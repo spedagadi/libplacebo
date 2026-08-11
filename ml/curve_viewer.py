@@ -182,16 +182,15 @@ def dv_gold_curve(row, xs):
 @st.cache_resource
 def train_model(dataset_csv, l1_csv):
     """
-    Train GBR to predict RPU polynomial coefficients directly (Option B).
-    Uses dv_coef_model — predicts pivots + per-segment coefficients for comp[0].
+    Train model using dv_coef_model.train() — auto-selects feature set
+    (base9 / derived14 / full27) based on training data size.
     Returns (models, feature_cols, train_scene_ids, held_out_scene_ids).
     """
     import dv_coef_model as coef
 
     df = coef.load_data(dataset_csv, l1_csv)
-    feats = [c for c in coef.FEATURE_COLS if c in df.columns and df[c].std() > 0]
 
-    # Build targets
+    # Build targets for 50/50 scene split
     targets, valid_idx = [], []
     for i, row in df.iterrows():
         t = coef.row_to_target(row)
@@ -200,26 +199,14 @@ def train_model(dataset_csv, l1_csv):
             valid_idx.append(i)
 
     df_v   = df.loc[valid_idx].reset_index(drop=True)
-    Y      = np.vstack(targets)
-    X      = df_v[feats].values
     groups = df_v["scene_id"].values
-
     all_scenes   = sorted(np.unique(groups))
     split        = len(all_scenes) // 2
     train_scenes = set(all_scenes[:split])
     held_scenes  = set(all_scenes[split:])
-    train_mask   = np.isin(groups, list(train_scenes))
 
-    X_tr, Y_tr = X[train_mask], Y[train_mask]
-
-    models = []
-    for k in range(coef.TARGET_DIM):
-        yz = Y_tr[:, k]
-        mu, sigma = yz.mean(), yz.std() + 1e-9
-        m = GradientBoostingRegressor(n_estimators=200, max_depth=3,
-                                      learning_rate=0.05, random_state=0)
-        m.fit(X_tr, (yz - mu) / sigma)
-        models.append((m, mu, sigma))
+    # Delegate to coef.train() which handles auto feature selection
+    models, feats = coef.train(df)
 
     return models, feats, train_scenes, held_scenes
 
@@ -242,17 +229,10 @@ def ml_predict(models, feats, row):
 # ---------------------------------------------------------------------------
 @st.cache_data
 def load_dataset(dataset_csv, l1_csv):
-    df = pd.read_csv(dataset_csv)
-    df["scene_id"] = df["scene_refresh"].cumsum()
-    if l1_csv:
-        l1 = pd.read_csv(l1_csv)
-        l1 = l1.sort_values("pts_approx").rename(columns={"pts_approx": "pts_time"})
-        df = df.sort_values("pts_time").reset_index(drop=True)
-        df = pd.merge_asof(df, l1[["pts_time","l1_min_pq","l1_max_pq","l1_avg_pq"]],
-                           on="pts_time", direction="nearest", tolerance=0.5)
-        for c in ["l1_min_pq","l1_max_pq","l1_avg_pq"]:
-            df[c] = df[c] / 4095.0
-    return df.reset_index(drop=True)
+    import dv_coef_model as coef
+    # coef.load_data handles L1 merge + derived SAT feature computation
+    df = coef.load_data(dataset_csv, l1_csv if l1_csv else None)
+    return df
 
 
 # ---------------------------------------------------------------------------
@@ -608,7 +588,7 @@ def main():
                 default_csv = arg
 
         csv_path = st.text_input("Dataset CSV", value=default_csv,
-                                 placeholder="dv_dataset_full.csv")
+                                 placeholder="dv_dataset_sat.csv")
         l1_path  = st.text_input("L1 CSV (optional, enables spline + ML)",
                                  value=default_l1,
                                  placeholder="l1_data.csv")
