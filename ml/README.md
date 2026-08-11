@@ -125,27 +125,60 @@ generalisation:
 | 10 | ~10k | Yes | Yes |
 | 20+ | ~20k+ | Definitely | Strong |
 
-### Recommended next titles (diverse visual coverage)
+### Stratified train/val/test split — 31 titles (60/20/20 by genre)
 
-Selected from nima4k.org complete DV catalogue for maximum training diversity:
+Selected from nima4k.org complete DV catalogue (334 titles, crawled Aug 2026).
+Genre-stratified so each split has proportionally similar genre distribution (±10%).
+The Little Things is the current single-title baseline; all titles below are the roadmap.
 
-| Title | Year | Visual rationale |
-|---|---|---|
-| Spider-Man: Across the Spider-Verse | 2023 | Animation — each dimension a different colour system |
-| Dune: Part Two | 2024 | Blinding sunlight vs dark underground arenas |
-| The Batman | 2022 | Near-total dark gothic — low-light stress test |
-| Top Gun: Maverick | 2022 | High-exposure daylight aerial, sun glare, cockpit switches |
-| 2001: A Space Odyssey | 1968 | Pure white interiors vs absolute black space |
-| Joker | 2019 | Bleached urban → hyper-warm amber arc |
-| Everything Everywhere All at Once | 2022 | Rapid cuts between different-graded universes |
-| Schindler's List | 1993 | B&W + selective colour — near-zero chroma baseline |
-| Lawrence of Arabia | 1962 | Extreme overexposed desert — highlight handling |
-| The Matrix | 1999 | Green digital world vs cold blue-grey real world |
-| Gladiator | 2000 | Warm arena, desaturated forest, dark catacombs |
-| Babylon | 2022 | Blazing outdoor + dark clubs + neon — within-scene HDR |
-| All Quiet on the Western Front | 2022 | Cold desaturated trenches + explosion contrast |
-| Despicable Me | 2010 | Bright primary-colour animation baseline |
-| Jaws | 1975 | Bright beach daylight → dark night ocean |
+**Genre distribution per split:**
+
+| Genre | Train (19) | Val (6) | Test (6) | Total |
+|---|---|---|---|---|
+| Action | 5 | 2 | 1 | 8 |
+| Sci-Fi | 4 | 1 | 1 | 6 |
+| Superhero | 2 | 1 | 1 | 4 |
+| Drama | 2 | 1 | 1 | 4 |
+| Horror | 2 | 0 | 1 | 3 |
+| Animation | 1 | 1 | 0 | 2 |
+| Comedy | 1 | 0 | 1 | 2 |
+| Classic/Epic | 2 | 0 | 0 | 2 |
+
+**Full title list:**
+
+| Title | Year | Genre | Split | Visual rationale |
+|---|---|---|---|---|
+| John Wick: Chapter 4 | 2023 | Action | Train | Neon geometry — Sacré-Cœur and Osaka nightclub as architectural choreography |
+| Top Gun: Maverick | 2022 | Action | Train | Bright IMAX aerial — F-18s against sunlit ocean and mountain corridors |
+| Atomic Blonde | 2017 | Action | Train | Cold War Berlin neon cyan/magenta with heavy grain and deep shadow |
+| Collateral | 2004 | Action | Train | Digital video LA night — ambient-lit blue-grey impossible on film |
+| Raiders of the Lost Ark | 1981 | Action | Train | Warm amber celluloid adventure across sun-baked deserts and ruins |
+| Warfare | 2025 | Action | Val | Handheld verité — desaturated sand-and-grey battlefield realism |
+| The Northman | 2022 | Action | Val | Fog-drenched Icelandic near-monochrome, ash and flame contrast |
+| Bullet Train | 2022 | Action | Test | Hyperrealistic neon-saturated Japanese pop-art Shinkansen interiors |
+| Dune: Part Two | 2024 | Sci-Fi | Train | Burnt-amber IMAX desert; near-monochromatic sandworm sequences |
+| The Matrix | 1999 | Sci-Fi | Train | Green-tinted digital world vs warm incandescent reality |
+| 2001: A Space Odyssey | 1968 | Sci-Fi | Train | Clinical white-on-black vacuum vs psychedelic Stargate sequence |
+| Alien: Romulus | 2024 | Sci-Fi | Train | Deep industrial shadow — wet corrugated metal in near-total darkness |
+| Godzilla Minus One | 2023 | Sci-Fi | Val | Postwar muted grey + B&W mode; kaiju destruction at human scale |
+| Hunger Games: Ballad | 2023 | Sci-Fi | Test | Capitol pastel gold/white vs drab grey District — hard chromatic binary |
+| Black Panther | 2018 | Superhero | Train | Afrofuturist purples, golds, neon waterfalls — unique MCU visual identity |
+| Watchmen | 2009 | Superhero | Train | Desaturated brown urban decay + saturated primary-colour costumes |
+| Joker | 2019 | Superhero | Val | Grimy 1970s Gotham, film grain, brown-green decay, expressionistic |
+| The Batman | 2022 | Superhero | Test | Perpetual rain-soaked noir — near-monochrome with amber as only accent |
+| Schindler's List | 1993 | Drama | Train | B&W realism + singular red-coat device — zero chroma baseline |
+| Babylon | 2022 | Drama | Train | Maximalist 1920s Hollywood — saturated torchlit parties, kinetic camera |
+| All Quiet on the Western Front | 2022 | Drama | Val | Mud-brown naturalistic WWI — grey sky and cold grain throughout |
+| Taxi Driver | 1976 | Drama | Test | Overexposed sodium-vapour NYC — Scorsese's grimy nocturnal urban purgatory |
+| The Shining | 1980 | Horror | Train | Cold symmetrical Kubrick — clinical pastels punctuated by red bursts |
+| A Quiet Place | 2018 | Horror | Train | Muted natural-light rural — golden-hour grain, silence over jump-scares |
+| Smile | 2022 | Horror | Test | Deliberately flat clinical daylight — suburban horror as medical procedural |
+| Spider-Man: Across the Spider-Verse | 2023 | Animation | Train | Each dimension wholly distinct — Impressionist, manga, LEGO, halftone |
+| Despicable Me | 2010 | Animation | Val | Bright primary-colour CGI — clean suburban whites, saturated Minion yellow |
+| Knives Out | 2019 | Comedy | Train | Autumnal gothic estate — warm amber lantern-lit widescreen interiors |
+| Groundhog Day | 1993 | Comedy | Test | Classic Hollywood winter — natural light, white snow, warm incandescent |
+| Lawrence of Arabia | 1962 | Classic/Epic | Train | 65mm Wadi Rum — no parallel for golden heat shimmer on celluloid |
+| Lord of the Rings: Fellowship | 2001 | Classic/Epic | Train | Lush NZ vistas + deep chiaroscuro underground — classical wide-format |
 
 ## Next steps
 
