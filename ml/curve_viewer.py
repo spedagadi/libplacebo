@@ -657,10 +657,19 @@ def main():
             format_func=lambda s: f"Scene {int(s):04d}  (t={float(df[df.scene_id==s].iloc[0].pts_time):.1f}s)",
         )
 
-        frame_idx = st.slider("Frame", 0, n - 1,
-                              value=st.session_state["nav_frame"],
-                              key="frame_slider")
-        # keep nav_frame in sync when slider is dragged
+        col_s, col_n = st.columns([3, 1])
+        with col_s:
+            frame_idx = st.slider("Frame", 0, n - 1,
+                                  value=st.session_state["nav_frame"],
+                                  key="frame_slider")
+        with col_n:
+            frame_direct = st.number_input("Index", 0, n - 1,
+                                           value=frame_idx,
+                                           step=1, key="frame_num",
+                                           label_visibility="visible")
+        # number_input takes priority if it changed
+        if frame_direct != frame_idx:
+            frame_idx = int(frame_direct)
         st.session_state["nav_frame"] = frame_idx
 
         st.divider()

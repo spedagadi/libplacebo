@@ -271,10 +271,11 @@ def _sanitise_rpu(rpu, n_dense=1024):
         new_segs.append({'order': 1, 'c0f': c0n, 'c1f': c1n, 'c2f': 0.0})
         slopes.append(c1n)
 
-    # Smooth: if slope jumps > 3× from previous non-zero segment, cap it
+    # Smooth: if slope jumps > 2× from previous non-zero segment, cap it
+    # Tightened from 3× to 2× — kink analysis showed 8% of scenes had 2.5-3× jumps
     for s in range(1, N_OUT):
         prev_slope = slopes[s - 1] if slopes[s - 1] > 0.01 else slopes[max(0, s-2)]
-        if prev_slope > 0.01 and slopes[s] > 3.0 * prev_slope:
+        if prev_slope > 0.01 and slopes[s] > 2.0 * prev_slope:
             # Cap slope at 1.5× previous, recompute c0 to maintain continuity
             cap = 1.5 * prev_slope
             x_lo = float(out_pivots[s])
@@ -282,6 +283,14 @@ def _sanitise_rpu(rpu, n_dense=1024):
             new_segs[s]['c1f'] = cap
             new_segs[s]['c0f'] = y_lo - cap * x_lo
             slopes[s] = cap
+            # Also propagate cap forward — prevents cascading kinks
+            for ss in range(s+1, N_OUT):
+                if slopes[ss] > 2.0 * slopes[ss-1]:
+                    y_lo2 = new_segs[ss-1]['c0f'] + new_segs[ss-1]['c1f'] * float(out_pivots[ss])
+                    cap2 = 2.0 * slopes[ss-1]
+                    new_segs[ss]['c1f'] = cap2
+                    new_segs[ss]['c0f'] = y_lo2 - cap2 * float(out_pivots[ss])
+                    slopes[ss] = cap2
 
     return {'n_segs': N_OUT, 'pivots': list(out_pivots), 'segs': new_segs}
 
