@@ -105,6 +105,9 @@ FEATURE_COLS = BASE_FEATURE_COLS + SAT_FEATURE_COLS
 
 # Feature set variants — select via FEATURE_SET constant
 FEATURE_SET = "derived14"  # "base9" | "derived14" | "full27" | "auto"
+# Stratification: enable when rare cells have >= 50 scenes (multi-title training)
+# Currently OFF — single title has too few rare-cell samples
+STRATIFY_DEFAULT = False
 # auto behaviour:
 #   < 1k  train scenes → base9      (single title, safe)
 #   1k-3k train scenes → derived14  (2-3 titles, good tradeoff)
@@ -341,7 +344,9 @@ STRATIFY_TARGET_PER_CELL = 400  # increase when more titles added
 RARITY_THRESHOLD = 50
 
 
-def load_data(dataset_csv, l1_csv=None, stratify=True):
+def load_data(dataset_csv, l1_csv=None, stratify=None):
+    if stratify is None:
+        stratify = STRATIFY_DEFAULT
     """
     Load dataset, compute derived features, and optionally apply stratified
     sampling so dark/mid/bright and concentrated/distributed/flat cells
@@ -374,7 +379,7 @@ def load_data(dataset_csv, l1_csv=None, stratify=True):
                 dfs.append(grp.sample(target, random_state=42))
         df = pd.concat(dfs).sort_values('pts_time').reset_index(drop=True)
         orig_n = len(pd.read_csv(dataset_csv).dropna(subset=['maxscl']))
-        print(f"  Stratified sampling: {orig_n} → {len(df)} frames  "
+        print(f"  Stratified sampling: {orig_n} -> {len(df)} frames  "
               f"({n_cells} cells, target {STRATIFY_TARGET_PER_CELL}/cell)")
         print(f"  Cell distribution:\n" +
               "\n".join(f"    {c}: {len(df[df.cell_id==c])}"
