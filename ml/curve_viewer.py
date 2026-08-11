@@ -43,10 +43,10 @@ OUTPUT_MAX_PQ = nits_to_pq(SDR_WHITE)
 OUTPUT_MIN_PQ = nits_to_pq(0.005)
 PL_HDR_PQ = 3
 
+# 9 pixel-only features — inference-safe, all from GPU histogram
 FEATURE_COLS = (
     ["maxscl", "average_maxrgb", "fraction_bright_pixels"] +
-    [f"distrib_val_{i}" for i in range(3, 9)] +
-    ["l1_min_pq", "l1_max_pq", "l1_avg_pq"]
+    [f"distrib_val_{i}" for i in range(3, 9)]
 )
 N_SAMPLE_PTS = 16
 SAMPLE_IDXS  = list(range(0, N_PTS, N_PTS // N_SAMPLE_PTS))
@@ -95,13 +95,27 @@ def load_libplacebo():
     return lib, spline_addr
 
 
-def spline_curve(l1_max_pq, l1_avg_pq, xs):
-    """Call pl_tone_map_spline via libplacebo DLL. xs defines the input grid."""
-    lib, spline_addr = load_libplacebo()
+_TM_SYMBOLS = {
+    "spline":    "pl_tone_map_spline",
+    "st2094-10": "pl_tone_map_st2094_10",
+    "st2094-40": "pl_tone_map_st2094_40",
+    "bt2390":    "pl_tone_map_bt2390",
+}
+
+def spline_curve(l1_max_pq, l1_avg_pq, xs,
+                 spline_contrast=0.5, knee_adaptation=0.4, slope_tuning=1.5,
+                 tone_mapper="spline"):
+    """Call a libplacebo tone mapper via DLL. xs defines the input grid."""
+    lib, _spline_addr = load_libplacebo()
+    sym = _TM_SYMBOLS.get(tone_mapper, "pl_tone_map_spline")
+    try:
+        tm_addr = ctypes.addressof(ctypes.c_void_p.in_dll(lib, sym))
+    except Exception:
+        tm_addr = _spline_addr
     lut_size = len(xs)
     params = PlToneMapParams()
     ctypes.memset(ctypes.addressof(params), 0, ctypes.sizeof(params))
-    params.function       = spline_addr
+    params.function       = tm_addr
     params.input_scaling  = PL_HDR_PQ
     params.output_scaling = PL_HDR_PQ
     params.lut_size       = lut_size
@@ -110,14 +124,14 @@ def spline_curve(l1_max_pq, l1_avg_pq, xs):
     params.input_avg      = float(l1_avg_pq)
     params.output_min     = OUTPUT_MIN_PQ
     params.output_max     = OUTPUT_MAX_PQ
-    params.constants.knee_adaptation   = 0.4
+    params.constants.knee_adaptation   = knee_adaptation
     params.constants.knee_minimum      = 0.1
     params.constants.knee_maximum      = 0.8
     params.constants.knee_default      = 0.4
     params.constants.knee_offset       = 1.0
-    params.constants.slope_tuning      = 1.5
+    params.constants.slope_tuning      = slope_tuning
     params.constants.slope_offset      = 0.2
-    params.constants.spline_contrast   = 0.5
+    params.constants.spline_contrast   = spline_contrast
     params.constants.reinhard_contrast = 0.5
     params.constants.linear_knee       = 0.3
     params.constants.exposure          = 1.0
@@ -240,7 +254,9 @@ def load_dataset(dataset_csv, l1_csv):
 # ---------------------------------------------------------------------------
 # Plots
 # ---------------------------------------------------------------------------
-def build_three_curves(row, models, feats, show_pivots):
+def build_three_curves(row, models, feats, show_pivots,
+                       spline_contrast=0.5, knee_adaptation=0.4, slope_tuning=1.5,
+                       tone_mapper="spline"):
     xs = np.linspace(0, 1, N_PTS)
 
     # DV gold — only valid over [pivot_min, pivot_max]
@@ -257,7 +273,11 @@ def build_three_curves(row, models, feats, show_pivots):
     l1_avg = float(row.get("l1_avg_pq") or 0)
     if l1_max > 0:
         xs_spl = np.linspace(0, l1_max, N_PTS)
-        spl    = spline_curve(l1_max, l1_avg, xs_spl)
+        spl    = spline_curve(l1_max, l1_avg, xs_spl,
+                              spline_contrast=spline_contrast,
+                              knee_adaptation=knee_adaptation,
+                              slope_tuning=slope_tuning,
+                              tone_mapper=tone_mapper)
     else:
         xs_spl, spl = None, None
 
@@ -291,7 +311,7 @@ def build_three_curves(row, models, feats, show_pivots):
         fig.add_trace(go.Scatter(
             x=xs_spl.tolist(), y=spl.tolist(), mode="lines",
             line=dict(color="#e07840", width=2, dash="dash"),
-            name="libplacebo spline",
+            name=f"libplacebo {tone_mapper}",
             hovertemplate="spline<br>in=%{x:.3f}<br>out=%{y:.3f}<extra></extra>",
         ))
 
@@ -453,13 +473,16 @@ def _get_env():
     return _DV_RENDER_ENV
 
 
-@st.cache_data(max_entries=16)
-def render_frame(video_path: str, pts_time: float, mode: str,
+@st.cache_data(max_entries=32)
+def render_frame(video_path: str, pts_time: float, mode: str,  # mode = dv_render mode
                  width: int = 960, height: int = 540,
                  lut_path: str = None,
                  l1_max_pq: float = 0.0,
                  l1_avg_pq: float = 0.0,
-                 out_nits: int = 203) -> np.ndarray:
+                 out_nits: int = 203,
+                 spline_contrast: float = 0.0,
+                 knee_adaptation: float = 0.0,
+                 slope_tuning: float = 0.0) -> np.ndarray:
     """
     Call dv_render.exe to render one frame through the full libplacebo pipeline.
     Returns RGB uint8 (H, W, 3) numpy array, or None on failure.
@@ -478,6 +501,9 @@ def render_frame(video_path: str, pts_time: float, mode: str,
         cmd += ["--l1-max", f"{l1_max_pq:.6f}", "--l1-avg", f"{l1_avg_pq:.6f}"]
     if out_nits != 203:
         cmd += ["--out-nits", str(out_nits)]
+    cmd += ["--spline-contrast", f"{spline_contrast:.3f}"]
+    cmd += ["--knee-adaptation", f"{knee_adaptation:.3f}"]
+    cmd += ["--slope-tuning",    f"{slope_tuning:.3f}"]
 
     try:
         r = subprocess.run(cmd, capture_output=True, env=_get_env(), timeout=60)
@@ -497,7 +523,10 @@ def _write_rpu_lut(t, path):
     coef.write_rpu_lut(t, path)
 
 
-def build_frame_panel(video_path, pts_time, row, models, feats, width=960, height=540, out_nits=203):
+def build_frame_panel(video_path, pts_time, row, models, feats,
+                      width=960, height=540, out_nits=203,
+                      spline_contrast=0.0, knee_adaptation=0.0, slope_tuning=0.0,
+                      tone_mapper="spline"):
     """
     Render DV gold / libplacebo spline / ML prediction via dv_render.exe.
     All three go through the same libplacebo D3D11 pipeline — only the tone
@@ -511,15 +540,20 @@ def build_frame_panel(video_path, pts_time, row, models, feats, width=960, heigh
 
     # --- DV gold: map_dovi=true — libplacebo applies RPU ycc_to_rgb matrix
     #     + RPU polynomial. This is the reference/gold standard. ---
+    sc = dict(spline_contrast=spline_contrast,
+              knee_adaptation=knee_adaptation,
+              slope_tuning=slope_tuning)
+
     img_gold = render_frame(video_path, pts_time, "gold", width, height,
-                            out_nits=out_nits)
+                            out_nits=out_nits, **sc)
     if img_gold is not None:
         images["DV gold"] = img_gold
 
-    img_spline = render_frame(video_path, pts_time, "spline", width, height,
-                              l1_max_pq=l1_max, l1_avg_pq=l1_avg, out_nits=out_nits)
+    img_spline = render_frame(video_path, pts_time, tone_mapper, width, height,
+                              l1_max_pq=l1_max, l1_avg_pq=l1_avg,
+                              out_nits=out_nits, **sc)
     if img_spline is not None:
-        images["libplacebo spline"] = img_spline
+        images[f"libplacebo {tone_mapper}"] = img_spline
 
     if models:
         ml_t = ml_predict(models, feats, row)
@@ -529,7 +563,7 @@ def build_frame_panel(video_path, pts_time, row, models, feats, width=960, heigh
             _write_rpu_lut(ml_t, tmp.name)
             img_ml = render_frame(video_path, pts_time, "ml", width, height,
                                   lut_path=tmp.name, l1_max_pq=l1_max,
-                                  l1_avg_pq=l1_avg, out_nits=out_nits)
+                                  l1_avg_pq=l1_avg, out_nits=out_nits, **sc)
             os.unlink(tmp.name)
             if img_ml is not None:
                 images["ML prediction"] = img_ml
@@ -541,7 +575,7 @@ def build_frame_panel(video_path, pts_time, row, models, feats, width=960, heigh
     diffs = {}
     if "DV gold" in images:
         ref = images["DV gold"].astype(np.int16)
-        for name in ["libplacebo spline", "ML prediction"]:
+        for name in [f"libplacebo {tone_mapper}", "ML prediction"]:
             if name in images:
                 diffs[name] = np.abs(images[name].astype(np.int16) - ref).mean(axis=2)
 
@@ -634,7 +668,16 @@ def main():
         st.session_state["nav_frame"] = frame_idx
 
         st.divider()
-        show_pivots = st.toggle("Show pivot points", value=True)
+        show_pivots  = st.toggle("Show pivot points", value=True)
+        tone_mapper  = st.selectbox(
+            "Tone mapper (spline/reference mode)",
+            options=["spline", "st2094-10", "st2094-40", "bt2390"],
+            index=0,
+            help=("spline=libplacebo default  "
+                  "st2094-10=SMPTE rational EETF (DV L1 metadata)  "
+                  "st2094-40=SMPTE Bezier (HDR10+ ootf)  "
+                  "bt2390=ITU hermite spline"),
+        )
 
         st.divider()
         DEFAULT_VIDEO = "D:/Jdownloader/TeLtlTig2226pWBLHMAXDlyVsonHECAtms1LUX/The.Little.Things.2021.2160p.WEB-DL.HMAX.Dolby.Vision.HEVC.Atmos.5.1-FLUX/The Little Things (2021) 2160p WEB-DL HMAX Dolby Vision HEVC Atmos 5.1-FLUX.mp4"
@@ -647,6 +690,15 @@ def main():
             help="50=projector  203=SDR monitor  1000=HDR display",
         )
         show_diff   = st.toggle("Show difference heatmap", value=True)
+
+        st.divider()
+        st.caption("Spline tone-map constants")
+        spline_contrast  = st.slider("spline_contrast",  0.0, 1.5, 0.5, 0.05,
+                                     help="0=linear, 0.5=default, 1.5=clip-like shoulder")
+        knee_adaptation  = st.slider("knee_adaptation",  0.0, 1.0, 0.4, 0.05,
+                                     help="0=fixed knee, 1=fully adapt to scene avg")
+        slope_tuning     = st.slider("slope_tuning",     0.0, 4.0, 1.5, 0.1,
+                                     help="Slope aggressiveness vs peak ratio")
 
     # --- Main area ---
     cur = df.iloc[frame_idx]
@@ -661,7 +713,11 @@ def main():
     # 3-curve plot + luminance panel
     col_curve, col_lum = st.columns([3, 2])
     with col_curve:
-        st.plotly_chart(build_three_curves(cur, models, feats, show_pivots),
+        st.plotly_chart(build_three_curves(cur, models, feats, show_pivots,
+                                           spline_contrast=spline_contrast,
+                                           knee_adaptation=knee_adaptation,
+                                           slope_tuning=slope_tuning,
+                                           tone_mapper=tone_mapper),
                         use_container_width=True, key=f"curves_{frame_idx}")
     with col_lum:
         st.plotly_chart(build_luminance_figure(cur), use_container_width=True,
@@ -694,9 +750,13 @@ def main():
 
     # --- Frame panel ---
     if show_frames and video_path and __import__("os").path.exists(video_path):
-        with st.spinner(f"Decoding frame at t={t:.2f}s  ({out_nits} nits target)..."):
+        with st.spinner(f"Decoding frame at t={t:.2f}s  ({out_nits} nits, {tone_mapper})..."):
             result = build_frame_panel(video_path, t, cur, models, feats,
-                                       out_nits=out_nits)
+                                       out_nits=out_nits,
+                                       spline_contrast=spline_contrast,
+                                       knee_adaptation=knee_adaptation,
+                                       slope_tuning=slope_tuning,
+                                       tone_mapper=tone_mapper)
 
         if result is None:
             st.error("Frame decode failed — check video path and ffmpeg.")

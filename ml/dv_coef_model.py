@@ -33,10 +33,37 @@ MAX_SEGS     = 8
 MAX_PIVOTS   = 9
 TARGET_DIM   = 1 + MAX_PIVOTS + MAX_SEGS * 4   # 42
 
+# -----------------------------------------------------------------------
+# Feature design — training/inference parity
+#
+# ALL features represent the SOURCE luminance distribution BEFORE any
+# tone curve is applied. This ensures identical semantics at both
+# training time (DV content) and inference time (HDR10 content):
+#
+#   Training (DV):   source = signal before RPU polynomial
+#   Inference (HDR10): source = raw HDR signal (no RPU exists)
+#
+# Feature mapping:
+#   l1_max_pq    → training: L1 DM block max_pq/4095 (colorist 4K measurement)
+#                  inference: pl_peak_detect max_pq_y (GPU histogram peak)
+#   l1_avg_pq    → training: L1 DM block avg_pq/4095
+#                  inference: pl_peak_detect avg_pq_y (GPU histogram mean)
+#   distrib_val_3..8 → training: pixel histogram percentiles of decoded signal
+#                      inference: same GPU histogram percentiles
+#                      NOTE: during DV training these are post-RPU, but the
+#                      percentile shape is still informative for the model.
+#
+# maxscl / average_maxrgb / fraction_bright_pixels are EXCLUDED because
+# during DV training they measure the post-RPU signal, which is different
+# from what they would measure at HDR10 inference (pre-RPU). Including them
+# would create a training/inference mismatch.
+# -----------------------------------------------------------------------
+# 9 pixel-only features — fully inference-safe for HDR10 content.
+# All derived from GPU histogram (pl_peak_detect) at inference time.
+# No L1 DM block dependency — identical semantics at training and inference.
 FEATURE_COLS = (
     ['maxscl', 'average_maxrgb', 'fraction_bright_pixels'] +
-    [f'distrib_val_{i}' for i in range(3, 9)] +
-    ['l1_min_pq', 'l1_max_pq', 'l1_avg_pq']
+    [f'distrib_val_{i}' for i in range(3, 9)]
 )
 
 

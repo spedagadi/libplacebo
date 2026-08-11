@@ -51,21 +51,40 @@
 typedef struct {
     const char *input;
     double      pts;
-    const char *mode;      /* "gold" | "spline" | "ml" */
+    const char *mode;      /* "gold" | "spline" | "st2094-10" | "st2094-40" | "bt2390" | "ml" */
     const char *lut_file;  /* path to .cube, required for mode=ml */
     int         width;
     int         height;
     float       out_nits;
-    float       l1_max_pq; /* L1 DM block max PQ (0-1), for spline mode */
-    float       l1_avg_pq; /* L1 DM block avg PQ (0-1), for spline mode */
+    float       l1_max_pq;       /* L1 DM block max PQ (0-1) */
+    float       l1_avg_pq;       /* L1 DM block avg PQ (0-1) */
+    /* Spline tone-mapper constants (PL_TONE_MAP_CONSTANTS defaults shown) */
+    float       knee_adaptation; /* 0.0-1.0, default 0.4 */
+    float       knee_minimum;    /* 0.0-0.5, default 0.1 */
+    float       knee_maximum;    /* 0.5-1.0, default 0.8 */
+    float       knee_default;    /* default 0.4 */
+    float       slope_tuning;    /* 0-10,    default 1.5 */
+    float       slope_offset;    /* 0-1,     default 0.2 */
+    float       spline_contrast; /* 0-1.5,   default 0.5 */
 } Args;
 
 static void usage(const char *argv0)
 {
     fprintf(stderr,
-        "Usage: %s --input <file> --pts <sec> --mode <gold|spline|ml>\n"
-        "          [--lut <file.cube>] [--width <px>] [--height <px>]\n"
-        "          [--out-nits <nits>]\n"
+        "Usage: %s --input <file> --pts <sec> --mode <gold|spline|st2094-10|st2094-40|bt2390|ml>\n"
+        "          [--lut <rpu_poly>]         required for --mode ml\n"
+        "          [--width <px>] [--height <px>]\n"
+        "          [--out-nits <nits>]         target display peak (default 203)\n"
+        "          [--l1-max <0-1>]            frame peak PQ\n"
+        "          [--l1-avg <0-1>]            frame avg PQ\n"
+        "  Spline constants (leave unset for libplacebo defaults):\n"
+        "          [--knee-adaptation <0-1>]   default 0.4\n"
+        "          [--knee-minimum <0-0.5>]    default 0.1\n"
+        "          [--knee-maximum <0.5-1>]    default 0.8\n"
+        "          [--knee-default <val>]      default 0.4\n"
+        "          [--slope-tuning <0-10>]     default 1.5\n"
+        "          [--slope-offset <0-1>]      default 0.2\n"
+        "          [--spline-contrast <0-1.5>] default 0.5\n"
         "Output: raw RGB8 to stdout\n", argv0);
 }
 
@@ -74,17 +93,32 @@ static bool parse_args(int argc, char **argv, Args *a)
     a->width    = 1920;
     a->height   = 1080;
     a->out_nits = 203.0f;
+    /* Sentinel: -1 means "use libplacebo default" */
+    a->knee_adaptation = -1.f;
+    a->knee_minimum    = -1.f;
+    a->knee_maximum    = -1.f;
+    a->knee_default    = -1.f;
+    a->slope_tuning    = -1.f;
+    a->slope_offset    = -1.f;
+    a->spline_contrast = -1.f;
 
     for (int i = 1; i < argc; i++) {
-        if (!strcmp(argv[i], "--input")    && i+1 < argc) { a->input    = argv[++i]; }
-        else if (!strcmp(argv[i], "--pts") && i+1 < argc) { a->pts      = atof(argv[++i]); }
-        else if (!strcmp(argv[i], "--mode")&& i+1 < argc) { a->mode     = argv[++i]; }
-        else if (!strcmp(argv[i], "--lut") && i+1 < argc) { a->lut_file = argv[++i]; }
-        else if (!strcmp(argv[i], "--width")  && i+1 < argc) { a->width  = atoi(argv[++i]); }
-        else if (!strcmp(argv[i], "--height") && i+1 < argc) { a->height = atoi(argv[++i]); }
-        else if (!strcmp(argv[i], "--out-nits") && i+1 < argc) { a->out_nits   = atof(argv[++i]); }
-        else if (!strcmp(argv[i], "--l1-max")  && i+1 < argc) { a->l1_max_pq  = atof(argv[++i]); }
-        else if (!strcmp(argv[i], "--l1-avg")  && i+1 < argc) { a->l1_avg_pq  = atof(argv[++i]); }
+        if      (!strcmp(argv[i], "--input")          && i+1 < argc) { a->input           = argv[++i]; }
+        else if (!strcmp(argv[i], "--pts")            && i+1 < argc) { a->pts             = atof(argv[++i]); }
+        else if (!strcmp(argv[i], "--mode")           && i+1 < argc) { a->mode            = argv[++i]; }
+        else if (!strcmp(argv[i], "--lut")            && i+1 < argc) { a->lut_file        = argv[++i]; }
+        else if (!strcmp(argv[i], "--width")          && i+1 < argc) { a->width           = atoi(argv[++i]); }
+        else if (!strcmp(argv[i], "--height")         && i+1 < argc) { a->height          = atoi(argv[++i]); }
+        else if (!strcmp(argv[i], "--out-nits")       && i+1 < argc) { a->out_nits        = atof(argv[++i]); }
+        else if (!strcmp(argv[i], "--l1-max")         && i+1 < argc) { a->l1_max_pq       = atof(argv[++i]); }
+        else if (!strcmp(argv[i], "--l1-avg")         && i+1 < argc) { a->l1_avg_pq       = atof(argv[++i]); }
+        else if (!strcmp(argv[i], "--knee-adaptation") && i+1 < argc) { a->knee_adaptation = atof(argv[++i]); }
+        else if (!strcmp(argv[i], "--knee-minimum")   && i+1 < argc) { a->knee_minimum    = atof(argv[++i]); }
+        else if (!strcmp(argv[i], "--knee-maximum")   && i+1 < argc) { a->knee_maximum    = atof(argv[++i]); }
+        else if (!strcmp(argv[i], "--knee-default")   && i+1 < argc) { a->knee_default    = atof(argv[++i]); }
+        else if (!strcmp(argv[i], "--slope-tuning")   && i+1 < argc) { a->slope_tuning    = atof(argv[++i]); }
+        else if (!strcmp(argv[i], "--slope-offset")   && i+1 < argc) { a->slope_offset    = atof(argv[++i]); }
+        else if (!strcmp(argv[i], "--spline-contrast") && i+1 < argc) { a->spline_contrast = atof(argv[++i]); }
         else { fprintf(stderr, "Unknown argument: %s\n", argv[i]); return false; }
     }
     if (!a->input || !a->mode || a->pts < 0) {
@@ -332,7 +366,8 @@ int main(int argc, char **argv)
      * set each component to a pass-through polynomial, then point repr.dovi
      * at the copy. The original is const and must not be modified directly. */
     struct pl_dovi_metadata dovi_identity = {0};
-    if (strcmp(a.mode, "gold") != 0 &&
+    bool is_gold = !strcmp(a.mode, "gold");
+    if (!is_gold &&
         image.repr.sys == PL_COLOR_SYSTEM_DOLBYVISION && image.repr.dovi)
     {
         /* Copy matrices and offsets from the original RPU */
@@ -395,16 +430,43 @@ int main(int argc, char **argv)
     struct pl_render_params rparams = pl_render_default_params;
     rparams.color_map_params = &cmap;
 
+    /* Apply user-supplied spline constants — negative sentinel means keep default */
+#define APPLY_IF_SET(field, arg) if ((arg) >= 0.0f) cmap.tone_constants.field = (arg)
+    APPLY_IF_SET(knee_adaptation, a.knee_adaptation);
+    APPLY_IF_SET(knee_minimum,    a.knee_minimum);
+    APPLY_IF_SET(knee_maximum,    a.knee_maximum);
+    APPLY_IF_SET(knee_default,    a.knee_default);
+    APPLY_IF_SET(slope_tuning,    a.slope_tuning);
+    APPLY_IF_SET(slope_offset,    a.slope_offset);
+    APPLY_IF_SET(spline_contrast, a.spline_contrast);
+#undef APPLY_IF_SET
 
-    if (!strcmp(a.mode, "gold")) {
+
+    if (is_gold) {
         /* map_dowi=true: libplacebo applies RPU polynomial directly.
          * Spline handles any residual HDR→SDR compression. */
         cmap.tone_mapping_function = &pl_tone_map_spline;
         cmap.metadata = PL_HDR_METADATA_CIE_Y;
 
-    } else if (!strcmp(a.mode, "spline")) {
-        /* Identity RPU reshape + spline driven by L1 values. */
-        cmap.tone_mapping_function = &pl_tone_map_spline;
+    } else if (!strcmp(a.mode, "spline")    ||
+               !strcmp(a.mode, "st2094-10") ||
+               !strcmp(a.mode, "st2094-40") ||
+               !strcmp(a.mode, "bt2390")) {
+        /* Identity RPU reshape + chosen tone mapper driven by L1 values.
+         *   spline    — single-pivot polynomial (libplacebo default)
+         *   st2094-10 — SMPTE ST 2094-10 Annex B.2 rational EETF
+         *   st2094-40 — SMPTE ST 2094-40 Annex B Bezier (uses HDR10+ ootf if present)
+         *   bt2390    — ITU-R BT.2390 hermite spline EETF
+         */
+        if (!strcmp(a.mode, "st2094-10"))
+            cmap.tone_mapping_function = &pl_tone_map_st2094_10;
+        else if (!strcmp(a.mode, "st2094-40"))
+            cmap.tone_mapping_function = &pl_tone_map_st2094_40;
+        else if (!strcmp(a.mode, "bt2390"))
+            cmap.tone_mapping_function = &pl_tone_map_bt2390;
+        else
+            cmap.tone_mapping_function = &pl_tone_map_spline;
+
         cmap.metadata = PL_HDR_METADATA_CIE_Y;
         if (a.l1_max_pq > 0) {
             image.color.hdr.max_pq_y = a.l1_max_pq;
