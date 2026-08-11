@@ -43,15 +43,15 @@ OUTPUT_MAX_PQ = nits_to_pq(SDR_WHITE)
 OUTPUT_MIN_PQ = nits_to_pq(0.005)
 PL_HDR_PQ = 3
 
-# Feature cols managed by dv_coef_model — viewer uses coef.FEATURE_COLS via train_model()
-# This local copy is only used for display; training delegates to dv_coef_model.train()
+# Feature cols — mirrors dv_coef_model.FEATURE_COLS (full 27 raw SAT zones)
+# Training auto-selects base9/derived20/full27 based on scene count
 _SAT_ROWS, _SAT_COLS = 3, 3
 FEATURE_COLS = (
     ["maxscl", "average_maxrgb", "fraction_bright_pixels"] +
     [f"distrib_val_{i}" for i in range(3, 9)] +
     [f"zone_mean_r{r}_c{c}" for r in range(_SAT_ROWS) for c in range(_SAT_COLS)] +
     [f"zone_max_r{r}_c{c}"  for r in range(_SAT_ROWS) for c in range(_SAT_COLS)]
-)  # Full 27 — auto-reduced to 9 by train() if < 3k training scenes
+)
 N_SAMPLE_PTS = 16
 SAMPLE_IDXS  = list(range(0, N_PTS, N_PTS // N_SAMPLE_PTS))
 
@@ -204,6 +204,10 @@ def train_model(dataset_csv, l1_csv):
     split        = len(all_scenes) // 2
     train_scenes = set(all_scenes[:split])
     held_scenes  = set(all_scenes[split:])
+
+    # Force reload to pick up FEATURE_SET changes without Streamlit restart
+    import importlib
+    importlib.reload(coef)
 
     # Delegate to coef.train() which handles auto feature selection
     models, feats = coef.train(df)
@@ -613,7 +617,8 @@ def main():
         if l1_csv:
             with st.spinner("Training ML model on first 50% of scenes..."):
                 models, feats, train_scenes, held_scenes = train_model(csv_path, l1_csv)
-            st.caption(f"ML ready  |  {len(feats)} features  |  "
+            import dv_coef_model as _coef
+            st.caption(f"ML ready  |  {len(feats)} features  ({_coef.FEATURE_SET})  |  "
                        f"train={len(train_scenes)} scenes  held-out={len(held_scenes)} scenes")
         else:
             models, feats = None, []

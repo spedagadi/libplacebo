@@ -85,18 +85,26 @@ BASE_FEATURE_COLS = (
 # making it suitable for smaller datasets (~1-3k scenes).
 # Computed from the 3x3 zone grid during extraction (requires dv_dataset_sat.csv).
 DERIVED_SAT_COLS = [
-    'sat_centre_max',          # zone_max_r1_c1 — centre zone peak (subject brightness)
-    'sat_peak_zone_max',       # max(all zone_max) — where is the brightest point
+    # Original 5 derived SAT features
+    'sat_centre_max',               # centre zone peak — subject brightness
+    'sat_peak_zone_max',            # max across all zones — brightest point anywhere
     'sat_highlight_concentration',  # peak_zone_max / maxscl — how clustered are highlights
-    'sat_centre_vs_edge',      # zone_mean_r1_c1 / mean(edge zones) — subject vs background
-    'sat_vertical_gradient',   # mean(top zones) / mean(bottom zones) — sky vs ground
+    'sat_centre_vs_edge',           # centre mean / edge mean — subject vs background
+    'sat_vertical_gradient',        # top mean / bottom mean — sky vs ground
+    # New 6 texture + locality features
+    'shadow_texture_var',           # variance in dark zones — shadow detail retention
+    'dark_zone_count',              # zones with mean < 0.1 PQ
+    'highlight_zone_count',         # zones with mean > 0.5 PQ
+    'highlight_x',                  # x position of peak zone (0=left, 1=right)
+    'highlight_y',                  # y position of peak zone (0=top, 1=bottom)
+    'highlight_edge_flag',          # 1 if peak zone is on frame edge
 ]
 
 # Full 27-feature set (base + all 18 raw SAT zones)
 FEATURE_COLS = BASE_FEATURE_COLS + SAT_FEATURE_COLS
 
 # Feature set variants — select via FEATURE_SET constant
-FEATURE_SET = "auto"   # "base9" | "derived14" | "full27" | "auto"
+FEATURE_SET = "derived14"  # "base9" | "derived14" | "full27" | "auto"
 # auto behaviour:
 #   < 1k  train scenes → base9      (single title, safe)
 #   1k-3k train scenes → derived14  (2-3 titles, good tradeoff)
@@ -241,13 +249,14 @@ def _sanitise_rpu(rpu, n_dense=1024):
     ys = np.clip(ys, 0.0, 1.0)
     np.maximum.accumulate(ys, out=ys)
 
-    # --- Step 4: refit on evenly-spaced pivots (avoids uneven-slope banding) ---
-    # Use 32 linear segments — fine enough to appear smooth in both the plot
-    # and the render, while staying within libplacebo's MAX_PIECES=8 limit.
-    # Note: libplacebo pl_dovi_metadata only supports up to 8 segments (9 pivots).
+    # --- Step 4: refit on evenly-spaced pivots ---
+    # Use 8 linear segments on a uniform grid. Then smooth slope discontinuities:
+    # a sudden slope jump > 3× between adjacent segments is a sanitisation artefact
+    # (dense drop repaired to flat, then adjacent segment overshoots) — cap it.
     N_OUT = 8
     out_pivots = np.linspace(0.0, 1.0, N_OUT + 1)
     new_segs = []
+    slopes = []
     for s in range(N_OUT):
         x_lo = float(out_pivots[s])
         x_hi = float(out_pivots[s + 1])
@@ -257,6 +266,19 @@ def _sanitise_rpu(rpu, n_dense=1024):
         c1n  = max(0.0, (y_hi - y_lo) / dx) if dx > 1e-8 else 0.0
         c0n  = y_lo - c1n * x_lo
         new_segs.append({'order': 1, 'c0f': c0n, 'c1f': c1n, 'c2f': 0.0})
+        slopes.append(c1n)
+
+    # Smooth: if slope jumps > 3× from previous non-zero segment, cap it
+    for s in range(1, N_OUT):
+        prev_slope = slopes[s - 1] if slopes[s - 1] > 0.01 else slopes[max(0, s-2)]
+        if prev_slope > 0.01 and slopes[s] > 3.0 * prev_slope:
+            # Cap slope at 1.5× previous, recompute c0 to maintain continuity
+            cap = 1.5 * prev_slope
+            x_lo = float(out_pivots[s])
+            y_lo = new_segs[s - 1]['c0f'] + new_segs[s - 1]['c1f'] * float(out_pivots[s])
+            new_segs[s]['c1f'] = cap
+            new_segs[s]['c0f'] = y_lo - cap * x_lo
+            slopes[s] = cap
 
     return {'n_segs': N_OUT, 'pivots': list(out_pivots), 'segs': new_segs}
 
@@ -313,7 +335,18 @@ def add_derived_sat(df):
     return df
 
 
-def load_data(dataset_csv, l1_csv=None):
+# Maximum frames per stratification cell for balanced sampling
+STRATIFY_TARGET_PER_CELL = 400  # increase when more titles added
+# Rarity boost: cells with fewer than this many samples get 2× sample weight
+RARITY_THRESHOLD = 50
+
+
+def load_data(dataset_csv, l1_csv=None, stratify=True):
+    """
+    Load dataset, compute derived features, and optionally apply stratified
+    sampling so dark/mid/bright and concentrated/distributed/flat cells
+    are equally represented in the training data.
+    """
     df = pd.read_csv(dataset_csv)
     df['scene_id'] = df['scene_refresh'].cumsum()
     if l1_csv:
@@ -325,7 +358,28 @@ def load_data(dataset_csv, l1_csv=None):
         for c in ['l1_min_pq','l1_max_pq','l1_avg_pq']:
             df[c] = df[c] / 4095.0
     df = df.dropna(subset=['maxscl','seg0_c0']).reset_index(drop=True)
-    df = add_derived_sat(df)   # compute derived SAT features if raw zones present
+    df = add_derived_sat(df)
+
+    # Stratified sampling if cell_id column is present
+    if stratify and 'cell_id' in df.columns:
+        cell_counts = df['cell_id'].value_counts()
+        n_cells = len(cell_counts)
+        dfs = []
+        for cell, grp in df.groupby('cell_id'):
+            n = len(grp)
+            target = STRATIFY_TARGET_PER_CELL
+            if n <= target:
+                dfs.append(grp)             # keep all if under target
+            else:
+                dfs.append(grp.sample(target, random_state=42))
+        df = pd.concat(dfs).sort_values('pts_time').reset_index(drop=True)
+        orig_n = len(pd.read_csv(dataset_csv).dropna(subset=['maxscl']))
+        print(f"  Stratified sampling: {orig_n} → {len(df)} frames  "
+              f"({n_cells} cells, target {STRATIFY_TARGET_PER_CELL}/cell)")
+        print(f"  Cell distribution:\n" +
+              "\n".join(f"    {c}: {len(df[df.cell_id==c])}"
+                        for c in sorted(df['cell_id'].unique())))
+
     return df
 
 

@@ -96,6 +96,20 @@ COLUMNS = [
     f"zone_mean_r{r}_c{c}" for r in range(SAT_GRID_ROWS) for c in range(SAT_GRID_COLS)
 ] + [
     f"zone_max_r{r}_c{c}"  for r in range(SAT_GRID_ROWS) for c in range(SAT_GRID_COLS)
+] + [
+    # Shadow texture features (dual SAT — variance in dark zones)
+    "shadow_texture_var",    # variance of luma in zones with mean < 0.1 PQ
+    "dark_zone_count",       # number of 3x3 zones with mean < 0.1 PQ
+    "highlight_zone_count",  # number of 3x3 zones with mean > 0.5 PQ
+    # Highlight locality features
+    "highlight_x",           # normalised x of peak zone centre (0=left, 1=right)
+    "highlight_y",           # normalised y of peak zone centre (0=top,  1=bottom)
+    "highlight_edge_flag",   # 1 if peak zone is on frame edge, 0 if interior
+    # Stratification labels (not model features — used for balanced sampling)
+    "lum_tier",              # dark/mid/bright  (from maxscl)
+    "spatial_cls",           # concentrated/distributed/flat (from highlight_concentration)
+    "shadow_tex_cls",        # textured/flat (from shadow_texture_var)
+    "cell_id",               # e.g. "dark_concentrated_textured"
 ]
 
 
@@ -223,6 +237,89 @@ def compute_sat_features(y_2d: np.ndarray, grid_rows: int = SAT_GRID_ROWS,
     return feats
 
 
+def compute_texture_and_locality(y_2d: np.ndarray, zone_feats: dict,
+                                  grid_rows: int = SAT_GRID_ROWS,
+                                  grid_cols: int = SAT_GRID_COLS) -> dict:
+    """
+    Compute shadow texture, highlight locality, and stratification labels.
+
+    Shadow texture: variance of luma in dark zones using dual SAT (sum + sum-of-squares).
+    Highlight locality: which zone holds peak brightness and where it sits spatially.
+    Stratification: classify into 18 cells for balanced dataset sampling.
+    """
+    H, W = y_2d.shape
+    feats = {}
+
+    # --- Dual SAT for variance in O(1) per zone ---
+    sat_sum = np.zeros((H + 1, W + 1), dtype=np.float64)
+    sat_sq  = np.zeros((H + 1, W + 1), dtype=np.float64)
+    y64 = y_2d.astype(np.float64)
+    sat_sum[1:, 1:] = np.cumsum(np.cumsum(y64,      axis=0), axis=1)
+    sat_sq [1:, 1:] = np.cumsum(np.cumsum(y64 ** 2, axis=0), axis=1)
+
+    def zone_var(r0, r1, c0, c1):
+        n = max((r1 - r0) * (c1 - c0), 1)
+        s  = sat_sum[r1,c1] - sat_sum[r0,c1] - sat_sum[r1,c0] + sat_sum[r0,c0]
+        s2 = sat_sq [r1,c1] - sat_sq [r0,c1] - sat_sq [r1,c0] + sat_sq [r0,c0]
+        return max(0.0, float(s2 / n - (s / n) ** 2))
+
+    # --- Shadow texture & highlight locality ---
+    dark_vars  = []
+    dark_count = 0
+    hi_count   = 0
+    peak_zone_r, peak_zone_c = 0, 0
+    peak_zone_val = -1.0
+
+    for r in range(grid_rows):
+        for c in range(grid_cols):
+            r0 = int(round(r     * H / grid_rows))
+            r1 = int(round((r+1) * H / grid_rows))
+            c0 = int(round(c     * W / grid_cols))
+            c1 = int(round((c+1) * W / grid_cols))
+            zm = zone_feats[f"zone_mean_r{r}_c{c}"]
+            zx = zone_feats[f"zone_max_r{r}_c{c}"]
+
+            if zm < 0.1:
+                dark_count += 1
+                dark_vars.append(zone_var(r0, r1, c0, c1))
+            if zm > 0.5:
+                hi_count += 1
+            if zx > peak_zone_val:
+                peak_zone_val = zx
+                peak_zone_r, peak_zone_c = r, c
+
+    feats["shadow_texture_var"]   = float(np.mean(dark_vars)) if dark_vars else 0.0
+    feats["dark_zone_count"]      = dark_count
+    feats["highlight_zone_count"] = hi_count
+
+    # Highlight locality — normalised centre of peak zone
+    feats["highlight_x"]         = (peak_zone_c + 0.5) / grid_cols  # 0=left, 1=right
+    feats["highlight_y"]         = (peak_zone_r + 0.5) / grid_rows  # 0=top,  1=bottom
+    feats["highlight_edge_flag"] = int(
+        peak_zone_r == 0 or peak_zone_r == grid_rows - 1 or
+        peak_zone_c == 0 or peak_zone_c == grid_cols - 1
+    )
+
+    # --- Stratification labels ---
+    maxscl = zone_feats.get("maxscl", float(y_2d.max()))  # fallback
+    # Use zone features if available, otherwise compute inline
+    peak_zone_max = max(zone_feats.get(f"zone_max_r{r}_c{c}", 0.0)
+                        for r in range(grid_rows) for c in range(grid_cols))
+    hi_conc = peak_zone_max / max(maxscl, 1e-6)
+
+    lum_tier = "bright" if maxscl >= 0.6 else ("mid" if maxscl >= 0.3 else "dark")
+    spatial_cls = ("concentrated" if hi_conc >= 0.85
+                   else ("distributed" if hi_conc >= 0.5 else "flat"))
+    shadow_tex_cls = "textured" if feats["shadow_texture_var"] > 0.002 else "flat"
+
+    feats["lum_tier"]      = lum_tier
+    feats["spatial_cls"]   = spatial_cls
+    feats["shadow_tex_cls"] = shadow_tex_cls
+    feats["cell_id"]       = f"{lum_tier}_{spatial_cls}_{shadow_tex_cls}"
+
+    return feats
+
+
 def decode_chunk_pixel_stats(input_path: str, start_sec: float, duration_sec: float) -> dict:
     """
     Decode the chunk at low resolution via ffmpeg at 1fps, extract 10-bit PQ Y channel,
@@ -262,15 +359,19 @@ def decode_chunk_pixel_stats(input_path: str, start_sec: float, duration_sec: fl
         pcts   = np.percentile(y_flat, DISTRIB_PERCENTILES)
 
         abs_sec = round(start_sec + frame_idx)
-        result[abs_sec] = {
+        base_stats = {
             "maxscl":                  float(y_flat.max()),
             "average_maxrgb":          float(y_flat.mean()),
             "fraction_bright_pixels":  float((y_flat > 0.5).mean()),
-            "targeted_display_max_nits": None,   # not available in Profile 5
+            "targeted_display_max_nits": None,
             **{f"distrib_pct_{i}": float(DISTRIB_PERCENTILES[i]) for i in range(9)},
             **{f"distrib_val_{i}": float(pcts[i]) for i in range(9)},
-            **compute_sat_features(y_2d),
         }
+        sat_feats = compute_sat_features(y_2d)
+        # Pass base maxscl into texture/locality so stratification uses it
+        sat_feats["maxscl"] = base_stats["maxscl"]
+        tex_feats = compute_texture_and_locality(y_2d, sat_feats)
+        result[abs_sec] = {**base_stats, **sat_feats, **tex_feats}
         frame_idx += 1
 
     proc.wait()
