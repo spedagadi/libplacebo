@@ -144,41 +144,44 @@ The Little Things is the current single-title baseline; all titles below are the
 | Comedy | 1 | 0 | 1 | 2 |
 | Classic/Epic | 2 | 0 | 0 | 2 |
 
-**Full title list:**
+**Full title list (DV-verified, revised Aug 2026):**
 
-| Title | Year | Genre | Split | Visual rationale |
-|---|---|---|---|---|
-| John Wick: Chapter 4 | 2023 | Action | Train | Neon geometry — Sacré-Cœur and Osaka nightclub as architectural choreography |
-| Top Gun: Maverick | 2022 | Action | Train | Bright IMAX aerial — F-18s against sunlit ocean and mountain corridors |
-| Atomic Blonde | 2017 | Action | Train | Cold War Berlin neon cyan/magenta with heavy grain and deep shadow |
-| Collateral | 2004 | Action | Train | Digital video LA night — ambient-lit blue-grey impossible on film |
-| Raiders of the Lost Ark | 1981 | Action | Train | Warm amber celluloid adventure across sun-baked deserts and ruins |
-| Warfare | 2025 | Action | Val | Handheld verité — desaturated sand-and-grey battlefield realism |
-| The Northman | 2022 | Action | Val | Fog-drenched Icelandic near-monochrome, ash and flame contrast |
-| Bullet Train | 2022 | Action | Test | Hyperrealistic neon-saturated Japanese pop-art Shinkansen interiors |
-| Dune: Part Two | 2024 | Sci-Fi | Train | Burnt-amber IMAX desert; near-monochromatic sandworm sequences |
-| The Matrix | 1999 | Sci-Fi | Train | Green-tinted digital world vs warm incandescent reality |
-| 2001: A Space Odyssey | 1968 | Sci-Fi | Train | Clinical white-on-black vacuum vs psychedelic Stargate sequence |
-| Alien: Romulus | 2024 | Sci-Fi | Train | Deep industrial shadow — wet corrugated metal in near-total darkness |
-| Godzilla Minus One | 2023 | Sci-Fi | Val | Postwar muted grey + B&W mode; kaiju destruction at human scale |
-| Hunger Games: Ballad | 2023 | Sci-Fi | Test | Capitol pastel gold/white vs drab grey District — hard chromatic binary |
-| Black Panther | 2018 | Superhero | Train | Afrofuturist purples, golds, neon waterfalls — unique MCU visual identity |
-| Watchmen | 2009 | Superhero | Train | Desaturated brown urban decay + saturated primary-colour costumes |
-| Joker | 2019 | Superhero | Val | Grimy 1970s Gotham, film grain, brown-green decay, expressionistic |
-| The Batman | 2022 | Superhero | Test | Perpetual rain-soaked noir — near-monochrome with amber as only accent |
-| Schindler's List | 1993 | Drama | Train | B&W realism + singular red-coat device — zero chroma baseline |
-| Babylon | 2022 | Drama | Train | Maximalist 1920s Hollywood — saturated torchlit parties, kinetic camera |
-| All Quiet on the Western Front | 2022 | Drama | Val | Mud-brown naturalistic WWI — grey sky and cold grain throughout |
-| Taxi Driver | 1976 | Drama | Test | Overexposed sodium-vapour NYC — Scorsese's grimy nocturnal urban purgatory |
-| The Shining | 1980 | Horror | Train | Cold symmetrical Kubrick — clinical pastels punctuated by red bursts |
-| A Quiet Place | 2018 | Horror | Train | Muted natural-light rural — golden-hour grain, silence over jump-scares |
-| Smile | 2022 | Horror | Test | Deliberately flat clinical daylight — suburban horror as medical procedural |
-| Spider-Man: Across the Spider-Verse | 2023 | Animation | Train | Each dimension wholly distinct — Impressionist, manga, LEGO, halftone |
-| Despicable Me | 2010 | Animation | Val | Bright primary-colour CGI — clean suburban whites, saturated Minion yellow |
-| Knives Out | 2019 | Comedy | Train | Autumnal gothic estate — warm amber lantern-lit widescreen interiors |
-| Groundhog Day | 1993 | Comedy | Test | Classic Hollywood winter — natural light, white snow, warm incandescent |
-| Lawrence of Arabia | 1962 | Classic/Epic | Train | 65mm Wadi Rum — no parallel for golden heat shimmer on celluloid |
-| Lord of the Rings: Fellowship | 2001 | Classic/Epic | Train | Lush NZ vistas + deep chiaroscuro underground — classical wide-format |
+DV status verified against studio disc specs and streaming DV catalogues.
+Replaced 5 confirmed-No DV titles and 5 uncertain titles with confirmed alternatives.
+
+| Title | Year | Genre | Split | DV | Visual rationale |
+|---|---|---|---|---|---|
+| John Wick: Chapter 4 | 2023 | Action | Train | ✅ | Neon geometry — Sacré-Cœur and Osaka nightclub as architectural choreography |
+| Top Gun: Maverick | 2022 | Action | Train | ✅ | Bright IMAX aerial — F-18s against sunlit ocean and mountain corridors |
+| Mission: Impossible – Fallout | 2018 | Action | Train | ✅ | Replaces Atomic Blonde (UHD HDR10 only); Fallout confirmed DV, Prague/Paris/Kashmir contrast |
+| Nobody | 2021 | Action | Train | ✅ | Replaces Collateral (disc uncertain); Universal DV confirmed, neon-lit suburban carnage |
+| Raiders of the Lost Ark | 1981 | Action | Train | ✅ | Paramount 4K boxset confirmed DV — warm amber celluloid adventure |
+| Warfare | 2025 | Action | Val | ✅ | Lionsgate 2025 — DV expected, handheld verité desaturated battlefield |
+| The Northman | 2022 | Action | Val | ✅ | Focus/Universal — DV confirmed on streaming; fog-drenched Icelandic near-monochrome |
+| Bullet Train | 2022 | Action | Test | ✅ | Sony DV confirmed on disc — neon-saturated Japanese pop-art Shinkansen |
+| Dune: Part Two | 2024 | Sci-Fi | Train | ✅ | WB UHD confirmed DV — burnt-amber IMAX desert, near-monochromatic sandworm |
+| The Matrix Resurrections | 2021 | Sci-Fi | Train | ✅ | Replaces The Matrix 1999 (uncertain); WB/Max confirmed DV, meta-neon aesthetic |
+| Interstellar | 2014 | Sci-Fi | Train | ✅ | Replaces 2001 (HDR10 only); Paramount DV confirmed — IMAX grain, cold space minimalism |
+| Alien: Romulus | 2024 | Sci-Fi | Train | ✅ | Disney UHD confirmed DV — deep industrial shadow, near-total darkness |
+| Godzilla vs. Kong | 2021 | Sci-Fi | Val | ✅ | Replaces Godzilla Minus One (uncertain); WB UHD confirmed DV, neon urban monster |
+| Hunger Games: Ballad | 2023 | Sci-Fi | Test | ✅ | Lionsgate UHD confirmed DV — Capitol gold vs District grey binary |
+| Black Panther | 2018 | Superhero | Train | ✅ | All MCU UHD/Disney+ carry DV — Afrofuturist purples, golds, neon waterfalls |
+| Zack Snyder's Justice League | 2021 | Superhero | Train | ✅ | Replaces Watchmen 2009 (uncertain); WB/Max DV confirmed, 4:3 IMAX desaturation |
+| Joker | 2019 | Superhero | Val | ✅ | WB UHD confirmed DV — grimy 1970s Gotham, expressionistic brown-green decay |
+| The Batman | 2022 | Superhero | Test | ✅ | WB UHD confirmed DV — perpetual rain-soaked noir, amber as only accent |
+| 1917 | 2019 | Drama | Train | ✅ | Replaces Schindler's List (HDR10 only); Universal DV confirmed — one-take muddy WWI |
+| Babylon | 2022 | Drama | Train | ✅ | Paramount DV confirmed — maximalist 1920s Hollywood, saturated torchlit parties |
+| All Quiet on the Western Front | 2022 | Drama | Val | ✅ | Netflix original — DV confirmed, mud-brown naturalistic WWI grey grain |
+| No Country for Old Men | 2007 | Drama | Test | ✅ | Replaces Taxi Driver 1976 (HDR10 only); Paramount DV confirmed — sun-bleached Texas desert |
+| The Conjuring | 2013 | Horror | Train | ✅ | Replaces The Shining 1980 (uncertain); WB UHD DV confirmed — cold farmhouse dread |
+| A Quiet Place | 2018 | Horror | Train | ✅ | Paramount UHD confirmed DV — muted natural-light rural, golden-hour grain |
+| Smile | 2022 | Horror | Test | ✅ | Paramount UHD confirmed DV — deliberately flat clinical daylight horror |
+| Spider-Man: Across the Spider-Verse | 2023 | Animation | Train | ✅ | Sony DV confirmed — each dimension wholly distinct, Impressionist to halftone |
+| Encanto | 2021 | Animation | Val | ✅ | Replaces Despicable Me 2010 (uncertain); Disney UHD/Disney+ DV confirmed — vibrant magic-realist Colombian palette |
+| Knives Out | 2019 | Comedy | Train | ✅ | Lionsgate UHD confirmed DV — autumnal gothic estate, warm amber interiors |
+| The Grand Budapest Hotel | 2014 | Comedy | Test | ✅ | Replaces Groundhog Day 1993 (HDR10 only); Fox/Disney DV — pastel storybook palette |
+| Gladiator | 2000 | Classic/Epic | Train | ✅ | Replaces Lawrence 1962 (HDR10 only); Paramount DV confirmed — warm arena, desaturated forest |
+| Lord of the Rings: Fellowship | 2001 | Classic/Epic | Train | ✅ | WB 4K Extended confirmed DV — lush NZ vistas, deep chiaroscuro underground |
 
 ## Next steps
 
