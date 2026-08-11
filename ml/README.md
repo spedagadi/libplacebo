@@ -148,52 +148,78 @@ Scale targets for XGBoost and cross-title generalisation:
 
 #### On disk — G:\ disc remuxes
 
-**Source tiers for training quality (best → worst):**
-1. **Pure disc** — BDMV or MKV remux, pixel+RPU both from the same physical disc master
-2. **Hybrid disc** — disc video + RPU sourced from streaming (RPU authored for slightly different encode; tolerable since both derive from the same colorist session)
-3. **WEB-DL** — pixel+RPU both from streaming re-encode; excluded from training corpus
+**Source tiers:** P = Pure disc (pixel+RPU from same master) · H = Hybrid disc (disc video, streaming RPU) · W = WEB-DL (excluded)  
+**Status:** ✅ Ready · ⚠️ Needs work · 🔍 Unverified (ISO)
 
-> **Test set integrity:** Test titles must be **community benchmark titles** — ones that AVForums, AVS Forum, and Blu-ray.com members actively post DV comparisons for. If a title appears in training, any results shown to the community on that title can be dismissed as memorisation. Titles marked `*` are community benchmarks and must never appear in Train or Val.
+---
 
-| # | Title | Year | Genre | Location | Format | DV | Profile | Tier | Status | Split | Notes |
-|---|---|---|---|---|---|---|---|---|---|---|---|
-| 1 | Alien: Romulus | 2024 | Sci-Fi/Horror | `G:\Alien.Romulus...DOUHD` | BDMV | ✅ | 7 | Pure disc | ⚠️ | Train | EL 5528 kbps — use EL stream file for RPU |
-| 2 | Furiosa | 2024 | Action | `G:\Furiosa...GLiMMER` | BDMV | ✅ | 7 | Pure disc | ⚠️ | Train | EL 2106 kbps — use EL stream file for RPU |
-| 3 | Warfare | 2025 | War/Action | `G:\Warfare...TMT` | BDMV | ✅ | ? | Pure disc | ✅ | Train | Profile TBD — verify |
-| 4 | Spotlight | 2015 | Drama | `G:\Spotlight...MTeam` | BDMV | ✅ | 7 | Pure disc | ⚠️ | Train | EL 8522 kbps — use EL stream file for RPU |
-| 5 | Zodiac | 2007 | Crime/Thriller | `G:\Zodiac...CHDBits` | BDMV | ✅ | 7 | Pure disc | ⚠️ | Train | EL 14879 kbps — use EL stream file for RPU |
-| 6 | Rush | 2013 | Sport/Drama | `G:\Rush...HDT` | MKV | ✅ | **7** | Pure disc | ✅ | Train | DOVI confirmed; EL in v:0 — 123 RPU NALs/5s |
-| 7 | Wonder Woman 1984 | 2020 | Superhero | `G:\Wonder.Woman.1984...` | BDMV | ✅ | ? | Pure disc | ✅ | Train | Profile TBD — verify |
-| 8 | First Blood | 1982 | Action | `G:\First.Blood...BLoz` | BDMV | ✅ | ? | Pure disc | ✅ | Train | Profile TBD — classic grain |
-| 9 | Pacific Rim | 2013 | Sci-Fi/Action | `G:\Pacific Rim...REMUX.mkv` | MKV | ✅ | **8** | Hybrid disc | ✅ | Train | Disc video + streaming RPU; DOVI confirmed |
-| 10 | Prometheus | 2012 | Sci-Fi/Horror | `G:\Prometheus...mkv` | MKV | ✅ | **8** | Hybrid disc | ✅ | Train | Disc video + streaming RPU; DOVI confirmed |
-| 11 | The Creator | 2023 | Sci-Fi | `G:\The Creator...mkv` | MKV | ✅ | **8** | Hybrid disc | ✅ | Train | Disc video + streaming RPU; DOVI confirmed |
-| 12 | Everest | 2015 | Drama/Adventure | `G:\Everest...mkv` | MKV | ✅ | **8** | Hybrid disc | ✅ | Train | Disc video + streaming RPU; DOVI confirmed |
-| 13 | Kingdom of the Planet of the Apes | 2024 | Sci-Fi | `G:\Kingdom.of.the.Planet...mkv` | MKV | ✅ | **8** | Hybrid disc | ✅ | Train | Disc video + streaming RPU; DOVI confirmed |
-| 14 | 28 Years Later | 2025 | Horror | `G:\28.Years.Later...TMT` | BDMV | ✅ | ? | Pure disc | ✅ | Train | Profile TBD — moved from Val; fills Horror Train |
-| 15 | How to Train Your Dragon | 2025 | Animation | `G:\How.to.Train...B3LLUM` | BDMV | ✅ | 7 | Pure disc | ⚠️ | Val | EL 5917 kbps — use EL stream file for RPU |
-| 16 | MI: The Final Reckoning | 2025 | Action | `G:\Mission.Impossible-The.Final...` | BDMV | ✅ | 7 | Pure disc | ⚠️ | Val | EL 4029 kbps — use EL stream file for RPU |
-| 17 | The Invisible Man | 2020 | Horror/Sci-Fi | `G:\The.Invisible.Man...BeyondHD` | BDMV | ✅ | 7 | Pure disc | ⚠️ | Val | EL 7082 kbps — use EL stream file for RPU |
-| 18 | Tron: Legacy | 2010 | Sci-Fi | `G:\Tron.Legacy...TMT` | BDMV | ✅ | ? | Pure disc | ✅ | Val | Profile TBD — verify |
-| 19 | F1: The Movie | 2025 | Sport/Drama | `G:\F1.The.Movie...TMT` | BDMV | ✅ | ? | Pure disc | ✅ | Val | Profile TBD — verify |
-| 20 | Weapons | 2025 | Thriller | `G:\Weapons.2025...mkv` | MKV | ✅ | **7** | Hybrid disc | ✅ | Val | Disc video + streaming RPU; DOVI confirmed |
-| 21 | Ballerina | 2025 | Action | `G:\Ballerina...` | BDMV | ✅ | ? | Pure disc | ✅ | Val | Profile TBD — filler Val slot |
-| 22 | **Dune: Part Two** * | 2024 | Sci-Fi | `G:\Dune.Part.Two...DOUHD` | BDMV | ✅ | 7 | Pure disc | ⚠️ | **Test** | Community benchmark — amber IMAX desert; EL stream |
-| 23 | **Top Gun: Maverick** * | 2022 | Action | `G:\Top.Gun.Maverick...` | RAR | ✅ | ? | Pure disc | ⚠️ | **Test** | Community benchmark — IMAX aerial; extract RAR first |
-| 24 | **Spider-Man: ATSV** * | 2023 | Animation | `G:\Spider.Man.Across...mkv` | MKV | ✅ | **7** | Pure disc | ⚠️ | **Test** | Community benchmark; DOVI confirmed; German audio |
-| 25 | **Godzilla Minus One** * | 2023 | Sci-Fi | `G:\Godzilla.Minus.One...AREY` | BDMV | ✅ | 7 | Pure disc | ⚠️ | **Test** | Community benchmark — JPN disc DV; EL stream |
-| 26 | **Civil War** * | 2024 | War/Action | `G:\Civil War 2024...mkv` | MKV | ✅ | **7** | Pure disc | ✅ | **Test** | A24 DV benchmark; DOVI confirmed; EL in v:0 |
-| 27 | Predator Badlands | 2025 | Sci-Fi/Action | `G:\Predator.Badlands...MTeam` | BDMV | ✅ | 7 | Pure disc | ⚠️ | Test | EL 3957 kbps — use EL stream file for RPU |
-| 28 | Gladiator II | 2024 | Action/Epic | `G:\Gladiator.II...SharpHD.iso` | ISO | 🔍 | ? | Pure disc | ⚠️ | Test | ISO — mount + ffprobe to confirm DV/profile |
-| 29 | No Time to Die | 2021 | Action | `G:\No.Time.to.Die...ISO` | ISO | 🔍 | ? | Pure disc | ⚠️ | Test | ISO — mount + ffprobe to confirm |
-| 30 | Wonder Woman | 2017 | Superhero | `G:\Wonder.Woman.2017.../...iso` | ISO | 🔍 | ? | Pure disc | ⚠️ | Test | ISO — mount + ffprobe to confirm |
-| 31 | John Wick: Chapter 4 * | 2023 | Action | `G:\John.Wick.Kapitel.4...mkv` | MKV | ✅ | **7** | Pure disc | ⚠️ | **Test** (EN needed) | Community benchmark; DOVI confirmed; currently German — get EN disc |
-| 32 | Troy (Director's Cut) | 2004 | Epic | `G:\Troy.2004...mkv` | MKV | ✅ | **7** | Pure disc | ⚠️ | — | DOVI confirmed; EL in v:0; German audio; reserve |
-| 33 | Kingdom of Heaven (DC) | 2005 | Epic/Historical | `G:\Koenigreich.der.Himmel...mkv` | MKV | ✅ | **7** | Pure disc | ⚠️ | — | DOVI confirmed; EL in v:0; German audio; reserve |
-| 34 | The Hurt Locker | 2008 | War/Drama | `G:\Toedliches.Kommando...mkv` | MKV | ✅ | **7** | Pure disc | ⚠️ | — | DOVI confirmed; EL in v:0; German audio; reserve |
-| 35 | V for Vendetta | 2005 | Action/Sci-Fi | `G:\V.for.Vendetta...iso` | ISO | 🔍 | ? | Pure disc | ⚠️ | — | ISO — mount + ffprobe to confirm |
-| 35 | MI: Dead Reckoning Pt 1 | 2023 | Action | `G:\Mission.Impossible.Dead.Reckoning...iso` | ISO | 🔍 | ? | Pure disc | ⚠️ | — | ISO — mount + ffprobe to confirm |
-| 36 | Top Gun: Maverick | 2022 | Action | `G:\Top.Gun.Maverick...` | RAR | ✅ | ? | Pure disc | ⚠️ | — | In RAR archives — extract first |
+##### Train (14 titles)
+
+| Title | Year | Genre | Format | DV | P | Tier | Notes |
+|---|---|---|---|---|---|---|---|
+| Alien: Romulus | 2024 | Sci-Fi/Horror | BDMV | ✅ | 7 | P | EL 5528 kbps — use EL stream file |
+| Furiosa | 2024 | Action | BDMV | ✅ | 7 | P | EL 2106 kbps — use EL stream file |
+| Warfare | 2025 | War/Action | BDMV | ✅ | ? | P | Profile TBD |
+| Spotlight | 2015 | Drama | BDMV | ✅ | 7 | P | EL 8522 kbps — use EL stream file |
+| Zodiac | 2007 | Crime/Thriller | BDMV | ✅ | 7 | P | EL 14879 kbps — use EL stream file |
+| Rush | 2013 | Sport/Drama | MKV | ✅ | **7** | P | DOVI confirmed; EL in v:0 |
+| Wonder Woman 1984 | 2020 | Superhero | BDMV | ✅ | ? | P | Profile TBD |
+| First Blood | 1982 | Action | BDMV | ✅ | ? | P | Classic grain; profile TBD |
+| Pacific Rim | 2013 | Sci-Fi/Action | MKV | ✅ | **8** | H | DOVI confirmed |
+| Prometheus | 2012 | Sci-Fi/Horror | MKV | ✅ | **8** | H | DOVI confirmed |
+| The Creator | 2023 | Sci-Fi | MKV | ✅ | **8** | H | DOVI confirmed |
+| Everest | 2015 | Drama/Adventure | MKV | ✅ | **8** | H | DOVI confirmed |
+| Kingdom of the Planet of the Apes | 2024 | Sci-Fi | MKV | ✅ | **8** | H | DOVI confirmed |
+| 28 Years Later | 2025 | Horror | BDMV | ✅ | ? | P | Profile TBD |
+
+---
+
+##### Val (7 titles)
+
+| Title | Year | Genre | Format | DV | P | Tier | Notes |
+|---|---|---|---|---|---|---|---|
+| How to Train Your Dragon | 2025 | Animation | BDMV | ✅ | 7 | P | EL 5917 kbps — use EL stream file |
+| MI: The Final Reckoning | 2025 | Action | BDMV | ✅ | 7 | P | EL 4029 kbps — use EL stream file |
+| The Invisible Man | 2020 | Horror/Sci-Fi | BDMV | ✅ | 7 | P | EL 7082 kbps — use EL stream file |
+| Tron: Legacy | 2010 | Sci-Fi | BDMV | ✅ | ? | P | Near-total black, isolated neon |
+| F1: The Movie | 2025 | Sport/Drama | BDMV | ✅ | ? | P | Bright daylight + paddock |
+| Weapons | 2025 | Thriller | MKV | ✅ | **7** | H | DOVI confirmed; EL in v:0 |
+| Ballerina | 2025 | Action | BDMV | ✅ | ? | P | John Wick universe |
+
+---
+
+##### Test (community benchmarks — never used in Train/Val)
+
+> These are titles AVForums / AVS Forum members actively post DV comparisons for. Results shown on these titles to the community prove generalisation, not memorisation. `*` = primary community benchmark.
+
+| Title | Year | Genre | Format | DV | P | Status | Notes |
+|---|---|---|---|---|---|---|---|
+| **Dune: Part Two** * | 2024 | Sci-Fi | BDMV | ✅ | 7 | ⚠️ | Most-posted DV comparison 2024-25; EL stream needed |
+| **Top Gun: Maverick** * | 2022 | Action | RAR | ✅ | ? | ⚠️ | Canonical IMAX/HDR demo disc; extract RAR first |
+| **Godzilla Minus One** * | 2023 | Sci-Fi | BDMV | ✅ | 7 | ⚠️ | JPN disc DV; EL stream needed |
+| **Civil War** * | 2024 | War/Action | MKV | ✅ | **7** | ✅ | A24 DV; DOVI confirmed; EL in v:0 |
+| **Spider-Man: ATSV** * | 2023 | Animation | MKV | ✅ | **7** | ⚠️ | Animation HDR benchmark; German audio |
+| **John Wick: Ch4** * | 2023 | Action | MKV | ✅ | **7** | ⚠️ | Neon geometry benchmark; currently German — get EN |
+| Predator Badlands | 2025 | Sci-Fi/Action | BDMV | ✅ | 7 | ⚠️ | EL stream needed |
+| Gladiator II | 2024 | Action/Epic | ISO | 🔍 | ? | ⚠️ | ISO — mount + ffprobe to confirm |
+| No Time to Die | 2021 | Action | ISO | 🔍 | ? | ⚠️ | ISO — mount + ffprobe to confirm |
+| Wonder Woman 2017 | 2017 | Superhero | ISO | 🔍 | ? | ⚠️ | ISO — mount + ffprobe to confirm |
+| **The Batman** * _(download)_ | 2022 | Superhero/Noir | — | ✅ | — | ⬇️ | Rain noir — contrast to WW1984; WB UHD |
+| **Blade Runner 2049** * _(download)_ | 2017 | Sci-Fi/Noir | — | ✅ | — | ⬇️ | Most-discussed AVForums HDR benchmark; not on disk |
+| **Joker** * _(download)_ | 2019 | Superhero/Drama | — | ✅ | — | ⬇️ | Grimy Gotham; community DV discussion title |
+
+---
+
+##### Reserve (German audio or unverified ISO — usable if genre gap remains)
+
+| Title | Year | Genre | Format | DV | P | Notes |
+|---|---|---|---|---|---|---|
+| John Wick: Ch4 | 2023 | Action | MKV | ✅ | **7** | German audio; DOVI confirmed — use if EN unavailable |
+| Troy (DC) | 2004 | Epic | MKV | ✅ | **7** | German audio; DOVI confirmed |
+| Kingdom of Heaven (DC) | 2005 | Epic | MKV | ✅ | **7** | German audio; DOVI confirmed |
+| The Hurt Locker | 2008 | War/Drama | MKV | ✅ | **7** | German audio; DOVI confirmed |
+| V for Vendetta | 2005 | Action/Sci-Fi | ISO | 🔍 | ? | ISO — mount + ffprobe |
+| MI: Dead Reckoning Pt 1 | 2023 | Action | ISO | 🔍 | ? | ISO — mount + ffprobe |
 
 #### On disk — no DV (skip for training)
 
