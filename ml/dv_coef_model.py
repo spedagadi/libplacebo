@@ -27,6 +27,16 @@ from sklearn.ensemble import GradientBoostingRegressor
 from sklearn.model_selection import GroupKFold
 from sklearn.metrics import r2_score
 
+# XGBoost — preferred over GBR: faster, better regularisation, handles missing values
+try:
+    from xgboost import XGBRegressor
+    _HAVE_XGB = True
+except ImportError:
+    _HAVE_XGB = False
+
+USE_XGBOOST = False  # GBR outperforms XGB on this small dataset (~919 scenes)
+                     # Switch to True when training on 10k+ scenes
+
 COEF_SCALE   = 1.0 / (2 ** 23)
 INPUT_MAX    = 1023.0
 MAX_SEGS     = 8
@@ -285,13 +295,30 @@ def train(df):
 
     print(f"Train: {train_mask.sum()}  Test: {(~train_mask).sum()}")
 
-    # Train one GBR per target dimension
+    # Train one model per target dimension
+    use_xgb = USE_XGBOOST and _HAVE_XGB
+    algo = "XGBoost" if use_xgb else "GBR"
+    print(f"  Using {algo}")
     models = []
     for k in range(TARGET_DIM):
         yz = Y_tr[:, k]
         mu, sigma = yz.mean(), yz.std() + 1e-9
-        m = GradientBoostingRegressor(n_estimators=200, max_depth=3,
-                                      learning_rate=0.05, random_state=0)
+        if use_xgb:
+            m = XGBRegressor(
+                n_estimators=300,
+                max_depth=4,
+                learning_rate=0.05,
+                subsample=0.8,
+                colsample_bytree=0.8,
+                min_child_weight=3,
+                reg_lambda=1.0,
+                random_state=0,
+                verbosity=0,
+                n_jobs=-1,
+            )
+        else:
+            m = GradientBoostingRegressor(n_estimators=200, max_depth=3,
+                                          learning_rate=0.05, random_state=0)
         m.fit(X_tr, (yz - mu) / sigma)
         models.append((m, mu, sigma))
         if k % 10 == 0:
