@@ -65,6 +65,9 @@ typedef struct {
     float       knee_default;    /* default 0.4 */
     float       slope_tuning;    /* 0-10,    default 1.5 */
     float       slope_offset;    /* 0-1,     default 0.2 */
+    /* Gamut/colour volume controls */
+    float       perceptual_strength; /* 0.0-1.0, default 0.8 — chroma restoration after tone map */
+    int         gamut_expansion;     /* 0/1, default 0 — allow chroma expansion beyond source */
     float       spline_contrast; /* 0-1.5,   default 0.5 */
 } Args;
 
@@ -84,6 +87,8 @@ static void usage(const char *argv0)
         "          [--knee-default <val>]      default 0.4\n"
         "          [--slope-tuning <0-10>]     default 1.5\n"
         "          [--slope-offset <0-1>]      default 0.2\n"
+        "          [--perceptual-strength <0-1>] default 0.8 (chroma restoration after tone map)\n"
+        "          [--gamut-expansion <0|1>]    default 0 (allow chroma expansion beyond source)\n"
         "          [--spline-contrast <0-1.5>] default 0.5\n"
         "Output: raw RGB8 to stdout\n", argv0);
 }
@@ -99,7 +104,9 @@ static bool parse_args(int argc, char **argv, Args *a)
     a->knee_maximum    = -1.f;
     a->knee_default    = -1.f;
     a->slope_tuning    = -1.f;
-    a->slope_offset    = -1.f;
+    a->slope_offset         = -1.f;
+    a->perceptual_strength  = -1.f;
+    a->gamut_expansion      = -1;
     a->spline_contrast = -1.f;
 
     for (int i = 1; i < argc; i++) {
@@ -117,7 +124,9 @@ static bool parse_args(int argc, char **argv, Args *a)
         else if (!strcmp(argv[i], "--knee-maximum")   && i+1 < argc) { a->knee_maximum    = atof(argv[++i]); }
         else if (!strcmp(argv[i], "--knee-default")   && i+1 < argc) { a->knee_default    = atof(argv[++i]); }
         else if (!strcmp(argv[i], "--slope-tuning")   && i+1 < argc) { a->slope_tuning    = atof(argv[++i]); }
-        else if (!strcmp(argv[i], "--slope-offset")   && i+1 < argc) { a->slope_offset    = atof(argv[++i]); }
+        else if (!strcmp(argv[i], "--slope-offset")        && i+1 < argc) { a->slope_offset        = atof(argv[++i]); }
+        else if (!strcmp(argv[i], "--perceptual-strength") && i+1 < argc) { a->perceptual_strength = atof(argv[++i]); }
+        else if (!strcmp(argv[i], "--gamut-expansion")     && i+1 < argc) { a->gamut_expansion     = atoi(argv[++i]); }
         else if (!strcmp(argv[i], "--spline-contrast") && i+1 < argc) { a->spline_contrast = atof(argv[++i]); }
         else { fprintf(stderr, "Unknown argument: %s\n", argv[i]); return false; }
     }
@@ -440,6 +449,12 @@ int main(int argc, char **argv)
     APPLY_IF_SET(slope_offset,    a.slope_offset);
     APPLY_IF_SET(spline_contrast, a.spline_contrast);
 #undef APPLY_IF_SET
+
+    /* Gamut/colour volume controls */
+    if (a.perceptual_strength >= 0.0f)
+        cmap.gamut_constants.perceptual_strength = a.perceptual_strength;
+    if (a.gamut_expansion >= 0)
+        cmap.gamut_expansion = (bool)a.gamut_expansion;
 
 
     if (is_gold) {

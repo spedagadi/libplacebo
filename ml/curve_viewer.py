@@ -462,7 +462,7 @@ def _get_env():
 
 
 @st.cache_data(max_entries=32)
-def render_frame(video_path: str, pts_time: float, mode: str,  # mode = dv_render mode
+def render_frame(video_path: str, pts_time: float, mode: str,
                  width: int = 960, height: int = 540,
                  lut_path: str = None,
                  l1_max_pq: float = 0.0,
@@ -470,7 +470,9 @@ def render_frame(video_path: str, pts_time: float, mode: str,  # mode = dv_rende
                  out_nits: int = 203,
                  spline_contrast: float = 0.0,
                  knee_adaptation: float = 0.0,
-                 slope_tuning: float = 0.0) -> np.ndarray:
+                 slope_tuning: float = 0.0,
+                 perceptual_strength: float = 0.8,
+                 gamut_expansion: bool = False) -> np.ndarray:
     """
     Call dv_render.exe to render one frame through the full libplacebo pipeline.
     Returns RGB uint8 (H, W, 3) numpy array, or None on failure.
@@ -489,9 +491,11 @@ def render_frame(video_path: str, pts_time: float, mode: str,  # mode = dv_rende
         cmd += ["--l1-max", f"{l1_max_pq:.6f}", "--l1-avg", f"{l1_avg_pq:.6f}"]
     if out_nits != 203:
         cmd += ["--out-nits", str(out_nits)]
-    cmd += ["--spline-contrast", f"{spline_contrast:.3f}"]
-    cmd += ["--knee-adaptation", f"{knee_adaptation:.3f}"]
-    cmd += ["--slope-tuning",    f"{slope_tuning:.3f}"]
+    cmd += ["--spline-contrast",      f"{spline_contrast:.3f}"]
+    cmd += ["--knee-adaptation",      f"{knee_adaptation:.3f}"]
+    cmd += ["--slope-tuning",         f"{slope_tuning:.3f}"]
+    cmd += ["--perceptual-strength",  f"{perceptual_strength:.3f}"]
+    cmd += ["--gamut-expansion",      "1" if gamut_expansion else "0"]
 
     try:
         r = subprocess.run(cmd, capture_output=True, env=_get_env(), timeout=60)
@@ -514,7 +518,8 @@ def _write_rpu_lut(t, path):
 def build_frame_panel(video_path, pts_time, row, models, feats,
                       width=960, height=540, out_nits=203,
                       spline_contrast=0.0, knee_adaptation=0.0, slope_tuning=0.0,
-                      tone_mapper="spline"):
+                      tone_mapper="spline",
+                      perceptual_strength=0.8, gamut_expansion=False):
     """
     Render DV gold / libplacebo spline / ML prediction via dv_render.exe.
     All three go through the same libplacebo D3D11 pipeline — only the tone
@@ -530,7 +535,9 @@ def build_frame_panel(video_path, pts_time, row, models, feats,
     #     + RPU polynomial. This is the reference/gold standard. ---
     sc = dict(spline_contrast=spline_contrast,
               knee_adaptation=knee_adaptation,
-              slope_tuning=slope_tuning)
+              slope_tuning=slope_tuning,
+              perceptual_strength=perceptual_strength,
+              gamut_expansion=gamut_expansion)
 
     img_gold = render_frame(video_path, pts_time, "gold", width, height,
                             out_nits=out_nits, **sc)
@@ -689,6 +696,13 @@ def main():
         slope_tuning     = st.slider("slope_tuning",     0.0, 4.0, 1.5, 0.1,
                                      help="Slope aggressiveness vs peak ratio")
 
+        st.divider()
+        st.caption("Colour volume (gamut) controls")
+        perceptual_strength = st.slider("perceptual_strength", 0.0, 1.0, 0.8, 0.05,
+                                        help="Chroma restoration after tone map — higher preserves colour saturation at low nits")
+        gamut_expansion     = st.toggle("gamut_expansion", value=False,
+                                        help="Allow chroma beyond source gamut — helps restore washed-out colours at 50 nits")
+
     # --- Main area ---
     cur = df.iloc[frame_idx]
     t   = float(cur["pts_time"])
@@ -745,7 +759,9 @@ def main():
                                        spline_contrast=spline_contrast,
                                        knee_adaptation=knee_adaptation,
                                        slope_tuning=slope_tuning,
-                                       tone_mapper=tone_mapper)
+                                       tone_mapper=tone_mapper,
+                                       perceptual_strength=perceptual_strength,
+                                       gamut_expansion=gamut_expansion)
 
         if result is None:
             st.error("Frame decode failed — check video path and ffmpeg.")
