@@ -43,10 +43,13 @@ OUTPUT_MAX_PQ = nits_to_pq(SDR_WHITE)
 OUTPUT_MIN_PQ = nits_to_pq(0.005)
 PL_HDR_PQ = 3
 
-# 9 pixel-only features — inference-safe, all from GPU histogram
+# 9 base + 18 SAT spatial = 27 features — all inference-safe
+_SAT_ROWS, _SAT_COLS = 3, 3
 FEATURE_COLS = (
     ["maxscl", "average_maxrgb", "fraction_bright_pixels"] +
-    [f"distrib_val_{i}" for i in range(3, 9)]
+    [f"distrib_val_{i}" for i in range(3, 9)] +
+    [f"zone_mean_r{r}_c{c}" for r in range(_SAT_ROWS) for c in range(_SAT_COLS)] +
+    [f"zone_max_r{r}_c{c}"  for r in range(_SAT_ROWS) for c in range(_SAT_COLS)]
 )
 N_SAMPLE_PTS = 16
 SAMPLE_IDXS  = list(range(0, N_PTS, N_PTS // N_SAMPLE_PTS))

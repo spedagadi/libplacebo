@@ -49,6 +49,10 @@ PIXEL_H = 144
 
 DISTRIB_PERCENTILES = [1, 5, 10, 25, 50, 75, 90, 95, 99]
 
+# Spatial grid for SAT features
+SAT_GRID_ROWS = 3
+SAT_GRID_COLS = 3
+
 HDR10P_KEY = "HDR Dynamic Metadata SMPTE2094-40 (HDR10+)"
 DV_KEY     = "Dolby Vision Metadata"
 MD_KEY     = "Mastering display metadata"
@@ -86,6 +90,12 @@ COLUMNS = [
     "seg7_order", "seg7_c0", "seg7_c1", "seg7_c2",
     # Static mastering metadata (Profile 8 only)
     "mastering_max_lum", "mastering_min_lum", "maxcll", "maxfall",
+] + [
+    # Spatial zone features (3x3 grid SAT) — mean and max PQ per zone
+    # Zones: row0..2 (top→bottom), col0..2 (left→right)
+    f"zone_mean_r{r}_c{c}" for r in range(SAT_GRID_ROWS) for c in range(SAT_GRID_COLS)
+] + [
+    f"zone_max_r{r}_c{c}"  for r in range(SAT_GRID_ROWS) for c in range(SAT_GRID_COLS)
 ]
 
 
@@ -180,6 +190,39 @@ def probe_chunk(input_path: str, start_sec: float, duration_sec: float) -> list:
     return json.loads(out, object_pairs_hook=_dedup_pairs).get("frames", [])
 
 
+def compute_sat_features(y_2d: np.ndarray, grid_rows: int = SAT_GRID_ROWS,
+                          grid_cols: int = SAT_GRID_COLS) -> dict:
+    """
+    Compute zonal mean and max PQ using a summed area table (integral image).
+    y_2d: (H, W) float32 PQ luma frame.
+    Returns dict of zone_mean_rR_cC and zone_max_rR_cC for a grid_rows x grid_cols grid.
+    """
+    H, W = y_2d.shape
+
+    # Summed area table for mean: O(1) zone sum queries
+    sat = np.zeros((H + 1, W + 1), dtype=np.float64)
+    sat[1:, 1:] = np.cumsum(np.cumsum(y_2d.astype(np.float64), axis=0), axis=1)
+
+    feats = {}
+    for r in range(grid_rows):
+        for c in range(grid_cols):
+            # Zone pixel boundaries
+            r0 = int(round(r     * H / grid_rows))
+            r1 = int(round((r+1) * H / grid_rows))
+            c0 = int(round(c     * W / grid_cols))
+            c1 = int(round((c+1) * W / grid_cols))
+
+            n = max((r1 - r0) * (c1 - c0), 1)
+            zone_sum = sat[r1, c1] - sat[r0, c1] - sat[r1, c0] + sat[r0, c0]
+            zone_mean = float(zone_sum / n)
+            zone_max  = float(y_2d[r0:r1, c0:c1].max())
+
+            feats[f"zone_mean_r{r}_c{c}"] = zone_mean
+            feats[f"zone_max_r{r}_c{c}"]  = zone_max
+
+    return feats
+
+
 def decode_chunk_pixel_stats(input_path: str, start_sec: float, duration_sec: float) -> dict:
     """
     Decode the chunk at low resolution via ffmpeg at 1fps, extract 10-bit PQ Y channel,
@@ -214,17 +257,19 @@ def decode_chunk_pixel_stats(input_path: str, start_sec: float, duration_sec: fl
             break
 
         # Y plane: 10-bit little-endian uint16, values 0-1023 (full range PQ)
-        y = np.frombuffer(data[:y_bytes], dtype="<u2").astype(np.float32) / 1023.0
-        pcts = np.percentile(y, DISTRIB_PERCENTILES)
+        y_flat = np.frombuffer(data[:y_bytes], dtype="<u2").astype(np.float32) / 1023.0
+        y_2d   = y_flat.reshape(h, w)
+        pcts   = np.percentile(y_flat, DISTRIB_PERCENTILES)
 
         abs_sec = round(start_sec + frame_idx)
         result[abs_sec] = {
-            "maxscl":                  float(y.max()),
-            "average_maxrgb":          float(y.mean()),
-            "fraction_bright_pixels":  float((y > 0.5).mean()),
+            "maxscl":                  float(y_flat.max()),
+            "average_maxrgb":          float(y_flat.mean()),
+            "fraction_bright_pixels":  float((y_flat > 0.5).mean()),
             "targeted_display_max_nits": None,   # not available in Profile 5
             **{f"distrib_pct_{i}": float(DISTRIB_PERCENTILES[i]) for i in range(9)},
             **{f"distrib_val_{i}": float(pcts[i]) for i in range(9)},
+            **compute_sat_features(y_2d),
         }
         frame_idx += 1
 

@@ -68,12 +68,19 @@ TARGET_DIM   = 1 + MAX_PIVOTS + MAX_SEGS * 4   # 42
 # from what they would measure at HDR10 inference (pre-RPU). Including them
 # would create a training/inference mismatch.
 # -----------------------------------------------------------------------
-# 9 pixel-only features — fully inference-safe for HDR10 content.
-# All derived from GPU histogram (pl_peak_detect) at inference time.
-# No L1 DM block dependency — identical semantics at training and inference.
+# Spatial zone columns (3x3 SAT grid — 18 features)
+_SAT_ROWS, _SAT_COLS = 3, 3
+SAT_FEATURE_COLS = (
+    [f'zone_mean_r{r}_c{c}' for r in range(_SAT_ROWS) for c in range(_SAT_COLS)] +
+    [f'zone_max_r{r}_c{c}'  for r in range(_SAT_ROWS) for c in range(_SAT_COLS)]
+)
+
+# Base 9 pixel features + 18 SAT spatial features = 27 total
+# All inference-safe: SAT zones computed from GPU histogram at 3x3 zone granularity
 FEATURE_COLS = (
     ['maxscl', 'average_maxrgb', 'fraction_bright_pixels'] +
-    [f'distrib_val_{i}' for i in range(3, 9)]
+    [f'distrib_val_{i}' for i in range(3, 9)] +
+    SAT_FEATURE_COLS
 )
 
 
