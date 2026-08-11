@@ -115,8 +115,7 @@ Modes: `gold` (RPU polynomial), `spline`, `st2094-10`, `st2094-40`, `bt2390`, `m
 
 ## Training data roadmap
 
-Currently trained on 29 minutes of one title. Target for XGBoost and cross-title
-generalisation:
+Scale targets for XGBoost and cross-title generalisation:
 
 | Titles | ~Scenes | XGBoost? | Cross-title generalisation? |
 |---|---|---|---|
@@ -125,63 +124,82 @@ generalisation:
 | 10 | ~10k | Yes | Yes |
 | 20+ | ~20k+ | Definitely | Strong |
 
-### Stratified train/val/test split — 31 titles (60/20/20 by genre)
+### Dataset inventory — confirmed DV titles (scanned Aug 2026)
 
-Selected from nima4k.org complete DV catalogue (334 titles, crawled Aug 2026).
-Genre-stratified so each split has proportionally similar genre distribution (±10%).
-The Little Things is the current single-title baseline; all titles below are the roadmap.
+**Status key:** ✅ Ready to extract · ⚠️ Needs work (see Notes) · ⬇️ Download needed  
+**DV key:** ✅ Confirmed (BDNFO/EL track verified) · 🔍 Likely (known disc, unverified) · ❌ No DV  
+**Format:** BDMV = complete disc folder · ISO = disc image · MKV = remux/encode · m2ts = raw stream
 
-**Genre distribution per split:**
+#### On disk — G:\ and D:\
 
-| Genre | Train (19) | Val (6) | Test (6) | Total |
+| # | Title | Year | Genre | Location | Format | DV | Status | Split | Notes |
+|---|---|---|---|---|---|---|---|---|---|
+| 1 | The Little Things | 2021 | Crime/Thriller | `D:\Jdownloader\TeLtlTig...` | m2ts+mp4 | ✅ | ✅ | **Baseline** | Current training title, 2060 scenes extracted |
+| 2 | Dune: Part Two | 2024 | Sci-Fi | `G:\Dune.Part.Two...DOUHD` | BDMV | ✅ | ✅ | Train | EL 2110 kbps; IMAX amber desert, near-mono |
+| 3 | Alien: Romulus | 2024 | Sci-Fi/Horror | `G:\Alien.Romulus...DOUHD` | BDMV | ✅ | ✅ | Train | EL 5528 kbps; deep shadow, near-total darkness |
+| 4 | Furiosa | 2024 | Action | `G:\Furiosa...GLiMMER` | BDMV | ✅ | ✅ | Train | EL 2106 kbps; post-apoc warm/desaturated |
+| 5 | Godzilla Minus One | 2023 | Sci-Fi | `G:\Godzilla.Minus.One...AREY` | BDMV | ✅ | ✅ | Train | EL 6869 kbps; JPN disc confirmed DV |
+| 6 | Warfare | 2025 | War/Action | `G:\Warfare...TMT` | BDMV | ✅ | ✅ | Train | Handheld verité, desaturated battlefield |
+| 7 | Spotlight | 2015 | Drama | `G:\Spotlight...MTeam` | BDMV | ✅ | ✅ | Train | EL 8522 kbps; flat neutral office drama |
+| 8 | Zodiac | 2007 | Crime/Thriller | `G:\Zodiac...CHDBits` | BDMV | ✅ | ✅ | Train | EL 14879 kbps; very high bitrate EL, vintage |
+| 9 | Pacific Rim | 2013 | Sci-Fi/Action | `G:\Pacific Rim...REMUX.mkv` | MKV | ✅ | ✅ | Train | DoVi; neon-lit mech vs monster nightscapes |
+| 10 | Prometheus | 2012 | Sci-Fi/Horror | `G:\Prometheus...mkv` | MKV | ✅ | ✅ | Train | DV; cold industrial alien, deep space |
+| 11 | The Creator | 2023 | Sci-Fi | `G:\The Creator...mkv` | MKV | ✅ | ✅ | Train | DoVi; tropical sci-fi, warm golden light |
+| 12 | Wonder Woman 1984 | 2020 | Superhero | `G:\Wonder.Woman.1984...` | BDMV | ✅ | ✅ | Train | HDR+DV; vivid 80s neon/mall aesthetic |
+| 13 | First Blood | 1982 | Action | `G:\First.Blood...BLoz` | BDMV | ✅ | ✅ | Train | Classic film grain, forest + rain |
+| 14 | Rush | 2013 | Sport/Drama | `G:\Rush...HDT` | MKV | ✅ | ✅ | Train | DV; high-saturation race, vivid skin tones |
+| 15 | Everest | 2015 | Drama/Adventure | `G:\Everest...mkv` | MKV | ✅ | ✅ | Train | DV HDR10+; extreme bright snow + deep shadows |
+| 16 | Kingdom of the Planet of the Apes | 2024 | Sci-Fi | `G:\Kingdom.of.the.Planet...mkv` | MKV | ✅ | ✅ | Train | DV; lush forest, warm daylight |
+| 17 | Civil War | 2024 | War/Action | `G:\Civil War 2024...mkv` | MKV | ✅ | ✅ | Val | DoVi; desaturated photojournalist aesthetic |
+| 18 | How to Train Your Dragon | 2025 | Animation | `G:\How.to.Train...B3LLUM` | BDMV | ✅ | ✅ | Val | EL 5917 kbps; vibrant animation colour volume |
+| 19 | 28 Years Later | 2025 | Horror | `G:\28.Years.Later...TMT` | BDMV | ✅ | ✅ | Val | Post-apoc; desaturated green-grey |
+| 20 | MI: The Final Reckoning | 2025 | Action | `G:\Mission.Impossible-The.Final...` | BDMV | ✅ | ✅ | Val | EL 4029 kbps; mixed location, day/night |
+| 21 | The Invisible Man | 2020 | Horror/Sci-Fi | `G:\The.Invisible.Man...BeyondHD` | BDMV | ✅ | ✅ | Val | EL 7082 kbps; clinical suburban daylight |
+| 22 | Tron: Legacy | 2010 | Sci-Fi | `G:\Tron.Legacy...TMT` | BDMV | ✅ | ✅ | Val | DV; near-total black, isolated neon |
+| 23 | F1: The Movie | 2025 | Sport/Drama | `G:\F1.The.Movie...TMT` | BDMV | ✅ | ✅ | Val | Bright daylight racing + paddock interiors |
+| 24 | Predator Badlands | 2025 | Sci-Fi/Action | `G:\Predator.Badlands...MTeam` | BDMV | ✅ | ✅ | Test | EL 3957 kbps; jungle + alien terrain |
+| 25 | Ballerina | 2025 | Action | `G:\Ballerina...` | BDMV | ✅ | ✅ | Test | DV; high-contrast John Wick universe |
+| 26 | Spider-Man: Across the Spider-Verse | 2023 | Animation | `G:\Spider.Man.Across...mkv` | MKV | ⚠️ | ⚠️ | Test | DV; German audio — video/DV identical |
+| 27 | Gladiator II | 2024 | Action/Epic | `G:\Gladiator.II...SharpHD.iso` | ISO | 🔍 | ⚠️ | Test | ISO — needs mounting to extract |
+| 28 | No Time to Die | 2021 | Action | `G:\No.Time.to.Die...ISO` | ISO | 🔍 | ⚠️ | Test | ISO — needs mounting to extract |
+| 29 | Wonder Woman | 2017 | Superhero | `G:\Wonder.Woman.2017.../...iso` | ISO | 🔍 | ⚠️ | Test | ISO inside folder — needs mounting |
+| 30 | John Wick: Chapter 4 | 2023 | Action | `G:\John.Wick.Kapitel.4...mkv` | MKV | ✅ | ⚠️ | — | German audio; DV confirmed — use if EN unavailable |
+| 31 | Troy (Director's Cut) | 2004 | Epic | `G:\Troy.2004...mkv` | MKV | ✅ | ⚠️ | — | German audio; reserve for epic/historical gap |
+| 32 | Kingdom of Heaven (DC) | 2005 | Epic/Historical | `G:\Koenigreich.der.Himmel...mkv` | MKV | ✅ | ⚠️ | — | German audio; reserve |
+| 33 | The Hurt Locker | 2008 | War/Drama | `G:\Toedliches.Kommando...mkv` | MKV | ✅ | ⚠️ | — | German audio; reserve |
+| 34 | V for Vendetta | 2005 | Action/Sci-Fi | `G:\V.for.Vendetta...iso` | ISO | 🔍 | ⚠️ | — | ISO — needs mounting; reserve |
+| 35 | MI: Dead Reckoning Pt 1 | 2023 | Action | `G:\Mission.Impossible.Dead.Reckoning...iso` | ISO | 🔍 | ⚠️ | — | ISO — needs mounting; reserve |
+| 36 | Top Gun: Maverick | 2022 | Action | `G:\Top.Gun.Maverick...` | RAR | ✅ | ⚠️ | — | Still in RAR archives — needs extraction first |
+| 37 | Weapons | 2025 | Thriller | `G:\Weapons.2025...mkv` | MKV | ✅ | ✅ | — | DV HDR10+; reserve |
+| 38 | 28 Years Later: Bone Temple | 2026 | Horror | `G:\28.Years.Later.The.Bone.Temple...mkv` | MKV | ✅ | ✅ | — | WEB-DL DV; reserve |
+
+#### On disk — no DV (skip for training)
+
+| Title | Year | Location | HDR | Note |
 |---|---|---|---|---|
-| Action | 5 | 2 | 1 | 8 |
-| Sci-Fi | 4 | 1 | 1 | 6 |
-| Superhero | 2 | 1 | 1 | 4 |
-| Drama | 2 | 1 | 1 | 4 |
-| Horror | 2 | 0 | 1 | 3 |
-| Animation | 1 | 1 | 0 | 2 |
-| Comedy | 1 | 0 | 1 | 2 |
-| Classic/Epic | 2 | 0 | 0 | 2 |
+| Oppenheimer | 2023 | `G:\Oppenheimer...ESiR` | HDR10 | EUR disc — HDR10 only; US disc has DV |
+| Se7en | 1995 | `G:\Se7en...` | HDR10 | Disc confirmed HDR10 only |
+| Last Breath | 2025 | `G:\Last.Breath...` | HDR10 | No DV track on disc |
+| Heat | 1995 | `G:\Heat.1995...mkv` | HDR10+ | No DV |
+| Nope | 2022 | `G:\Nope 2022...mkv` | HDR10 | No DV |
+| Exodus: Gods and Kings | 2014 | `G:\Exodus Gods and Kings.m2ts` | HDR10 | Single m2ts, likely no DV |
 
-**Full title list (DV-verified, revised Aug 2026):**
+#### Download needed — genre gap-fillers
 
-DV status verified against studio disc specs and streaming DV catalogues.
-Replaced 5 confirmed-No DV titles and 5 uncertain titles with confirmed alternatives.
+Priority: fill Comedy, classic Horror, and Superhero Drama gaps not covered by G:\.
 
-| Title | Year | Genre | Split | DV | Visual rationale |
-|---|---|---|---|---|---|
-| John Wick: Chapter 4 | 2023 | Action | Train | ✅ | Neon geometry — Sacré-Cœur and Osaka nightclub as architectural choreography |
-| Top Gun: Maverick | 2022 | Action | Train | ✅ | Bright IMAX aerial — F-18s against sunlit ocean and mountain corridors |
-| Mission: Impossible – Fallout | 2018 | Action | Train | ✅ | Replaces Atomic Blonde (UHD HDR10 only); Fallout confirmed DV, Prague/Paris/Kashmir contrast |
-| Nobody | 2021 | Action | Train | ✅ | Replaces Collateral (disc uncertain); Universal DV confirmed, neon-lit suburban carnage |
-| Raiders of the Lost Ark | 1981 | Action | Train | ✅ | Paramount 4K boxset confirmed DV — warm amber celluloid adventure |
-| Warfare | 2025 | Action | Val | ✅ | Lionsgate 2025 — DV expected, handheld verité desaturated battlefield |
-| The Northman | 2022 | Action | Val | ✅ | Focus/Universal — DV confirmed on streaming; fog-drenched Icelandic near-monochrome |
-| Bullet Train | 2022 | Action | Test | ✅ | Sony DV confirmed on disc — neon-saturated Japanese pop-art Shinkansen |
-| Dune: Part Two | 2024 | Sci-Fi | Train | ✅ | WB UHD confirmed DV — burnt-amber IMAX desert, near-monochromatic sandworm |
-| The Matrix Resurrections | 2021 | Sci-Fi | Train | ✅ | Replaces The Matrix 1999 (uncertain); WB/Max confirmed DV, meta-neon aesthetic |
-| Interstellar | 2014 | Sci-Fi | Train | ✅ | Replaces 2001 (HDR10 only); Paramount DV confirmed — IMAX grain, cold space minimalism |
-| Alien: Romulus | 2024 | Sci-Fi | Train | ✅ | Disney UHD confirmed DV — deep industrial shadow, near-total darkness |
-| Godzilla vs. Kong | 2021 | Sci-Fi | Val | ✅ | Replaces Godzilla Minus One (uncertain); WB UHD confirmed DV, neon urban monster |
-| Hunger Games: Ballad | 2023 | Sci-Fi | Test | ✅ | Lionsgate UHD confirmed DV — Capitol gold vs District grey binary |
-| Black Panther | 2018 | Superhero | Train | ✅ | All MCU UHD/Disney+ carry DV — Afrofuturist purples, golds, neon waterfalls |
-| Zack Snyder's Justice League | 2021 | Superhero | Train | ✅ | Replaces Watchmen 2009 (uncertain); WB/Max DV confirmed, 4:3 IMAX desaturation |
-| Joker | 2019 | Superhero | Val | ✅ | WB UHD confirmed DV — grimy 1970s Gotham, expressionistic brown-green decay |
-| The Batman | 2022 | Superhero | Test | ✅ | WB UHD confirmed DV — perpetual rain-soaked noir, amber as only accent |
-| 1917 | 2019 | Drama | Train | ✅ | Replaces Schindler's List (HDR10 only); Universal DV confirmed — one-take muddy WWI |
-| Babylon | 2022 | Drama | Train | ✅ | Paramount DV confirmed — maximalist 1920s Hollywood, saturated torchlit parties |
-| All Quiet on the Western Front | 2022 | Drama | Val | ✅ | Netflix original — DV confirmed, mud-brown naturalistic WWI grey grain |
-| No Country for Old Men | 2007 | Drama | Test | ✅ | Replaces Taxi Driver 1976 (HDR10 only); Paramount DV confirmed — sun-bleached Texas desert |
-| The Conjuring | 2013 | Horror | Train | ✅ | Replaces The Shining 1980 (uncertain); WB UHD DV confirmed — cold farmhouse dread |
-| A Quiet Place | 2018 | Horror | Train | ✅ | Paramount UHD confirmed DV — muted natural-light rural, golden-hour grain |
-| Smile | 2022 | Horror | Test | ✅ | Paramount UHD confirmed DV — deliberately flat clinical daylight horror |
-| Spider-Man: Across the Spider-Verse | 2023 | Animation | Train | ✅ | Sony DV confirmed — each dimension wholly distinct, Impressionist to halftone |
-| Encanto | 2021 | Animation | Val | ✅ | Replaces Despicable Me 2010 (uncertain); Disney UHD/Disney+ DV confirmed — vibrant magic-realist Colombian palette |
-| Knives Out | 2019 | Comedy | Train | ✅ | Lionsgate UHD confirmed DV — autumnal gothic estate, warm amber interiors |
-| The Grand Budapest Hotel | 2014 | Comedy | Test | ✅ | Replaces Groundhog Day 1993 (HDR10 only); Fox/Disney DV — pastel storybook palette |
-| Gladiator | 2000 | Classic/Epic | Train | ✅ | Replaces Lawrence 1962 (HDR10 only); Paramount DV confirmed — warm arena, desaturated forest |
-| Lord of the Rings: Fellowship | 2001 | Classic/Epic | Train | ✅ | WB 4K Extended confirmed DV — lush NZ vistas, deep chiaroscuro underground |
+| # | Title | Year | Genre | DV | Priority | Split | Why needed |
+|---|---|---|---|---|---|---|---|
+| D1 | Joker | 2019 | Superhero/Drama | ✅ | High | Val | WB UHD; grimy Gotham — different from current superhero coverage |
+| D2 | The Batman | 2022 | Superhero/Noir | ✅ | High | Test | WB UHD; perpetual rain noir — strong contrast to WW84 |
+| D3 | A Quiet Place | 2018 | Horror | ✅ | High | Train | Paramount UHD; natural-light rural — fills pure horror Train slot |
+| D4 | Knives Out | 2019 | Comedy/Mystery | ✅ | High | Train | Lionsgate UHD; autumnal interiors — only Comedy candidate |
+| D5 | The Grand Budapest Hotel | 2014 | Comedy | ✅ | Medium | Test | Fox/Disney; pastel storybook — unique palette, fills Comedy Test |
+| D6 | Interstellar | 2014 | Sci-Fi | ✅ | Medium | Train | Paramount UHD; IMAX grain + cold space minimalism |
+| D7 | 1917 | 2019 | Drama/War | ✅ | Medium | Train | Universal UHD; one-take muddy WWI, fills Drama Train |
+| D8 | All Quiet on the Western Front | 2022 | Drama/War | ✅ | Medium | Val | Netflix DV; grey grain naturalistic — fills Drama Val |
+| D9 | Lord of the Rings: Fellowship | 2001 | Epic | ✅ | Low | Train | WB 4K Extended; classic deep shadow + NZ vistas |
+| D10 | Encanto | 2021 | Animation | ✅ | Low | Val | Disney+; vibrant magic-realist — fills Animation Val slot |
 
 ## Next steps
 
