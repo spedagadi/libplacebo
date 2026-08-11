@@ -75,8 +75,8 @@ libplacebo already runs for spline tone mapping. Zero additional compute at infe
 | `average_maxrgb` | 1 | `pl_peak_detect` avg_pq_y |
 | `fraction_bright_pixels` | 1 | histogram bin count >0.5 |
 | `distrib_val_3..8` | 6 | histogram percentiles p25–p99 |
-| `zone_mean_rR_cC` (3×3) | 9 | zonal histogram means |
-| `zone_max_rR_cC` (3×3) | 9 | zonal histogram peaks |
+| `zone_mean_rR_cC` (3×3) | 9 | zonal histogram means — **auto-enabled at ≥3k train scenes** |
+| `zone_max_rR_cC` (3×3) | 9 | zonal histogram peaks — **auto-enabled at ≥3k train scenes** |
 
 ## Results (single title — The Little Things 2021, DV Profile 5)
 

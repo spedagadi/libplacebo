@@ -75,13 +75,35 @@ SAT_FEATURE_COLS = (
     [f'zone_max_r{r}_c{c}'  for r in range(_SAT_ROWS) for c in range(_SAT_COLS)]
 )
 
-# Base 9 pixel features + 18 SAT spatial features = 27 total
-# All inference-safe: SAT zones computed from GPU histogram at 3x3 zone granularity
-FEATURE_COLS = (
+BASE_FEATURE_COLS = (
     ['maxscl', 'average_maxrgb', 'fraction_bright_pixels'] +
-    [f'distrib_val_{i}' for i in range(3, 9)] +
-    SAT_FEATURE_COLS
+    [f'distrib_val_{i}' for i in range(3, 9)]
 )
+
+# 5 derived SAT features — compact spatial representation.
+# Captures the same spatial structure as all 18 raw zones but with fewer parameters,
+# making it suitable for smaller datasets (~1-3k scenes).
+# Computed from the 3x3 zone grid during extraction (requires dv_dataset_sat.csv).
+DERIVED_SAT_COLS = [
+    'sat_centre_max',          # zone_max_r1_c1 — centre zone peak (subject brightness)
+    'sat_peak_zone_max',       # max(all zone_max) — where is the brightest point
+    'sat_highlight_concentration',  # peak_zone_max / maxscl — how clustered are highlights
+    'sat_centre_vs_edge',      # zone_mean_r1_c1 / mean(edge zones) — subject vs background
+    'sat_vertical_gradient',   # mean(top zones) / mean(bottom zones) — sky vs ground
+]
+
+# Full 27-feature set (base + all 18 raw SAT zones)
+FEATURE_COLS = BASE_FEATURE_COLS + SAT_FEATURE_COLS
+
+# Feature set variants — select via FEATURE_SET constant
+FEATURE_SET = "auto"   # "base9" | "derived14" | "full27" | "auto"
+# auto behaviour:
+#   < 1k  train scenes → base9      (single title, safe)
+#   1k-3k train scenes → derived14  (2-3 titles, good tradeoff)
+#   >= 3k train scenes → full27     (4+ titles, all features)
+
+SAT_MIN_SCENES_DERIVED = 1000   # min scenes for derived14
+SAT_MIN_SCENES_FULL    = 3000   # min scenes for full27
 
 
 # ---------------------------------------------------------------------------
@@ -256,6 +278,41 @@ def write_rpu_lut(t, path):
 # ---------------------------------------------------------------------------
 # Data loading + merge
 # ---------------------------------------------------------------------------
+def add_derived_sat(df):
+    """Compute 5 derived SAT features from raw zone columns if present."""
+    has_zones = 'zone_max_r1_c1' in df.columns
+    if not has_zones:
+        return df
+
+    # Centre max (subject brightness)
+    df['sat_centre_max'] = df['zone_max_r1_c1']
+
+    # Peak zone max (brightest point anywhere)
+    max_cols = [f'zone_max_r{r}_c{c}' for r in range(3) for c in range(3)]
+    df['sat_peak_zone_max'] = df[max_cols].max(axis=1)
+
+    # Highlight concentration: how clustered are highlights (1.0 = all in one zone)
+    df['sat_highlight_concentration'] = (
+        df['sat_peak_zone_max'] / df['maxscl'].clip(lower=1e-6)
+    ).clip(0, 2)
+
+    # Centre vs edge: subject brightness relative to background
+    edge_mean_cols = [f'zone_mean_r{r}_c{c}' for r in range(3) for c in range(3)
+                      if not (r == 1 and c == 1)]
+    edge_mean = df[edge_mean_cols].mean(axis=1).clip(lower=1e-6)
+    df['sat_centre_vs_edge'] = (df['zone_mean_r1_c1'] / edge_mean).clip(0, 5)
+
+    # Vertical gradient: top half vs bottom half mean brightness
+    top_cols    = [f'zone_mean_r0_c{c}' for c in range(3)]
+    bottom_cols = [f'zone_mean_r2_c{c}' for c in range(3)]
+    bottom_mean = df[bottom_cols].mean(axis=1).clip(lower=1e-6)
+    df['sat_vertical_gradient'] = (
+        df[top_cols].mean(axis=1) / bottom_mean
+    ).clip(0, 5)
+
+    return df
+
+
 def load_data(dataset_csv, l1_csv=None):
     df = pd.read_csv(dataset_csv)
     df['scene_id'] = df['scene_refresh'].cumsum()
@@ -268,6 +325,7 @@ def load_data(dataset_csv, l1_csv=None):
         for c in ['l1_min_pq','l1_max_pq','l1_avg_pq']:
             df[c] = df[c] / 4095.0
     df = df.dropna(subset=['maxscl','seg0_c0']).reset_index(drop=True)
+    df = add_derived_sat(df)   # compute derived SAT features if raw zones present
     return df
 
 
@@ -275,8 +333,32 @@ def load_data(dataset_csv, l1_csv=None):
 # Train
 # ---------------------------------------------------------------------------
 def train(df):
-    feats = [c for c in FEATURE_COLS if c in df.columns and df[c].std() > 0]
-    print(f"Features: {feats}")
+    # Select feature set based on FEATURE_SET constant:
+    #   "base9"     — 9 pixel-only features, always safe
+    #   "derived14" — 9 base + 5 derived SAT features (~1k scenes sufficient)
+    #   "full27"    — 9 base + 18 raw SAT zone features (needs ~3k scenes)
+    #   "auto"      — derived14 if <3k train scenes, full27 if >=3k
+    all_scenes   = df['scene_id'].nunique() if 'scene_id' in df.columns else len(df) // 3
+    train_scenes = all_scenes // 2
+
+    fs = FEATURE_SET
+    if fs == "auto":
+        if train_scenes >= SAT_MIN_SCENES_FULL:
+            fs = "full27"
+        elif train_scenes >= SAT_MIN_SCENES_DERIVED:
+            fs = "derived14"
+        else:
+            fs = "base9"
+
+    if fs == "base9":
+        candidate_cols = BASE_FEATURE_COLS
+    elif fs == "derived14":
+        candidate_cols = BASE_FEATURE_COLS + DERIVED_SAT_COLS
+    else:  # full27
+        candidate_cols = FEATURE_COLS
+
+    feats = [c for c in candidate_cols if c in df.columns and df[c].std() > 0]
+    print(f"Features: {len(feats)}  [FEATURE_SET={fs}, train_scenes={train_scenes}]")
 
     targets, valid_idx = [], []
     for i, row in df.iterrows():
