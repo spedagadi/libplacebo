@@ -135,12 +135,19 @@ Scale targets for XGBoost and cross-title generalisation:
 
 > **Extractor note — Profile 7 BDMV:** The RPU is in the EL stream file (`BDMV/STREAM/` — separate m2ts from the 4K BL). `dv_metadata_extract.py` must target the EL file, not the main title. Profile 7 MKVs mux BL+EL into a single `v:0` stream — `v:0` works and yields RPU NALs normally (verified: 123 RPU NALs/5s on Rush).
 
-#### On disk — G:\ and D:\
+> **Source quality note:** Training data should come from **disc remuxes only** (BDMV/MKV remux). WEB-DL and streaming encodes are re-compressed from a different master than the one the colorist used when authoring the DV RPU metadata. The pixel statistics extracted from a WEB-DL do not faithfully represent the feature distribution the DV colorist was responding to — this adds noise to the feature→label relationship. WEB-DL titles may be used for **hypothesis testing and prototyping** but should not be part of the training corpus.
+
+#### Hypothesis baseline — WEB-DL (prototype only, excluded from training corpus)
+
+| Title | Year | Location | Format | DV | Profile | Note |
+|---|---|---|---|---|---|---|
+| The Little Things | 2021 | `D:\Jdownloader\TeLtlTig...` | WEB-DL mp4 | ✅ | 5 | 2060 scenes extracted; used for initial hypothesis validation only |
+
+#### On disk — G:\ disc remuxes
 
 | # | Title | Year | Genre | Location | Format | DV | Profile | Status | Split | Notes |
 |---|---|---|---|---|---|---|---|---|---|---|
-| 1 | The Little Things | 2021 | Crime/Thriller | `D:\Jdownloader\TeLtlTig...` | m2ts+mp4 | ✅ | 5 | ✅ | **Baseline** | 2060 scenes extracted |
-| 2 | Dune: Part Two | 2024 | Sci-Fi | `G:\Dune.Part.Two...DOUHD` | BDMV | ✅ | 7 | ⚠️ | Train | EL 2110 kbps — use EL stream file for RPU |
+| 1 | Dune: Part Two | 2024 | Sci-Fi | `G:\Dune.Part.Two...DOUHD` | BDMV | ✅ | 7 | ⚠️ | Train | EL 2110 kbps — use EL stream file for RPU |
 | 3 | Alien: Romulus | 2024 | Sci-Fi/Horror | `G:\Alien.Romulus...DOUHD` | BDMV | ✅ | 7 | ⚠️ | Train | EL 5528 kbps — use EL stream file for RPU |
 | 4 | Furiosa | 2024 | Action | `G:\Furiosa...GLiMMER` | BDMV | ✅ | 7 | ⚠️ | Train | EL 2106 kbps — use EL stream file for RPU |
 | 5 | Godzilla Minus One | 2023 | Sci-Fi | `G:\Godzilla.Minus.One...AREY` | BDMV | ✅ | 7 | ⚠️ | Train | EL 6869 kbps — JPN disc; use EL stream |
