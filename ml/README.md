@@ -153,7 +153,19 @@ Scale targets for XGBoost and cross-title generalisation:
 
 ---
 
-##### Train (14 titles)
+##### Calibration (3 titles — hyperparameter search only)
+
+> Used exclusively for Bayesian HPO over GBR hyperparameters (`n_estimators`, `max_depth`, `learning_rate`, `subsample`, `min_samples_leaf`). Titles are run many times during search — they must be separate from Train to avoid overfitting hyperparameters to the training distribution, and separate from Val/Test to preserve their independence. German audio is irrelevant here since calibration uses only pixel features + RPU labels.
+
+| Title | Year | Genre | Format | DV | P | Tier | Why |
+|---|---|---|---|---|---|---|---|
+| Everest | 2015 | Drama/Adventure | MKV | ✅ | **8** | H | Extreme bright snow + deep shadow — widest dynamic range; stresses both ends of the polynomial |
+| The Hurt Locker | 2008 | War/Drama | MKV | ✅ | **7** | P | Dark, muted, high contrast — stresses shadow region and low-light polynomial segments |
+| Troy (DC) | 2004 | Epic/Action | MKV | ✅ | **7** | P | Mixed daylight/interior, high EL bitrate — stresses highlight region and slope transitions |
+
+---
+
+##### Train (13 titles)
 
 | Title | Year | Genre | Format | DV | P | Tier | Notes |
 |---|---|---|---|---|---|---|---|
@@ -168,7 +180,6 @@ Scale targets for XGBoost and cross-title generalisation:
 | Pacific Rim | 2013 | Sci-Fi/Action | MKV | ✅ | **8** | H | DOVI confirmed |
 | Prometheus | 2012 | Sci-Fi/Horror | MKV | ✅ | **8** | H | DOVI confirmed |
 | The Creator | 2023 | Sci-Fi | MKV | ✅ | **8** | H | DOVI confirmed |
-| Everest | 2015 | Drama/Adventure | MKV | ✅ | **8** | H | DOVI confirmed |
 | Kingdom of the Planet of the Apes | 2024 | Sci-Fi | MKV | ✅ | **8** | H | DOVI confirmed |
 | 28 Years Later | 2025 | Horror | BDMV | ✅ | ? | P | Profile TBD |
 
@@ -210,14 +221,12 @@ Scale targets for XGBoost and cross-title generalisation:
 
 ---
 
-##### Reserve (German audio or unverified ISO — usable if genre gap remains)
+##### Reserve (unassigned — pull in if genre gap remains after downloads)
 
 | Title | Year | Genre | Format | DV | P | Notes |
 |---|---|---|---|---|---|---|
-| John Wick: Ch4 | 2023 | Action | MKV | ✅ | **7** | German audio; DOVI confirmed — use if EN unavailable |
-| Troy (DC) | 2004 | Epic | MKV | ✅ | **7** | German audio; DOVI confirmed |
+| John Wick: Ch4 | 2023 | Action | MKV | ✅ | **7** | German audio — replace with EN download (D9) |
 | Kingdom of Heaven (DC) | 2005 | Epic | MKV | ✅ | **7** | German audio; DOVI confirmed |
-| The Hurt Locker | 2008 | War/Drama | MKV | ✅ | **7** | German audio; DOVI confirmed |
 | V for Vendetta | 2005 | Action/Sci-Fi | ISO | 🔍 | ? | ISO — mount + ffprobe |
 | MI: Dead Reckoning Pt 1 | 2023 | Action | ISO | 🔍 | ? | ISO — mount + ffprobe |
 
