@@ -635,6 +635,8 @@ def main():
                     help="Append to existing CSV, resuming after last row's pts_time.")
     ap.add_argument("--start", type=float, default=0.0)
     ap.add_argument("--end",   type=float, default=None)
+    ap.add_argument("--no-pixels", action="store_true",
+                    help="Stage 1 manifest mode: skip pixel decode, extract RPU metadata only.")
     args = ap.parse_args()
 
     print(f"Probing: {args.input}")
@@ -646,8 +648,10 @@ def main():
     dv_profile = disc_profile or probe_profile
     end_sec = args.end if args.end is not None else total_dur
 
-    needs_pixel_decode = (dv_profile != 8)
-    feature_src = "HDR10+ side-data" if not needs_pixel_decode else f"pixel decode (Profile {dv_profile})"
+    needs_pixel_decode = (dv_profile != 8) and not args.no_pixels
+    feature_src = ("HDR10+ side-data" if dv_profile == 8
+                   else ("manifest only — no pixel decode" if args.no_pixels
+                         else f"pixel decode (Profile {dv_profile})"))
     rpu_note = Path(rpu_path).name if rpu_path != pixel_path else "(same as pixel)"
 
     print(f"  Duration: {total_dur:.1f}s ({total_dur/3600:.2f}h)  DV profile: {dv_profile}")
