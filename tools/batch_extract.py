@@ -114,13 +114,31 @@ def dismount_iso(iso_path):
     run_ps(f'Dismount-DiskImage -ImagePath "{iso_path}"')
 
 
+def _is_complete(csv_path: Path, min_rows: int = 1000) -> bool:
+    """Heuristic: a CSV with >min_rows is likely fully extracted."""
+    try:
+        with open(csv_path, "r") as f:
+            count = sum(1 for _ in f)
+        return count > min_rows
+    except Exception:
+        return False
+
+
 def extract_title(split, name, source, is_iso, no_pixels, dry_run):
     out_dir = Path(OUT_ROOT) / split
     out_csv = out_dir / f"{name}.csv"
 
+    resume = False
     if out_csv.exists():
-        print(f"  [skip] {name} — already exists ({out_csv})")
-        return True
+        size = out_csv.stat().st_size
+        if size <= 512:
+            out_csv.unlink()
+        elif _is_complete(out_csv):
+            print(f"  [done]   {name} — complete ({size//1024}KB), skipping")
+            return True
+        else:
+            print(f"  [resume] {name} — partial CSV {size//1024}KB, resuming from last row")
+            resume = True
 
     mount_point = None
     actual_source = source
@@ -146,6 +164,8 @@ def extract_title(split, name, source, is_iso, no_pixels, dry_run):
     ]
     if no_pixels:
         cmd.append("--no-pixels")
+    if resume:
+        cmd.append("--resume")
 
     if dry_run:
         print(f"  [dry] {' '.join(str(c) for c in cmd)}")
