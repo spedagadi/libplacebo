@@ -177,17 +177,17 @@ Scale targets for XGBoost and cross-title generalisation:
 |---|---|---|---|---|---|---|---|---|
 | Alien: Romulus | 2024 | Sci-Fi/Horror | BDMV | ✅ | 7 | P | ✅ | EL 5528 kbps; BDMV folder — EL auto-discovered |
 | Furiosa | 2024 | Action | BDMV | ✅ | 7 | P | ✅ | EL 2106 kbps; BDMV folder — EL auto-discovered |
-| Warfare | 2025 | War/Action | BDMV | ✅ | ? | P | ✅ | Profile TBD; extractor handles P5/7/8 automatically |
-| Spotlight | 2015 | Drama | BDMV | ✅ | 7 | P | ✅ | **Tested** — 124 rows, P7 v:1 interleaved, all features populated |
-| Zodiac | 2007 | Crime/Thriller | BDMV | ✅ | 7 | P | ✅ | EL 14879 kbps; BDMV folder — EL auto-discovered |
+| Warfare | 2025 | War/Action | BDMV | ✅ | **7** | P | ✅ | P7 v:1 interleaved; EL auto-discovered |
+| Spotlight | 2015 | Drama | BDMV | ✅ | **7** | P | ✅ | **Tested** — 124 rows, P7 v:1 interleaved, all features populated |
+| Zodiac | 2007 | Crime/Thriller | BDMV | ✅ | **7** | P | ✅ | P7 v:1; EL 14879 kbps; EL auto-discovered |
 | Rush | 2013 | Sport/Drama | MKV | ✅ | **7** | P | ✅ | **Tested** — 126 rows, P7 v:0, all features populated |
-| Wonder Woman 1984 | 2020 | Superhero | BDMV | ✅ | ? | P | ✅ | Profile TBD; extractor handles automatically |
-| First Blood | 1982 | Action | BDMV | ✅ | ? | P | ✅ | Classic grain; profile TBD |
+| Wonder Woman 1984 | 2020 | Superhero | BDMV | ✅ | **7** | P | ✅ | P7 v:1 interleaved; EL auto-discovered |
+| First Blood | 1982 | Action | BDMV | ✅ | **7** | P | ✅ | P7 v:1 interleaved; EL auto-discovered |
 | Pacific Rim | 2013 | Sci-Fi/Action | MKV | ✅ | **8** | H | ✅ | P8; DOVI confirmed |
 | Prometheus | 2012 | Sci-Fi/Horror | MKV | ✅ | **8** | H | ✅ | P8; DOVI confirmed |
 | The Creator | 2023 | Sci-Fi | MKV | ✅ | **8** | H | ✅ | P8; DOVI confirmed |
 | Kingdom of the Planet of the Apes | 2024 | Sci-Fi | MKV | ✅ | **8** | H | ✅ | P8; DOVI confirmed |
-| 28 Years Later | 2025 | Horror | BDMV | ✅ | ? | P | ✅ | Profile TBD; extractor handles automatically |
+| 28 Years Later | 2025 | Horror | BDMV | ✅ | **7** | P | ✅ | P7 v:1 interleaved; EL auto-discovered |
 
 ---
 
@@ -195,13 +195,13 @@ Scale targets for XGBoost and cross-title generalisation:
 
 | Title | Year | Genre | Format | DV | P | Tier | Status | Notes |
 |---|---|---|---|---|---|---|---|---|
-| How to Train Your Dragon | 2025 | Animation | BDMV | ✅ | 7 | P | ✅ | EL 5917 kbps; BDMV folder — EL auto-discovered |
-| MI: The Final Reckoning | 2025 | Action | BDMV | ✅ | 7 | P | ✅ | EL 4029 kbps; BDMV folder — EL auto-discovered |
-| The Invisible Man | 2020 | Horror/Sci-Fi | BDMV | ✅ | 7 | P | ✅ | EL 7082 kbps; BDMV folder — EL auto-discovered |
-| Tron: Legacy | 2010 | Sci-Fi | BDMV | ✅ | ? | P | ✅ | Profile TBD; near-total black + isolated neon |
-| F1: The Movie | 2025 | Sport/Drama | BDMV | ✅ | ? | P | ✅ | Profile TBD; bright daylight + paddock |
+| How to Train Your Dragon | 2025 | Animation | BDMV | ✅ | **7** | P | ✅ | P7 v:1; EL 5917 kbps; EL auto-discovered |
+| MI: The Final Reckoning | 2025 | Action | BDMV | ✅ | **7** | P | ✅ | P7 v:1; EL 4029 kbps; EL auto-discovered |
+| The Invisible Man | 2020 | Horror/Sci-Fi | BDMV | ✅ | **7** | P | ✅ | P7 v:1; EL 7082 kbps; EL auto-discovered |
+| Tron: Legacy | 2010 | Sci-Fi | BDMV | ✅ | **7** | P | ✅ | P7 v:1 interleaved; EL auto-discovered |
+| F1: The Movie | 2025 | Sport/Drama | BDMV | ✅ | **7** | P | ✅ | P7 v:1 interleaved; EL auto-discovered |
 | Weapons | 2025 | Thriller | MKV | ✅ | **7** | H | ✅ | P7 Hybrid; DOVI confirmed |
-| Ballerina | 2025 | Action | BDMV | ✅ | ? | P | ✅ | Profile TBD; John Wick universe |
+| Ballerina | 2025 | Action | BDMV | ✅ | **7** | P | ✅ | P7 v:1 interleaved; EL auto-discovered |
 
 ---
 
