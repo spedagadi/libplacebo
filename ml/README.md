@@ -78,7 +78,7 @@ libplacebo already runs for spline tone mapping. Zero additional compute at infe
 | `zone_mean_rR_cC` (3×3) | 9 | zonal histogram means — **auto-enabled at ≥3k train scenes** |
 | `zone_max_rR_cC` (3×3) | 9 | zonal histogram peaks — **auto-enabled at ≥3k train scenes** |
 
-## Results (single title — The Little Things 2021, DV Profile 5)
+## Results (prototype baseline — The Little Things 2021, WEB-DL P5)
 
 **Experiment B** — curve MAE vs DV gold, 579 held-out scenes:
 
@@ -126,12 +126,15 @@ Scale targets for XGBoost and cross-title generalisation:
 
 ### Dataset inventory — confirmed DV titles (scanned Aug 2026)
 
-**DV verification method:** MKVs probed via `ffprobe` DOVI configuration record (`side_data_type=DOVI configuration record` confirmed on all 13 MKVs). BDMV folders verified via BDNFO EL track presence. ISOs unverified — likely based on known disc specs.
+**DV verification method:** All on-disk titles stream-probed via UNSPEC62 RPU NAL scan and/or `ffprobe` DOVI configuration record. No `?` profiles remain.
 
-**Status key:** ✅ Ready to extract · ⚠️ Needs work (see Notes) · ⬇️ Download needed  
-**DV key:** ✅ Stream-verified · 🔍 Likely (known disc, not stream-probed) · ❌ No DV  
+**Status key:** ✅ Ready to extract · ⚠️ Needs work · ⬇️ Download needed  
+**DV key:** ✅ Stream-verified · ❌ No DV  
 **Format:** BDMV = complete disc folder · ISO = disc image · MKV = remux/encode  
-**Profile:** 5 = RPU in single layer (v:0) · 7 = BL+EL, RPU in EL (MKV: EL muxed into v:0; BDMV: EL is separate stream file) · 8 = HDR10-compatible single layer (v:0)
+**Profile support:**
+- **P7** (dual-layer BL+EL) — primary training format; all USA UHD discs and COMPLETE.UHD.BLURAY rips. EL carries the RPU, auto-discovered via `discover_sources()`.
+- **P8** (HDR10-compatible single layer) — hybrid remuxes (disc video + streaming RPU); supported, lower priority.
+- **P5** (pure DV single layer) — streaming/WEB-DL only; **excluded from training corpus** (pixel stats don't match the mastering environment). Used only for initial hypothesis testing.
 
 > **Extractor — source auto-discovery (Aug 2026):** `dv_metadata_extract.py` now accepts any source format. Pass a disc folder path for BDMV titles — `discover_sources()` probes for UNSPEC62 RPU NALs in v:0 and v:1, finds the EL stream automatically, and calibrates BDMV timestamp offsets. Tested: Rush P7 MKV (126 rows) and Spotlight P7 BDMV (124 rows), both with full polynomial + pixel + SAT features. ISOs: mount via `Mount-DiskImage` in PowerShell, then pass the mount point (`E:\`) as the folder input.
 
@@ -175,8 +178,8 @@ Scale targets for XGBoost and cross-title generalisation:
 
 | Title | Year | Genre | Format | DV | P | Tier | Status | Notes |
 |---|---|---|---|---|---|---|---|---|
-| Alien: Romulus | 2024 | Sci-Fi/Horror | BDMV | ✅ | 7 | P | ✅ | EL 5528 kbps; BDMV folder — EL auto-discovered |
-| Furiosa | 2024 | Action | BDMV | ✅ | 7 | P | ✅ | EL 2106 kbps; BDMV folder — EL auto-discovered |
+| Alien: Romulus | 2024 | Sci-Fi/Horror | BDMV | ✅ | **7** | P | ✅ | P7 v:1; EL 5528 kbps; EL auto-discovered |
+| Furiosa | 2024 | Action | BDMV | ✅ | **7** | P | ✅ | P7 v:1; EL 2106 kbps; EL auto-discovered |
 | Warfare | 2025 | War/Action | BDMV | ✅ | **7** | P | ✅ | P7 v:1 interleaved; EL auto-discovered |
 | Spotlight | 2015 | Drama | BDMV | ✅ | **7** | P | ✅ | **Tested** — 124 rows, P7 v:1 interleaved, all features populated |
 | Zodiac | 2007 | Crime/Thriller | BDMV | ✅ | **7** | P | ✅ | P7 v:1; EL 14879 kbps; EL auto-discovered |
@@ -211,7 +214,7 @@ Scale targets for XGBoost and cross-title generalisation:
 
 | Title | Year | Genre | Format | DV | P | Status | Notes |
 |---|---|---|---|---|---|---|---|
-| **Dune: Part Two** * | 2024 | Sci-Fi | BDMV | ✅ | 7 | ✅ | EL auto-discovered; pass disc folder as input |
+| **Dune: Part Two** * | 2024 | Sci-Fi | BDMV | ✅ | **7** | ✅ | P7 v:1; EL auto-discovered |
 | **Top Gun: Maverick** * | 2022 | Action | ISO | ✅ | **7** | ✅ | P7 v:1 confirmed; mount ISO → pass mount point as folder |
 | **Godzilla Minus One** * | 2023 | Sci-Fi | BDMV | ✅ | **7** | ✅ | JPN disc; EL auto-discovered |
 | **Civil War** * | 2024 | War/Action | MKV | ✅ | **7** | ✅ | P7; DOVI confirmed |
