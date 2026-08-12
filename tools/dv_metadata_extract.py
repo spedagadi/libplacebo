@@ -466,29 +466,44 @@ def compute_texture_and_locality(y_2d: np.ndarray, zone_feats: dict,
     return feats
 
 
-def decode_chunk_pixel_stats(input_path: str, start_sec: float, duration_sec: float) -> dict:
+def decode_chunk_pixel_stats(input_path: str, start_sec: float, duration_sec: float,
+                             nvdec: bool = False) -> dict:
     """
     Decode the chunk at low resolution via ffmpeg at 1fps, extract 10-bit PQ Y channel,
     compute luminance stats per frame.
 
+    nvdec=True: use NVDEC hardware decode + GPU scaling (~4x faster on RTX cards).
     Returns dict: round(abs_pts_sec) -> stats_dict
-    The caller looks up a frame's pixel stats by rounding its pts_time to the nearest second.
     """
     w, h = PIXEL_W, PIXEL_H
     y_bytes = w * h * 2                           # 10-bit LE, 2 bytes/pixel
     uv_bytes = (w // 2) * (h // 2) * 2 * 2       # U + V planes
     frame_bytes = y_bytes + uv_bytes
 
-    cmd = [
-        FFMPEG, "-v", "error",
-        "-ss", str(start_sec),
-        "-t", str(duration_sec),
-        "-i", input_path,
-        "-vf", f"scale={w}:{h}:flags=bilinear,fps=1",
-        "-pix_fmt", "yuv420p10le",
-        "-f", "rawvideo",
-        "pipe:1",
-    ]
+    if nvdec:
+        # NVDEC path: decode on GPU, scale on GPU, download to CPU
+        cmd = [
+            FFMPEG, "-v", "error",
+            "-hwaccel", "cuda", "-hwaccel_output_format", "cuda",
+            "-ss", str(start_sec),
+            "-t", str(duration_sec),
+            "-i", input_path,
+            "-vf", f"scale_cuda={w}:{h}:format=p010,hwdownload,format=p010le,fps=1",
+            "-pix_fmt", "p010le",
+            "-f", "rawvideo",
+            "pipe:1",
+        ]
+    else:
+        cmd = [
+            FFMPEG, "-v", "error",
+            "-ss", str(start_sec),
+            "-t", str(duration_sec),
+            "-i", input_path,
+            "-vf", f"scale={w}:{h}:flags=bilinear,fps=1",
+            "-pix_fmt", "yuv420p10le",
+            "-f", "rawvideo",
+            "pipe:1",
+        ]
 
     proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
     result = {}
@@ -637,6 +652,8 @@ def main():
     ap.add_argument("--end",   type=float, default=None)
     ap.add_argument("--no-pixels", action="store_true",
                     help="Stage 1 manifest mode: skip pixel decode, extract RPU metadata only.")
+    ap.add_argument("--nvdec", action="store_true",
+                    help="Stage 2: use NVDEC hardware decode for ~4x faster pixel extraction (requires CUDA ffmpeg).")
     args = ap.parse_args()
 
     print(f"Probing: {args.input}")
@@ -697,7 +714,8 @@ def main():
             pixel_stats = {}
             pts_offset  = 0.0
             if needs_pixel_decode:
-                pixel_stats = decode_chunk_pixel_stats(pixel_path, chunk_start, dur)
+                pixel_stats = decode_chunk_pixel_stats(pixel_path, chunk_start, dur,
+                                                       nvdec=args.nvdec)
                 # BDMV m2ts files may have non-zero pts base — calibrate offset from first frame
                 if frames and pixel_stats:
                     first_pts = float(frames[0].get("pts_time", chunk_start) or chunk_start)

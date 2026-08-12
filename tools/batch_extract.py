@@ -104,7 +104,7 @@ def _is_complete(csv_path: Path, min_rows: int = 1000) -> bool:
         return False
 
 
-def extract_title(split, name, source, is_iso, no_pixels, dry_run):
+def extract_title(split, name, source, is_iso, no_pixels, dry_run, nvdec=False):
     out_dir = Path(OUT_ROOT) / split
     out_csv = out_dir / f"{name}.csv"
 
@@ -146,6 +146,8 @@ def extract_title(split, name, source, is_iso, no_pixels, dry_run):
         cmd.append("--no-pixels")
     if resume:
         cmd.append("--resume")
+    if not no_pixels and nvdec:
+        cmd.append("--nvdec")
 
     if dry_run:
         print(f"  [dry] {' '.join(str(c) for c in cmd)}")
@@ -182,6 +184,8 @@ def main():
                     help="Print commands without running")
     ap.add_argument("--full-pixels", action="store_true",
                     help="Stage 2: include pixel decode (slower). Default is Stage 1 manifest only.")
+    ap.add_argument("--nvdec", action="store_true",
+                    help="Use NVDEC hardware decode for Stage 2 (~4x faster on RTX cards).")
     ap.add_argument("--title", metavar="NAME",
                     help="Process only this title (short name, e.g. 'rush')")
     ap.add_argument("--workers", type=int, default=2,
@@ -208,7 +212,8 @@ def main():
 
     def _run(item):
         split, name, source, is_iso = item
-        return name, extract_title(split, name, source, is_iso, no_pixels, args.dry_run)
+        return name, extract_title(split, name, source, is_iso, no_pixels,
+                                   args.dry_run, nvdec=args.nvdec)
 
     with ThreadPoolExecutor(max_workers=workers) as pool:
         futures = {pool.submit(_run, t): t[1] for t in titles}
