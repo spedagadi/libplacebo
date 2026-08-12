@@ -2,29 +2,30 @@
 """
 Extract per-frame DV + HDR10+ metadata from a Dolby Vision file for ML dataset construction.
 
-Handles two common profiles:
-  Profile 8 (HDR10-compatible): HDR10+ bezier curve + DV source range.
-                                Input features come from HDR10+ side-data.
-  Profile 5 (pure DV):          DV RPU piecewise polynomial tone curve.
-                                Input features computed from decoded pixel Y channel (PQ luma).
+Handles DV profiles and source formats:
+  Profile 5 (pure DV, single layer):      RPU embedded in main stream v:0.
+  Profile 7 (dual layer BL+EL):
+    - MKV / ISO interleaved:  BL in v:0, EL (RPU) also accessible via v:0 or v:1.
+    - BDMV folder:            BL = largest m2ts, EL = second-largest m2ts (separate file).
+  Profile 8 (HDR10-compatible, single):   RPU in v:0; HDR10+ side-data carries features.
+
+Source formats accepted:
+  - Single file: MKV, MP4, m2ts  (pass file path)
+  - BDMV folder: pass disc root or BDMV parent (auto-discovers BL + EL streams)
+  - Mounted ISO: pass mount-point folder (treated as BDMV folder)
 
 Per-frame features (inputs):
-  - maxscl: max PQ luma code (Profile 5: max Y; Profile 8: max of R/G/B channels)
-  - average_maxrgb: mean PQ luma
-  - fraction_bright_pixels: fraction of pixels above 0.5 normalized PQ
-  - distrib_pct_0..8: percentile labels [1,5,10,25,50,75,90,95,99]
-  - distrib_val_0..8: PQ luma at those percentiles (0-1 normalized)
-  - source_min_pq, source_max_pq: DV RPU source range (both profiles)
-  - scene_refresh: 1 on scene cut
+  - maxscl, average_maxrgb, fraction_bright_pixels
+  - distrib_val_0..8: PQ luma percentiles
+  - zone_mean/max_rR_cC: 3x3 SAT spatial grid
 
 Per-frame targets (tone curve):
   Profile 8 - HDR10+: knee_x, knee_y, 9 bezier anchors
-  Profile 5 - DV RPU Y-component: up to 8 pivot segments, each quadratic polynomial
-
-Output: CSV (one row per sampled frame).
+  Profile 5/7 - DV RPU Y-component: up to 8 pivot segments, each quadratic polynomial
 
 Usage:
   python dv_metadata_extract.py INPUT.mkv -o dataset.csv --sample-fps 1
+  python dv_metadata_extract.py "G:/Dune.Part.Two.2024.COMPLETE.UHD" -o dune.csv
   python dv_metadata_extract.py INPUT.mkv -o dataset.csv --sample-fps 0.5 --resume
 """
 
@@ -114,6 +115,130 @@ COLUMNS = [
 
 
 # ---------------------------------------------------------------------------
+# Source discovery — handles MKV/MP4/m2ts, BDMV folders, and mounted ISOs
+# ---------------------------------------------------------------------------
+
+def _scan_rpu_nals(path: str, stream_sel: str = "v:0", check_secs: int = 5) -> int:
+    """Return count of UNSPEC62 (RPU) NALs found in the first check_secs of stream_sel."""
+    cmd = [FFMPEG, "-v", "error", "-i", path,
+           "-map", f"0:{stream_sel}", "-t", str(check_secs),
+           "-c:v", "copy", "-f", "hevc", "pipe:1"]
+    try:
+        proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+        data = proc.stdout.read()
+        proc.wait()
+        return sum(1 for i in range(len(data) - 5)
+                   if data[i:i+4] == b'\x00\x00\x00\x01' and ((data[i+4] >> 1) & 0x3F) == 62)
+    except Exception:
+        return 0
+
+
+def _find_bdmv_streams(folder: Path):
+    """
+    Given a BDMV disc root (or BDMV parent), locate:
+      - bl_path: largest .m2ts in BDMV/STREAM/ (base layer — used for pixel decode)
+      - el_path: second-largest .m2ts if size ratio < 50× AND it carries RPU NALs
+
+    Returns (bl_path_str, el_path_str_or_None).
+    Raises FileNotFoundError if no BDMV/STREAM found.
+    """
+    # Accept: disc_root/, disc_root/BDMV/, or disc_root/Title/ (any depth ≤ 3)
+    stream_dir = None
+    for candidate in [folder / "BDMV" / "STREAM",
+                      folder / "STREAM",
+                      folder]:
+        if candidate.is_dir() and any(candidate.glob("*.m2ts")):
+            stream_dir = candidate
+            break
+
+    if stream_dir is None:
+        raise FileNotFoundError(f"No BDMV/STREAM directory found under {folder}")
+
+    files = sorted(
+        [(p.stat().st_size, p) for p in stream_dir.glob("*.m2ts")],
+        reverse=True
+    )
+    bl_size, bl_path = files[0]
+
+    el_path = None
+    for el_size, candidate in files[1:]:
+        if bl_size / el_size > 50:
+            break                        # too small to be EL
+        if _scan_rpu_nals(str(candidate), "v:0", check_secs=5) > 0:
+            el_path = candidate
+            break
+
+    return str(bl_path), (str(el_path) if el_path else None)
+
+
+def discover_sources(input_path: str):
+    """
+    Auto-detect the correct streams for a DV title.
+
+    Returns:
+        pixel_path  - file for pixel decode (BL for P7 BDMV, same as input otherwise)
+        rpu_path    - file for RPU/metadata probe
+        rpu_stream  - stream selector for rpu_path, e.g. "v:0" or "v:1"
+        dv_profile  - int or None (detected from rpu_path)
+
+    Handles:
+        - Single file (MKV/MP4/m2ts): checks v:0 and v:1 for RPU NALs
+        - BDMV folder or mounted ISO: finds BL + EL via _find_bdmv_streams()
+    """
+    path = Path(input_path)
+
+    # ---- BDMV folder or mounted ISO mount point ----
+    if path.is_dir():
+        print(f"  Source type: BDMV/disc folder — scanning for BL + EL streams")
+        bl_path, el_path = _find_bdmv_streams(path)
+        print(f"  BL (pixels): {Path(bl_path).name}")
+        if el_path:
+            print(f"  EL (RPU):    {Path(el_path).name}  [Profile 7 separate EL]")
+            return bl_path, el_path, "v:0", 7
+        # No separate EL — check if BL has interleaved EL in v:1
+        if _scan_rpu_nals(bl_path, "v:1", check_secs=5) > 0:
+            print(f"  EL (RPU):    {Path(bl_path).name} v:1  [Profile 7 interleaved]")
+            return bl_path, bl_path, "v:1", 7
+        # Single layer — P5 or P8
+        print(f"  RPU in BL v:0  [Profile 5/8 single layer]")
+        profile = _probe_dv_profile_file(bl_path, "v:0") or 5
+        return bl_path, bl_path, "v:0", profile
+
+    # ---- Single file (MKV, MP4, m2ts) ----
+    input_str = str(path)
+
+    # Check v:1 first — Profile 7 MKV with BL in v:0 and EL accessible via v:1
+    if _scan_rpu_nals(input_str, "v:1", check_secs=5) > 0:
+        print(f"  Source type: single file, RPU in v:1  [Profile 7 interleaved MKV/m2ts]")
+        profile = _probe_dv_profile_file(input_str, "v:0")
+        return input_str, input_str, "v:1", profile
+
+    # v:0 only — Profile 5, 8, or Profile 7 MKV with EL muxed into v:0
+    print(f"  Source type: single file, RPU in v:0")
+    profile = _probe_dv_profile_file(input_str, "v:0")
+    return input_str, input_str, "v:0", profile
+
+
+def _probe_dv_profile_file(path: str, stream_sel: str = "v:0") -> int:
+    """Read DV profile from DOVI configuration record side data. Returns int or None."""
+    sel = stream_sel.split(":")[-1]   # "v:0" → "v:0", or just "v:0"
+    cmd = [FFPROBE, "-v", "error",
+           "-select_streams", sel,
+           "-probesize", "50000000",
+           "-show_entries", "stream_side_data=dv_profile",
+           "-of", "default=noprint_wrappers=1", path]
+    try:
+        out = subprocess.check_output(cmd, stderr=subprocess.DEVNULL, text=True, timeout=15)
+        for line in out.splitlines():
+            if line.startswith("dv_profile="):
+                val = line.split("=", 1)[1].strip()
+                return int(val) if val.isdigit() else None
+    except Exception:
+        pass
+    return None
+
+
+# ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
 
@@ -170,31 +295,52 @@ def parse_poly_coef(raw):
 # ffprobe / ffmpeg wrappers
 # ---------------------------------------------------------------------------
 
-def get_probe_info(input_path: str):
-    """Return (duration_secs, dv_profile)."""
+def get_probe_info(pixel_path: str, rpu_path: str = None, rpu_stream: str = "v:0"):
+    """
+    Return (duration_secs, dv_profile).
+    duration comes from pixel_path; dv_profile from rpu_path (falls back to pixel_path).
+    """
+    # Duration from the pixel/BL file
     cmd = [FFPROBE, "-v", "error", "-print_format", "json",
-           "-show_entries", "format=duration:stream_side_data_list",
-           "-select_streams", "v:0", input_path]
+           "-show_entries", "format=duration",
+           pixel_path]
     out = subprocess.check_output(cmd, stderr=subprocess.DEVNULL)
-    d = json.loads(out, object_pairs_hook=_dedup_pairs)
-    duration = float(d["format"]["duration"])
+    duration = float(json.loads(out)["format"]["duration"])
+
+    # DV profile: prefer already-discovered value; otherwise probe rpu_path
     dv_profile = None
-    for s in d.get("streams", [{}])[0].get("side_data_list", []):
-        if isinstance(s, dict) and s.get("side_data_type") == "DOVI configuration record":
-            dv_profile = s.get("dv_profile")
-            break
+    probe_target = rpu_path or pixel_path
+    stream_sel = rpu_stream.split(":")[-1]   # "v:0" → "v:0"
+    cmd2 = [FFPROBE, "-v", "error", "-print_format", "json",
+            "-show_entries", "stream_side_data_list",
+            "-select_streams", stream_sel,
+            probe_target]
+    try:
+        out2 = subprocess.check_output(cmd2, stderr=subprocess.DEVNULL)
+        d2 = json.loads(out2, object_pairs_hook=_dedup_pairs)
+        for s in d2.get("streams", [{}])[0].get("side_data_list", []):
+            if isinstance(s, dict) and s.get("side_data_type") == "DOVI configuration record":
+                dv_profile = s.get("dv_profile")
+                break
+    except Exception:
+        pass
+
     return duration, dv_profile
 
 
-def probe_chunk(input_path: str, start_sec: float, duration_sec: float) -> list:
-    """Run ffprobe on a time window, return list of frame metadata dicts."""
+def probe_chunk(rpu_path: str, rpu_stream: str, start_sec: float, duration_sec: float) -> list:
+    """
+    Run ffprobe on a time window of rpu_path:rpu_stream.
+    Returns list of frame metadata dicts with DV side data.
+    """
+    stream_sel = rpu_stream.split(":")[-1]   # "v:0" or "v:1"
     cmd = [
         FFPROBE, "-v", "error",
         "-print_format", "json",
         "-show_frames",
         "-read_intervals", f"{start_sec}%+{duration_sec}",
-        "-select_streams", "v:0",
-        input_path,
+        "-select_streams", stream_sel,
+        rpu_path,
     ]
     try:
         out = subprocess.check_output(cmd, stderr=subprocess.DEVNULL)
@@ -378,11 +524,12 @@ def decode_chunk_pixel_stats(input_path: str, start_sec: float, duration_sec: fl
     return result
 
 
-def lookup_pixel_stats(pixel_stats: dict, pts_time: float) -> dict:
-    """Find closest pixel stats entry to the given pts_time (tolerance ±2 s)."""
+def lookup_pixel_stats(pixel_stats: dict, pts_time: float, pts_offset: float = 0.0) -> dict:
+    """Find closest pixel stats entry to the given pts_time (tolerance ±2 s).
+    pts_offset: subtract this from pts_time before lookup (corrects BDMV timestamp base)."""
     if not pixel_stats:
         return {}
-    key = round(pts_time)
+    key = round(pts_time - pts_offset)
     for delta in range(3):
         for k in (key + delta, key - delta):
             if k in pixel_stats:
@@ -394,7 +541,8 @@ def lookup_pixel_stats(pixel_stats: dict, pts_time: float) -> dict:
 # Row extraction
 # ---------------------------------------------------------------------------
 
-def extract_row(frame_idx: int, f: dict, dv_profile: int, pixel_stats: dict) -> dict:
+def extract_row(frame_idx: int, f: dict, dv_profile: int, pixel_stats: dict,
+                pts_offset: float = 0.0) -> dict:
     """Convert a ffprobe frame dict (+ optional pixel stats) to a CSV row dict."""
     sdata = {s["side_data_type"]: s for s in f.get("side_data_list", [])}
     h   = sdata.get(HDR10P_KEY, {})
@@ -429,7 +577,7 @@ def extract_row(frame_idx: int, f: dict, dv_profile: int, pixel_stats: dict) -> 
                for i in range(9)},
         }
     else:
-        feat = lookup_pixel_stats(pixel_stats, pts_time)
+        feat = lookup_pixel_stats(pixel_stats, pts_time, pts_offset)
 
     row = {
         "frame_idx":  frame_idx,
@@ -490,12 +638,21 @@ def main():
     args = ap.parse_args()
 
     print(f"Probing: {args.input}")
-    total_dur, dv_profile = get_probe_info(args.input)
+
+    # Auto-discover pixel source, RPU source, and stream selector
+    pixel_path, rpu_path, rpu_stream, disc_profile = discover_sources(args.input)
+
+    total_dur, probe_profile = get_probe_info(pixel_path, rpu_path, rpu_stream)
+    dv_profile = disc_profile or probe_profile
     end_sec = args.end if args.end is not None else total_dur
-    needs_pixel_decode = (dv_profile != 8)  # Profile 5 and others have no HDR10+ features
+
+    needs_pixel_decode = (dv_profile != 8)
+    feature_src = "HDR10+ side-data" if not needs_pixel_decode else f"pixel decode (Profile {dv_profile})"
+    rpu_note = Path(rpu_path).name if rpu_path != pixel_path else "(same as pixel)"
 
     print(f"  Duration: {total_dur:.1f}s ({total_dur/3600:.2f}h)  DV profile: {dv_profile}")
-    print(f"  Feature source: {'HDR10+ side-data' if not needs_pixel_decode else 'pixel decode (Profile 5)'}")
+    print(f"  Feature source: {feature_src}")
+    print(f"  RPU stream: {rpu_note} [{rpu_stream}]")
     print(f"  Processing: {args.start:.0f}s - {end_sec:.0f}s")
 
     resume_start = args.start
@@ -511,12 +668,12 @@ def main():
     write_header = (write_mode == "w")
     min_interval = 1.0 / args.sample_fps if args.sample_fps > 0 else 0.0
 
-    frame_idx     = 0
+    frame_idx      = 0
     frames_written = 0
-    chunk_start   = resume_start
-    prev_pts      = -999.0
-    total_chunks  = int((end_sec - chunk_start) / args.chunk_secs) + 1
-    chunk_num     = 0
+    chunk_start    = resume_start
+    prev_pts       = -999.0
+    total_chunks   = int((end_sec - chunk_start) / args.chunk_secs) + 1
+    chunk_num      = 0
 
     with open(args.output, write_mode, newline="") as csvfile:
         writer = csv.DictWriter(csvfile, fieldnames=COLUMNS, extrasaction="ignore")
@@ -525,17 +682,22 @@ def main():
 
         while chunk_start < end_sec:
             chunk_end = min(chunk_start + args.chunk_secs, end_sec)
-            dur = chunk_end - chunk_start
+            dur       = chunk_end - chunk_start
             chunk_num += 1
             t0 = time.time()
 
-            # --- metadata pass (always) ---
-            frames = probe_chunk(args.input, chunk_start, dur)
+            # RPU/metadata pass — probes rpu_path:rpu_stream for DV polynomial + scene flags
+            frames = probe_chunk(rpu_path, rpu_stream, chunk_start, dur)
 
-            # --- pixel pass (Profile 5 only) ---
+            # Pixel pass — decodes pixel_path (BL / main file) for histogram+SAT features
             pixel_stats = {}
+            pts_offset  = 0.0
             if needs_pixel_decode:
-                pixel_stats = decode_chunk_pixel_stats(args.input, chunk_start, dur)
+                pixel_stats = decode_chunk_pixel_stats(pixel_path, chunk_start, dur)
+                # BDMV m2ts files may have non-zero pts base — calibrate offset from first frame
+                if frames and pixel_stats:
+                    first_pts = float(frames[0].get("pts_time", chunk_start) or chunk_start)
+                    pts_offset = first_pts - chunk_start
 
             chunk_written = 0
             for f in frames:
@@ -547,7 +709,8 @@ def main():
                     frame_idx += 1
                     continue
 
-                row = extract_row(frame_idx, f, dv_profile, pixel_stats)
+                row = extract_row(frame_idx, f, dv_profile, pixel_stats,
+                                  pts_offset=pts_offset)
                 writer.writerow(row)
                 prev_pts = pts
                 chunk_written += 1
