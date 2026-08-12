@@ -269,23 +269,6 @@ static AVFrame *decode_frame_at(const char *path, double target_pts,
         goto fail;
     }
 
-    /* For P7 dual-layer BDMV: BL in v:0, EL (DV RPU) in a separate lower-res stream.
-     * Find the EL stream so we can feed its packets to the BL decoder — without them
-     * the decoder never sees the UNSPEC62 RPU NALs and libplacebo gets no DV metadata. */
-    int el_stream = -1;
-    for (int i = 0; i < (int)fmt->nb_streams; i++) {
-        if (i == vstream) continue;
-        if (fmt->streams[i]->codecpar->codec_type != AVMEDIA_TYPE_VIDEO) continue;
-        /* EL is the lower-resolution video stream */
-        if (fmt->streams[i]->codecpar->width < st->codecpar->width) {
-            el_stream = i;
-            fprintf(stderr, "info: found EL stream %d (%dx%d) for P7 DV\n",
-                    i, fmt->streams[i]->codecpar->width,
-                    fmt->streams[i]->codecpar->height);
-            break;
-        }
-    }
-
     /* Seek to just before target PTS */
     int64_t seek_ts = (int64_t)(target_pts * AV_TIME_BASE);
     av_seek_frame(fmt, -1, seek_ts, AVSEEK_FLAG_BACKWARD);
@@ -299,17 +282,7 @@ static AVFrame *decode_frame_at(const char *path, double target_pts,
     for (int attempts = 0; attempts < 512; attempts++) {
         int ret = av_read_frame(fmt, pkt);
         if (ret < 0) break;
-        /* Feed both BL and EL packets to the decoder: the EL carries the DV RPU NALs
-         * that libavcodec needs to populate AVFrame DV side data for libplacebo. */
-        if (pkt->stream_index != vstream && pkt->stream_index != el_stream) {
-            av_packet_unref(pkt); continue;
-        }
-        if (pkt->stream_index == el_stream) {
-            /* EL packet: send to decoder but don't expect a decoded frame output */
-            avcodec_send_packet(dec, pkt);
-            av_packet_unref(pkt);
-            continue;
-        }
+        if (pkt->stream_index != vstream) { av_packet_unref(pkt); continue; }
 
         avcodec_send_packet(dec, pkt);
         av_packet_unref(pkt);

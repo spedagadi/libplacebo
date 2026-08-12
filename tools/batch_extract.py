@@ -94,9 +94,8 @@ def dismount_iso(iso_path):
     run_ps(f'Dismount-DiskImage -ImagePath "{iso_path}"')
 
 
-def _is_complete(csv_path: Path, min_rows: int = 50000) -> bool:
-    """Heuristic: a CSV with >min_rows is likely fully extracted.
-    At 24fps all-frames, a 2hr movie = ~172k rows. 50k = ~35 minutes minimum."""
+def _is_complete(csv_path: Path, min_rows: int = 1000) -> bool:
+    """Heuristic: a CSV with >min_rows is likely fully extracted."""
     try:
         with open(csv_path, "r") as f:
             count = sum(1 for _ in f)
