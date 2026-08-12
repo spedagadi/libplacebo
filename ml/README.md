@@ -133,7 +133,7 @@ Scale targets for XGBoost and cross-title generalisation:
 **Format:** BDMV = complete disc folder · ISO = disc image · MKV = remux/encode  
 **Profile:** 5 = RPU in single layer (v:0) · 7 = BL+EL, RPU in EL (MKV: EL muxed into v:0; BDMV: EL is separate stream file) · 8 = HDR10-compatible single layer (v:0)
 
-> **Extractor note — Profile 7 BDMV:** The RPU is in the EL stream file (`BDMV/STREAM/` — separate m2ts from the 4K BL). `dv_metadata_extract.py` must target the EL file, not the main title. Profile 7 MKVs mux BL+EL into a single `v:0` stream — `v:0` works and yields RPU NALs normally (verified: 123 RPU NALs/5s on Rush).
+> **Extractor — source auto-discovery (Aug 2026):** `dv_metadata_extract.py` now accepts any source format. Pass a disc folder path for BDMV titles — `discover_sources()` probes for UNSPEC62 RPU NALs in v:0 and v:1, finds the EL stream automatically, and calibrates BDMV timestamp offsets. Tested: Rush P7 MKV (126 rows) and Spotlight P7 BDMV (124 rows), both with full polynomial + pixel + SAT features. ISOs: mount via `Mount-DiskImage` in PowerShell, then pass the mount point (`E:\`) as the folder input.
 
 > **Source quality note:** Training data should come from **disc remuxes only** (BDMV/MKV remux). WEB-DL and streaming encodes are re-compressed from a different master than the one the colorist used when authoring the DV RPU metadata. The pixel statistics extracted from a WEB-DL do not faithfully represent the feature distribution the DV colorist was responding to — this adds noise to the feature→label relationship. WEB-DL titles may be used for **hypothesis testing and prototyping** but should not be part of the training corpus.
 
@@ -173,35 +173,35 @@ Scale targets for XGBoost and cross-title generalisation:
 
 ##### Train (13 titles)
 
-| Title | Year | Genre | Format | DV | P | Tier | Notes |
-|---|---|---|---|---|---|---|---|
-| Alien: Romulus | 2024 | Sci-Fi/Horror | BDMV | ✅ | 7 | P | EL 5528 kbps — use EL stream file |
-| Furiosa | 2024 | Action | BDMV | ✅ | 7 | P | EL 2106 kbps — use EL stream file |
-| Warfare | 2025 | War/Action | BDMV | ✅ | ? | P | Profile TBD |
-| Spotlight | 2015 | Drama | BDMV | ✅ | 7 | P | EL 8522 kbps — use EL stream file |
-| Zodiac | 2007 | Crime/Thriller | BDMV | ✅ | 7 | P | EL 14879 kbps — use EL stream file |
-| Rush | 2013 | Sport/Drama | MKV | ✅ | **7** | P | DOVI confirmed; EL in v:0 |
-| Wonder Woman 1984 | 2020 | Superhero | BDMV | ✅ | ? | P | Profile TBD |
-| First Blood | 1982 | Action | BDMV | ✅ | ? | P | Classic grain; profile TBD |
-| Pacific Rim | 2013 | Sci-Fi/Action | MKV | ✅ | **8** | H | DOVI confirmed |
-| Prometheus | 2012 | Sci-Fi/Horror | MKV | ✅ | **8** | H | DOVI confirmed |
-| The Creator | 2023 | Sci-Fi | MKV | ✅ | **8** | H | DOVI confirmed |
-| Kingdom of the Planet of the Apes | 2024 | Sci-Fi | MKV | ✅ | **8** | H | DOVI confirmed |
-| 28 Years Later | 2025 | Horror | BDMV | ✅ | ? | P | Profile TBD |
+| Title | Year | Genre | Format | DV | P | Tier | Status | Notes |
+|---|---|---|---|---|---|---|---|---|
+| Alien: Romulus | 2024 | Sci-Fi/Horror | BDMV | ✅ | 7 | P | ✅ | EL 5528 kbps; BDMV folder — EL auto-discovered |
+| Furiosa | 2024 | Action | BDMV | ✅ | 7 | P | ✅ | EL 2106 kbps; BDMV folder — EL auto-discovered |
+| Warfare | 2025 | War/Action | BDMV | ✅ | ? | P | ✅ | Profile TBD; extractor handles P5/7/8 automatically |
+| Spotlight | 2015 | Drama | BDMV | ✅ | 7 | P | ✅ | **Tested** — 124 rows, P7 v:1 interleaved, all features populated |
+| Zodiac | 2007 | Crime/Thriller | BDMV | ✅ | 7 | P | ✅ | EL 14879 kbps; BDMV folder — EL auto-discovered |
+| Rush | 2013 | Sport/Drama | MKV | ✅ | **7** | P | ✅ | **Tested** — 126 rows, P7 v:0, all features populated |
+| Wonder Woman 1984 | 2020 | Superhero | BDMV | ✅ | ? | P | ✅ | Profile TBD; extractor handles automatically |
+| First Blood | 1982 | Action | BDMV | ✅ | ? | P | ✅ | Classic grain; profile TBD |
+| Pacific Rim | 2013 | Sci-Fi/Action | MKV | ✅ | **8** | H | ✅ | P8; DOVI confirmed |
+| Prometheus | 2012 | Sci-Fi/Horror | MKV | ✅ | **8** | H | ✅ | P8; DOVI confirmed |
+| The Creator | 2023 | Sci-Fi | MKV | ✅ | **8** | H | ✅ | P8; DOVI confirmed |
+| Kingdom of the Planet of the Apes | 2024 | Sci-Fi | MKV | ✅ | **8** | H | ✅ | P8; DOVI confirmed |
+| 28 Years Later | 2025 | Horror | BDMV | ✅ | ? | P | ✅ | Profile TBD; extractor handles automatically |
 
 ---
 
 ##### Val (7 titles)
 
-| Title | Year | Genre | Format | DV | P | Tier | Notes |
-|---|---|---|---|---|---|---|---|
-| How to Train Your Dragon | 2025 | Animation | BDMV | ✅ | 7 | P | EL 5917 kbps — use EL stream file |
-| MI: The Final Reckoning | 2025 | Action | BDMV | ✅ | 7 | P | EL 4029 kbps — use EL stream file |
-| The Invisible Man | 2020 | Horror/Sci-Fi | BDMV | ✅ | 7 | P | EL 7082 kbps — use EL stream file |
-| Tron: Legacy | 2010 | Sci-Fi | BDMV | ✅ | ? | P | Near-total black, isolated neon |
-| F1: The Movie | 2025 | Sport/Drama | BDMV | ✅ | ? | P | Bright daylight + paddock |
-| Weapons | 2025 | Thriller | MKV | ✅ | **7** | H | DOVI confirmed; EL in v:0 |
-| Ballerina | 2025 | Action | BDMV | ✅ | ? | P | John Wick universe |
+| Title | Year | Genre | Format | DV | P | Tier | Status | Notes |
+|---|---|---|---|---|---|---|---|---|
+| How to Train Your Dragon | 2025 | Animation | BDMV | ✅ | 7 | P | ✅ | EL 5917 kbps; BDMV folder — EL auto-discovered |
+| MI: The Final Reckoning | 2025 | Action | BDMV | ✅ | 7 | P | ✅ | EL 4029 kbps; BDMV folder — EL auto-discovered |
+| The Invisible Man | 2020 | Horror/Sci-Fi | BDMV | ✅ | 7 | P | ✅ | EL 7082 kbps; BDMV folder — EL auto-discovered |
+| Tron: Legacy | 2010 | Sci-Fi | BDMV | ✅ | ? | P | ✅ | Profile TBD; near-total black + isolated neon |
+| F1: The Movie | 2025 | Sport/Drama | BDMV | ✅ | ? | P | ✅ | Profile TBD; bright daylight + paddock |
+| Weapons | 2025 | Thriller | MKV | ✅ | **7** | H | ✅ | P7 Hybrid; DOVI confirmed |
+| Ballerina | 2025 | Action | BDMV | ✅ | ? | P | ✅ | Profile TBD; John Wick universe |
 
 ---
 
@@ -211,15 +211,15 @@ Scale targets for XGBoost and cross-title generalisation:
 
 | Title | Year | Genre | Format | DV | P | Status | Notes |
 |---|---|---|---|---|---|---|---|
-| **Dune: Part Two** * | 2024 | Sci-Fi | BDMV | ✅ | 7 | ⚠️ | Most-posted DV comparison 2024-25; EL stream needed |
-| **Top Gun: Maverick** * | 2022 | Action | RAR | ✅ | ? | ⚠️ | Canonical IMAX/HDR demo disc; extract RAR first |
-| **Godzilla Minus One** * | 2023 | Sci-Fi | BDMV | ✅ | 7 | ⚠️ | JPN disc DV; EL stream needed |
-| **Civil War** * | 2024 | War/Action | MKV | ✅ | **7** | ✅ | A24 DV; DOVI confirmed; EL in v:0 |
-| **Spider-Man: ATSV** * | 2023 | Animation | MKV | ✅ | **7** | ⚠️ | Animation HDR benchmark; German audio |
-| **John Wick: Ch4** * | 2023 | Action | MKV | ✅ | **7** | ⚠️ | Neon geometry benchmark; currently German — get EN |
-| Predator Badlands | 2025 | Sci-Fi/Action | BDMV | ✅ | 7 | ⚠️ | EL stream needed |
-| Gladiator II | 2024 | Action/Epic | ISO | ✅ | **7** | ⚠️ | DV P7 confirmed — v:1 RPU 121 NALs/5s; use v:1 for extraction |
-| No Time to Die | 2021 | Action | ISO | ✅ | **7** | ⚠️ | DV P7 confirmed — v:1 RPU 121 NALs/5s; use v:1 for extraction |
+| **Dune: Part Two** * | 2024 | Sci-Fi | BDMV | ✅ | 7 | ✅ | EL auto-discovered; pass disc folder as input |
+| **Top Gun: Maverick** * | 2022 | Action | RAR | ✅ | ? | ⚠️ | Extract RAR first → then pass as BDMV folder |
+| **Godzilla Minus One** * | 2023 | Sci-Fi | BDMV | ✅ | 7 | ✅ | JPN disc; EL auto-discovered |
+| **Civil War** * | 2024 | War/Action | MKV | ✅ | **7** | ✅ | P7; DOVI confirmed |
+| **Spider-Man: ATSV** * | 2023 | Animation | MKV | ✅ | **7** | ⚠️ | German audio — DV extraction works; need EN disc for community demo |
+| **John Wick: Ch4** * | 2023 | Action | MKV | ✅ | **7** | ⚠️ | German audio — need EN disc (D9) for Test community demo |
+| Predator Badlands | 2025 | Sci-Fi/Action | BDMV | ✅ | 7 | ✅ | EL auto-discovered; pass disc folder as input |
+| Gladiator II | 2024 | Action/Epic | ISO | ✅ | **7** | ⚠️ | Mount ISO (`Mount-DiskImage`), then pass mount point as folder |
+| No Time to Die | 2021 | Action | ISO | ✅ | **7** | ⚠️ | Mount ISO (`Mount-DiskImage`), then pass mount point as folder |
 | **The Batman** * _(download)_ | 2022 | Superhero/Noir | — | ✅ | — | ⬇️ | Rain noir — contrast to WW1984; WB UHD |
 | **Blade Runner 2049** * _(download)_ | 2017 | Sci-Fi/Noir | — | ✅ | — | ⬇️ | Most-discussed AVForums HDR benchmark; not on disk |
 | **Joker** * _(download)_ | 2019 | Superhero/Drama | — | ✅ | — | ⬇️ | Grimy Gotham; community DV discussion title |
