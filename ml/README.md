@@ -156,56 +156,48 @@ Scale targets for XGBoost and cross-title generalisation:
 
 ---
 
-##### Calibration (5 titles — HPO + Kalman smoother tuning)
+##### Calibration (0 on disk — downloads needed)
 
-> **Two calibration roles — same set serves both:**
-> 1. **Bayesian HPO** (per-frame GBR): tune `n_estimators`, `max_depth`, `learning_rate`, `subsample`, `min_samples_leaf`. Run 50-100 trials; must be isolated from Train/Val/Test.
-> 2. **Kalman smoother tuning**: fit process noise Q (within-scene drift), measurement noise R (ML prediction trust), and cut-inflation factor λ (rapid adaptation at scene boundaries). Requires **temporal sequences** extracted at ≥5fps (not the 1fps training sample) to capture frame-to-frame dynamics. Scene-refresh flags from the RPU provide ground-truth cut markers.
+> **Aug 2026 finding:** All 5 original calibration titles (Everest, Hurt Locker, Troy DC, John Wick Ch4, Kingdom of Heaven DC) are **P7/P8 MKV remuxes with 100% identity luma polynomials** — DV is colour-matrix-only for these titles. Useless for Bayesian HPO of the DTM luma polynomial model. Moved to Reserve-MKV below.
 >
-> German audio has no effect on either role. All 5 titles confirmed DOVI.
+> New calibration titles must be BDMV pure disc with real per-scene luma polynomials (confirmed by non-trivial polynomial diversity after extraction).
 
-| Title | Year | Genre | Format | DV | P | Tier | Calibration rationale |
+| Title | Year | Genre | Format | Priority | Split | Calibration rationale |
+|---|---|---|---|---|---|---|
+| **Mad Max: Fury Road** | 2015 | Action | BDMV | ⬇️ **Critical** | Cal | Hundreds of rapid cuts (best for λ tuning); extreme highlights vs shadow; Warner COMPLETE.UHD.BLURAY |
+| **The Revenant** | 2015 | Drama/Adventure | BDMV | ⬇️ **Critical** | Cal | Slow pacing, gradual illumination (best for Q within-scene); extreme snow/fire contrast; Fox UHD |
+| **Sicario** | 2015 | Thriller | BDMV | ⬇️ **Critical** | Cal | Precise studio lighting, tension-driven cuts (calibrates R); Lionsgate UHD; fills Thriller calibration gap |
+
+---
+
+##### Train (9 titles — BDMV only)
+
+> **Aug 2026:** All P7/P8 MKV remuxes removed — confirmed 100% identity luma polynomials, useless for DTM training. BDMV-only corpus going forward.
+
+| Title | Year | Genre | Format | DV | P | Status | Notes |
 |---|---|---|---|---|---|---|---|
-| Everest | 2015 | Drama/Adventure | MKV | ✅ | **8** | H | Wide dynamic range (snow→shadow); calibrates Q at both extremes |
-| The Hurt Locker | 2008 | War/Drama | MKV | ✅ | **7** | P | Dark/muted; calibrates Q for stable low-light sequences |
-| Troy (DC) | 2004 | Epic/Action | MKV | ✅ | **7** | P | Mixed light, high EL bitrate; calibrates R and highlight slope |
-| John Wick: Ch4 | 2023 | Action | MKV | ✅ | **7** | P | Many rapid scene cuts, neon/dark contrast; best title for tuning λ (cut inflation) |
-| Kingdom of Heaven (DC) | 2005 | Epic | MKV | ✅ | **7** | P | Long stable medieval scenes + battle transitions; calibrates Q within-scene vs across-scene |
+| Alien: Romulus | 2024 | Sci-Fi/Horror | BDMV | ✅ | **7** | ✅ | EL 5528 kbps; extraction in progress |
+| Atomic Blonde | 2017 | Action/Spy | BDMV | ✅ | **7** | ✅ | Extraction in progress |
+| Furiosa | 2024 | Action | BDMV | ✅ | **7** | ✅ | EL 2106 kbps; extraction in progress |
+| Warfare | 2025 | War/Action | BDMV | ✅ | **7** | ✅ | Extraction pending |
+| Spotlight | 2015 | Drama | BDMV | ✅ | **7** | ✅ | EL 8522 kbps — high bitrate EL, expected real polynomials |
+| Zodiac | 2007 | Crime/Thriller | BDMV | ✅ | **7** | ✅ | EL 14879 kbps — highest EL bitrate, priority extraction |
+| Wonder Woman 1984 | 2020 | Superhero | BDMV | ✅ | **7** | ✅ | Extraction pending |
+| First Blood | 1982 | Action | BDMV | ✅ | **7** | ✅ | Extraction pending |
+| 28 Years Later | 2025 | Horror | BDMV | ✅ | **7** | ✅ | Extraction pending |
 
 ---
 
-##### Train (14 titles)
+##### Val (6 titles — BDMV only)
 
-| Title | Year | Genre | Format | DV | P | Tier | Status | Notes |
-|---|---|---|---|---|---|---|---|---|
-| Alien: Romulus | 2024 | Sci-Fi/Horror | BDMV | ✅ | **7** | P | ✅ | P7 v:1; EL 5528 kbps; EL auto-discovered |
-| Atomic Blonde | 2017 | Action/Spy | BDMV | ✅ | **7** | P | ✅ | P7 v:1; stream-probed; previously missed (no BDNFO) |
-| Furiosa | 2024 | Action | BDMV | ✅ | **7** | P | ✅ | P7 v:1; EL 2106 kbps; EL auto-discovered |
-| Warfare | 2025 | War/Action | BDMV | ✅ | **7** | P | ✅ | P7 v:1 interleaved; EL auto-discovered |
-| Spotlight | 2015 | Drama | BDMV | ✅ | **7** | P | ✅ | **Tested** — 124 rows, P7 v:1 interleaved, all features populated |
-| Zodiac | 2007 | Crime/Thriller | BDMV | ✅ | **7** | P | ✅ | P7 v:1; EL 14879 kbps; EL auto-discovered |
-| Rush | 2013 | Sport/Drama | MKV | ✅ | **7** | P | ✅ | **Tested** — 126 rows, P7 v:0, all features populated |
-| Wonder Woman 1984 | 2020 | Superhero | BDMV | ✅ | **7** | P | ✅ | P7 v:1 interleaved; EL auto-discovered |
-| First Blood | 1982 | Action | BDMV | ✅ | **7** | P | ✅ | P7 v:1 interleaved; EL auto-discovered |
-| Pacific Rim | 2013 | Sci-Fi/Action | MKV | ✅ | **8** | H | ✅ | P8; DOVI confirmed |
-| Prometheus | 2012 | Sci-Fi/Horror | MKV | ✅ | **8** | H | ✅ | P8; DOVI confirmed |
-| The Creator | 2023 | Sci-Fi | MKV | ✅ | **8** | H | ✅ | P8; DOVI confirmed |
-| Kingdom of the Planet of the Apes | 2024 | Sci-Fi | MKV | ✅ | **8** | H | ✅ | P8; DOVI confirmed |
-| 28 Years Later | 2025 | Horror | BDMV | ✅ | **7** | P | ✅ | P7 v:1 interleaved; EL auto-discovered |
-
----
-
-##### Val (7 titles)
-
-| Title | Year | Genre | Format | DV | P | Tier | Status | Notes |
-|---|---|---|---|---|---|---|---|---|
-| How to Train Your Dragon | 2025 | Animation | BDMV | ✅ | **7** | P | ✅ | P7 v:1; EL 5917 kbps; EL auto-discovered |
-| MI: The Final Reckoning | 2025 | Action | BDMV | ✅ | **7** | P | ✅ | P7 v:1; EL 4029 kbps; EL auto-discovered |
-| The Invisible Man | 2020 | Horror/Sci-Fi | BDMV | ✅ | **7** | P | ✅ | P7 v:1; EL 7082 kbps; EL auto-discovered |
-| Tron: Legacy | 2010 | Sci-Fi | BDMV | ✅ | **7** | P | ✅ | P7 v:1 interleaved; EL auto-discovered |
-| F1: The Movie | 2025 | Sport/Drama | BDMV | ✅ | **7** | P | ✅ | P7 v:1 interleaved; EL auto-discovered |
-| Weapons | 2025 | Thriller | MKV | ✅ | **7** | H | ✅ | P7 Hybrid; DOVI confirmed |
-| Ballerina | 2025 | Action | BDMV | ✅ | **7** | P | ✅ | P7 v:1 interleaved; EL auto-discovered |
+| Title | Year | Genre | Format | DV | P | Status | Notes |
+|---|---|---|---|---|---|---|---|
+| How to Train Your Dragon | 2025 | Animation | BDMV | ✅ | **7** | ✅ | EL 5917 kbps |
+| MI: The Final Reckoning | 2025 | Action | BDMV | ✅ | **7** | ✅ | EL 4029 kbps |
+| The Invisible Man | 2020 | Horror/Sci-Fi | BDMV | ✅ | **7** | ✅ | EL 7082 kbps |
+| Tron: Legacy | 2010 | Sci-Fi | BDMV | ✅ | **7** | ✅ | Extraction pending |
+| F1: The Movie | 2025 | Sport/Drama | BDMV | ✅ | **7** | ✅ | Extraction pending |
+| Ballerina | 2025 | Action | BDMV | ✅ | **7** | ✅ | Extraction pending |
 
 ---
 
@@ -218,9 +210,9 @@ Scale targets for XGBoost and cross-title generalisation:
 | **Dune: Part Two** * | 2024 | Sci-Fi | BDMV | ✅ | **7** | ✅ | P7 v:1; EL auto-discovered |
 | **Top Gun: Maverick** * | 2022 | Action | ISO | ✅ | **7** | ✅ | P7 v:1 confirmed; mount ISO → pass mount point as folder |
 | **Godzilla Minus One** * | 2023 | Sci-Fi | BDMV | ✅ | **7** | ✅ | JPN disc; EL auto-discovered |
-| **Civil War** * | 2024 | War/Action | MKV | ✅ | **7** | ✅ | P7; DOVI confirmed |
-| **Spider-Man: ATSV** * | 2023 | Animation | MKV | ✅ | **7** | ✅ | P7; DOVI confirmed; German audio (no effect on DV extraction) |
-| **John Wick: Ch4** * | 2023 | Action | MKV | ✅ | **7** | ✅ | P7; DOVI confirmed; German audio (no effect on DV extraction) |
+| **Civil War** * | 2024 | War/Action | MKV | ✅ | **7** | ✅ | P7; identity polynomial (visual rendering demo only) |
+| **Spider-Man: ATSV** * | 2023 | Animation | MKV | ✅ | **7** | ✅ | P7; identity polynomial; German audio; visual demo only |
+| **John Wick: Ch4** * | 2023 | Action | MKV | ✅ | **7** | ✅ | P7; identity polynomial; German audio; visual demo only |
 | Predator Badlands | 2025 | Sci-Fi/Action | BDMV | ✅ | **7** | ✅ | P7 v:1; EL auto-discovered |
 | Gladiator II | 2024 | Action/Epic | ISO | ✅ | **7** | ✅ | P7 v:1 confirmed; mount ISO → pass mount point as folder |
 | No Time to Die | 2021 | Action | ISO | ✅ | **7** | ✅ | P7 v:1 confirmed; mount ISO → pass mount point as folder |
@@ -230,11 +222,26 @@ Scale targets for XGBoost and cross-title generalisation:
 
 ---
 
-##### Reserve (unassigned — pull in if genre gap remains after downloads)
+##### Reserve — BDMV ISOs (usable for visual rendering, polynomial TBD)
 
 | Title | Year | Genre | Format | DV | P | Notes |
 |---|---|---|---|---|---|---|
-| MI: Dead Reckoning Pt 1 | 2023 | Action | ISO | ✅ | **7** | ✅ | P7 v:1 confirmed; mount ISO → pass mount point; use if more Action needed |
+| MI: Dead Reckoning Pt 1 | 2023 | Action | ISO | ✅ | **7** | ✅ | P7 v:1 confirmed; use if more Action needed |
+
+##### Reserve — MKV only (identity polynomial confirmed — visual rendering only)
+
+> These titles have confirmed 100% identity luma polynomials. Usable in the Streamlit viewer for frame comparison (DV colour matrices apply correctly) but provide no useful training signal for the DTM luma polynomial model.
+
+| Title | Notes |
+|---|---|
+| Everest (P8 Hybrid MKV) | Identity |
+| Hurt Locker (P7 MKV, German custom dub) | Identity + MKV block addition errors (pts<500 fail in dv_render) |
+| Troy DC (P7 MKV) | Identity; renders OK for pts>500 |
+| John Wick Ch4 (P7 MKV, German) | Identity; 2-pivot single segment |
+| Kingdom of Heaven DC (P7 MKV, German) | Identity; 2-pivot single segment |
+| Rush (P7 MKV) | Identity; MKV block addition errors |
+| Pacific Rim / Prometheus / The Creator / KotPotA (P8 Hybrid MKV) | Identity |
+| Weapons (P7 Hybrid MKV) | Identity |
 
 #### On disk — no DV (skip for training)
 
@@ -256,22 +263,24 @@ DV verified by stream probe (RPU NAL scan and/or BDNFO EL track check). All conf
 
 #### Download needed
 
-`*` = community benchmark title; must go to Test regardless of genre slot.
+`*` = community benchmark (Test only). All downloads must be **COMPLETE.UHD.BLURAY** or equivalent pure disc BDMV format — MKV remuxes confirmed as identity polynomial and excluded from training.
 
-| # | Title | Year | Genre | DV | Priority | Split | Why needed |
+| # | Title | Year | Genre | Format | Priority | Split | Why needed |
 |---|---|---|---|---|---|---|---|
-| D1 | Knives Out | 2019 | Comedy/Mystery | ✅ | **Critical** | Train | Only Comedy candidate; Lionsgate UHD pure disc |
-| D2 | A Quiet Place | 2018 | Horror | ✅ | **Critical** | Train | 28 Yrs Later moved to Train; need 2nd horror Train title |
-| D3 | **The Batman** * | 2022 | Superhero/Noir | ✅ | High | **Test** | Community benchmark; perpetual rain noir — contrast to WW1984 |
-| D4 | **Blade Runner 2049** * | 2017 | Sci-Fi/Noir | ✅ | High | **Test** | Most-discussed HDR/DV benchmark on AVForums; not on disk at all |
-| D5 | **Joker** * | 2019 | Superhero/Drama | ✅ | High | **Test** | Community DV benchmark; grimy Gotham — colour science interest |
-| D6 | 1917 | 2019 | Drama/War | ✅ | Medium | Train | Universal UHD; one-take WWI fills pure Drama Train slot |
-| D7 | The Grand Budapest Hotel | 2014 | Comedy | ✅ | Medium | Val | Fox/Disney; pastel storybook — fills Comedy Val |
-| D8 | All Quiet on the Western Front | 2022 | Drama/War | ✅ | Medium | Val | Netflix DV; naturalistic grey — fills Drama Val |
-| D9 | **John Wick: Ch4** * (EN) | 2023 | Action | ✅ | Low | **Test** | German disc already usable; EN version preferred for community post authenticity |
-| D10 | Encanto | 2021 | Animation | ✅ | Low | Val | Disney+; fills Animation Val (Spider-Verse is German) |
-| D11 | Interstellar | 2014 | Sci-Fi | ✅ | Low | Train | Paramount UHD; IMAX grain — Sci-Fi Train depth |
-| D12 | Lord of the Rings: Fellowship | 2001 | Epic | ✅ | Low | Train | WB 4K Extended; fills Classic/Epic Train in English |
+| C1 | **Mad Max: Fury Road** | 2015 | Action | BDMV | **Critical** | **Cal** | Replaces 5 identity-polynomial MKV calibration titles; hundreds of cuts (λ tuning) + extreme dynamic range |
+| C2 | **The Revenant** | 2015 | Drama/Adv | BDMV | **Critical** | **Cal** | Slow pacing + snow/fire extremes; calibrates Q within-scene; Fox/Disney UHD |
+| C3 | **Sicario** | 2015 | Thriller | BDMV | **Critical** | **Cal** | Precise studio lighting, tension-driven cuts; Lionsgate UHD; fills Thriller calibration gap |
+| D1 | Knives Out | 2019 | Comedy | BDMV | **Critical** | Train | Only Comedy candidate; Lionsgate UHD |
+| D2 | A Quiet Place | 2018 | Horror | BDMV | **Critical** | Train | Need 2nd Horror Train title |
+| D3 | **The Batman** * | 2022 | Superhero/Noir | BDMV | High | **Test** | Community benchmark; perpetual rain noir |
+| D4 | **Blade Runner 2049** * | 2017 | Sci-Fi/Noir | BDMV | High | **Test** | Most-discussed AVForums HDR benchmark |
+| D5 | **Joker** * | 2019 | Superhero/Drama | BDMV | High | **Test** | Community DV benchmark; grimy Gotham |
+| D6 | 1917 | 2019 | Drama/War | BDMV | Medium | Train | Universal UHD; fills pure Drama Train slot |
+| D7 | The Grand Budapest Hotel | 2014 | Comedy | BDMV | Medium | Val | Fox/Disney; fills Comedy Val |
+| D8 | All Quiet on the Western Front | 2022 | Drama/War | BDMV | Medium | Val | Netflix DV; fills Drama Val |
+| D9 | Interstellar | 2014 | Sci-Fi | BDMV | Low | Train | Paramount UHD; IMAX grain |
+| D10 | Lord of the Rings: Fellowship | 2001 | Epic | BDMV | Low | Train | WB 4K Extended; Classic/Epic Train |
+| D11 | Encanto | 2021 | Animation | BDMV | Low | Val | Disney+; fills Animation Val |
 
 ## Next steps
 
