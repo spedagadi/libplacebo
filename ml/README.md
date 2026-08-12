@@ -212,14 +212,14 @@ Scale targets for XGBoost and cross-title generalisation:
 | Title | Year | Genre | Format | DV | P | Status | Notes |
 |---|---|---|---|---|---|---|---|
 | **Dune: Part Two** * | 2024 | Sci-Fi | BDMV | ✅ | 7 | ✅ | EL auto-discovered; pass disc folder as input |
-| **Top Gun: Maverick** * | 2022 | Action | ISO | ✅ | **7** | ⚠️ | P7 v:1 confirmed; mount ISO then pass mount point as folder |
-| **Godzilla Minus One** * | 2023 | Sci-Fi | BDMV | ✅ | 7 | ✅ | JPN disc; EL auto-discovered |
+| **Top Gun: Maverick** * | 2022 | Action | ISO | ✅ | **7** | ✅ | P7 v:1 confirmed; mount ISO → pass mount point as folder |
+| **Godzilla Minus One** * | 2023 | Sci-Fi | BDMV | ✅ | **7** | ✅ | JPN disc; EL auto-discovered |
 | **Civil War** * | 2024 | War/Action | MKV | ✅ | **7** | ✅ | P7; DOVI confirmed |
-| **Spider-Man: ATSV** * | 2023 | Animation | MKV | ✅ | **7** | ⚠️ | German audio — DV extraction works; need EN disc for community demo |
-| **John Wick: Ch4** * | 2023 | Action | MKV | ✅ | **7** | ⚠️ | German audio — need EN disc (D9) for Test community demo |
-| Predator Badlands | 2025 | Sci-Fi/Action | BDMV | ✅ | 7 | ✅ | EL auto-discovered; pass disc folder as input |
-| Gladiator II | 2024 | Action/Epic | ISO | ✅ | **7** | ⚠️ | Mount ISO (`Mount-DiskImage`), then pass mount point as folder |
-| No Time to Die | 2021 | Action | ISO | ✅ | **7** | ⚠️ | Mount ISO (`Mount-DiskImage`), then pass mount point as folder |
+| **Spider-Man: ATSV** * | 2023 | Animation | MKV | ✅ | **7** | ✅ | P7; DOVI confirmed; German audio (no effect on DV extraction) |
+| **John Wick: Ch4** * | 2023 | Action | MKV | ✅ | **7** | ✅ | P7; DOVI confirmed; German audio (no effect on DV extraction) |
+| Predator Badlands | 2025 | Sci-Fi/Action | BDMV | ✅ | **7** | ✅ | P7 v:1; EL auto-discovered |
+| Gladiator II | 2024 | Action/Epic | ISO | ✅ | **7** | ✅ | P7 v:1 confirmed; mount ISO → pass mount point as folder |
+| No Time to Die | 2021 | Action | ISO | ✅ | **7** | ✅ | P7 v:1 confirmed; mount ISO → pass mount point as folder |
 | **The Batman** * _(download)_ | 2022 | Superhero/Noir | — | ✅ | — | ⬇️ | Rain noir — contrast to WW1984; WB UHD |
 | **Blade Runner 2049** * _(download)_ | 2017 | Sci-Fi/Noir | — | ✅ | — | ⬇️ | Most-discussed AVForums HDR benchmark; not on disk |
 | **Joker** * _(download)_ | 2019 | Superhero/Drama | — | ✅ | — | ⬇️ | Grimy Gotham; community DV discussion title |
@@ -230,7 +230,7 @@ Scale targets for XGBoost and cross-title generalisation:
 
 | Title | Year | Genre | Format | DV | P | Notes |
 |---|---|---|---|---|---|---|
-| MI: Dead Reckoning Pt 1 | 2023 | Action | ISO | ✅ | **7** | DV P7 confirmed — v:1 RPU 121 NALs/5s; use if more Action needed |
+| MI: Dead Reckoning Pt 1 | 2023 | Action | ISO | ✅ | **7** | ✅ | P7 v:1 confirmed; mount ISO → pass mount point; use if more Action needed |
 
 #### On disk — no DV (skip for training)
 
@@ -264,7 +264,7 @@ DV verified by stream probe (RPU NAL scan and/or BDNFO EL track check). All conf
 | D6 | 1917 | 2019 | Drama/War | ✅ | Medium | Train | Universal UHD; one-take WWI fills pure Drama Train slot |
 | D7 | The Grand Budapest Hotel | 2014 | Comedy | ✅ | Medium | Val | Fox/Disney; pastel storybook — fills Comedy Val |
 | D8 | All Quiet on the Western Front | 2022 | Drama/War | ✅ | Medium | Val | Netflix DV; naturalistic grey — fills Drama Val |
-| D9 | **John Wick: Ch4** * (EN) | 2023 | Action | ✅ | Medium | **Test** | Community benchmark; have German disc — need EN version |
+| D9 | **John Wick: Ch4** * (EN) | 2023 | Action | ✅ | Low | **Test** | German disc already usable; EN version preferred for community post authenticity |
 | D10 | Encanto | 2021 | Animation | ✅ | Low | Val | Disney+; fills Animation Val (Spider-Verse is German) |
 | D11 | Interstellar | 2014 | Sci-Fi | ✅ | Low | Train | Paramount UHD; IMAX grain — Sci-Fi Train depth |
 | D12 | Lord of the Rings: Fellowship | 2001 | Epic | ✅ | Low | Train | WB 4K Extended; fills Classic/Epic Train in English |
