@@ -721,6 +721,10 @@ def main():
                 frames_written += 1
                 frame_idx += 1
 
+            # Flush after every chunk so concurrent readers see consistent data
+            csvfile.flush()
+            os.fsync(csvfile.fileno())
+
             elapsed = time.time() - t0
             pct = 100.0 * (chunk_start - args.start) / max(1, end_sec - args.start)
             px_note = f" px_frames={len(pixel_stats)}" if needs_pixel_decode else ""

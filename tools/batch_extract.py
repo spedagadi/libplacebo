@@ -34,20 +34,12 @@ OUT_ROOT  = "F:/DTMModelData"
 # ---------------------------------------------------------------------------
 # Title registry  — (split, short_name, source_path, is_iso)
 # ---------------------------------------------------------------------------
-TITLES = [
-    # ---- Calibration ----
-    ("calibration", "everest",
-     r"G:\Everest.2015.UHD.BluRay.2160p.TrueHD.Atmos.7.1.DV.HDR10P.HEVC.HYBRID.REMUX-FraMeSToR.mkv", False),
-    ("calibration", "hurt_locker",
-     r"G:\Toedliches.Kommando.The.Hurt.Locker.2008.German.Custom.Atmos.Dubbed.2160p.UHD.BluRay.DV.HDR.HEVC.Remux-QfG.mkv", False),
-    ("calibration", "troy_dc",
-     r"G:\Troy.2004.Directors.Cut.2160p.UHD.Blu-ray.Remux.DV.HDR.HEVC.DTS-HD.MA.5.1-CiNEPHiLES.mkv", False),
-    ("calibration", "john_wick_4",
-     r"G:\John.Wick.Kapitel.4.2023.German.Atmos.DL.2160p.UHD.BluRay.DV.HDR.HEVC.Remux-NIMA4K.mkv", False),
-    ("calibration", "kingdom_of_heaven_dc",
-     r"G:\Koenigreich.der.Himmel.2005.Directors.Cut.Roadshow.Version.German.DL.2160p.UHD.BluRay.DV.HDR.HEVC.Remux-QfG.mkv", False),
+# MKV titles removed — all tested as 100% identity polynomials (DV via colour matrix only).
+# Download pure-disc COMPLETE.UHD.BLURAY or USA.UHD disc versions for real luma curves.
+# BDMV folders only below — these have actual per-scene DV polynomial data.
 
-    # ---- Train ----
+TITLES = [
+    # ---- Train (BDMV only) ----
     ("train", "atomic_blonde",
      r"G:\Atomic.Blonde.2017.MULTi.COMPLETE.UHD.BLURAY-OLDHAM", False),
     ("train", "alien_romulus",
@@ -60,24 +52,14 @@ TITLES = [
      r"G:\Spotlight.2015.UHD.BluRay.2160p.HEVC.DTS-HD.MA5.1-MTeam", False),
     ("train", "zodiac",
      r"G:\Zodiac.2007.UHD.BluRay.2160p.HEVC.TrueHD5.1-CHDBits", False),
-    ("train", "rush",
-     r"G:\Rush.2013.2160p.UHD.Blu-ray.Remux.HEVC.DV.TrueHD.7.1.Atmos-HDT\Rush 2013 2160p UHD Blu-ray Remux HEVC DV TrueHD 7.1 Atmos-HDT.mkv", False),
     ("train", "wonder_woman_1984",
      r"G:\Wonder.Woman.1984.2020.2160p.CEE.UHD.Blu-ray.HDR.DV.HEVC.TrueHD.7.1.Atmos", False),
     ("train", "first_blood",
      r"G:\First.Blood.1982.2160p.USA.UHD.Blu-ray.DV.HDR.HEVC.TrueHD.7.1.Atmos-BLoz", False),
-    ("train", "pacific_rim",
-     r"G:\Pacific Rim 2013 Hybrid 2160p UHD Blu-ray Remux DoVi HDR HEVC TrueHD 7.1 Atmos.mkv", False),
-    ("train", "prometheus",
-     r"G:\Prometheus.2012.UHD.BluRay.2160p.DTS-HD.MA.7.1.DV.HEVC.HYBRID.REMUX-FraMeSToR.mkv", False),
-    ("train", "the_creator",
-     r"G:\The Creator 2023 Hybrid 2160p UHD Blu-ray Remux DoVi HDR HEVC TrueHD 7.1 Atmos.mkv", False),
-    ("train", "kingdom_of_apes",
-     r"G:\Kingdom.of.the.Planet.of.the.Apes.2024.UHD.BluRay.2160p.TrueHD.Atmos.7.1.DV.HEVC.HYBRID.REMUX-FraMeSToR.mkv", False),
     ("train", "28_years_later",
      r"G:\28.Years.Later.2025.2160p.USA.UHD.Blu-ray.DV.HDR.HEVC.TrueHD.7.1.Atmos-TMT", False),
 
-    # ---- Val ----
+    # ---- Val (BDMV only) ----
     ("val", "how_to_train_your_dragon",
      r"G:\How.to.Train.Your.Dragon.2025.2160p.COMPLETE.UHD.BLURAY-B3LLUM", False),
     ("val", "mi_final_reckoning",
@@ -88,8 +70,6 @@ TITLES = [
      r"G:\Tron.Legacy.2010.2160p.USA.UHD.Blu-ray.DV.HDR.HEVC.TrueHD.7.1.Atmos-TMT", False),
     ("val", "f1_movie",
      r"G:\F1.The.Movie.2025.2160p.USA.UHD.Blu-ray.DV.HDR.HEVC.TrueHD.7.1.Atmos-TMT", False),
-    ("val", "weapons",
-     r"G:\Weapons.2025.Hybrid.2160p.UHD.Blu-ray.Remux.DV.HDR10plus.HEVC.TrueHD.Atmos.7.1-CiNEPHiLES.mkv", False),
     ("val", "ballerina",
      r"G:\Ballerina.2025.2160p.USA.UHD.Blu-ray.DV.HDR.HEVC.TrueHD.7.1.Atmos", False),
 ]

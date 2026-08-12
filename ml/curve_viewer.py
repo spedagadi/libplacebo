@@ -234,8 +234,17 @@ def ml_predict(models, feats, row):
 @st.cache_data
 def load_dataset(dataset_csv, l1_csv):
     import dv_coef_model as coef
-    # coef.load_data handles L1 merge + derived SAT feature computation
     df = coef.load_data(dataset_csv, l1_csv if l1_csv else None)
+    if len(df) == 0:
+        # Stage 1 manifest CSV — pixel features are NaN, load_data drops all rows.
+        # Load raw and compute only scene_id so the viewer can show DV gold curves.
+        import pandas as pd
+        df = pd.read_csv(dataset_csv)
+        df = df[df["poly_pivots"].notna() & df["seg0_c0"].notna()].reset_index(drop=True)
+        if "scene_refresh" in df.columns:
+            df["scene_id"] = df["scene_refresh"].fillna(0).cumsum().astype(int)
+        else:
+            df["scene_id"] = range(len(df))
     return df
 
 
@@ -590,13 +599,19 @@ def main():
     with st.sidebar:
         st.title("DV Curve Viewer")
 
-        default_csv = ""
-        default_l1  = ""
-        for arg in sys.argv[1:]:
+        default_csv   = ""
+        default_l1    = ""
+        default_video = ""
+        i = 1
+        while i < len(sys.argv):
+            arg = sys.argv[i]
+            if arg == "--video" and i + 1 < len(sys.argv):
+                default_video = sys.argv[i + 1]; i += 2; continue
             if arg.endswith(".csv") and "l1" in arg.lower():
                 default_l1 = arg
             elif arg.endswith(".csv"):
                 default_csv = arg
+            i += 1
 
         csv_path = st.text_input("Dataset CSV", value=default_csv,
                                  placeholder="dv_dataset_sat.csv")
@@ -615,7 +630,8 @@ def main():
 
         df = load_dataset(csv_path, l1_csv)
         n  = len(df)
-        st.caption(f"{n:,} frames  |  {int(df['scene_id'].max())} scenes  |  {float(df['pts_time'].max()):.0f}s")
+        scene_count = int(df["scene_refresh"].sum()) if "scene_refresh" in df.columns else (int(df["scene_id"].max()) if "scene_id" in df.columns and df["scene_id"].notna().any() else "?")
+        st.caption(f"{n:,} frames  |  {scene_count} scenes  |  {float(df['pts_time'].max()):.0f}s")
 
         st.divider()
 
@@ -637,7 +653,7 @@ def main():
         if "nav_frame" not in st.session_state:
             st.session_state["nav_frame"] = 0
 
-        all_scene_ids = sorted(df["scene_id"].unique())
+        all_scene_ids = sorted(df["scene_id"].dropna().unique().tolist())
         held_out_only = st.toggle("Held-out scenes only", value=True,
                                    help="Show only the 50% of scenes not used in training")
         if held_out_only and held_scenes:
@@ -657,20 +673,26 @@ def main():
             format_func=lambda s: f"Scene {int(s):04d}  (t={float(df[df.scene_id==s].iloc[0].pts_time):.1f}s)",
         )
 
+        def _on_num_change():
+            st.session_state["nav_frame"] = int(st.session_state["frame_num"])
+
         col_s, col_n = st.columns([3, 1])
         with col_s:
             frame_idx = st.slider("Frame", 0, n - 1,
                                   value=st.session_state["nav_frame"],
                                   key="frame_slider")
         with col_n:
-            frame_direct = st.number_input("Index", 0, n - 1,
-                                           value=frame_idx,
-                                           step=1, key="frame_num",
-                                           label_visibility="visible")
-        # number_input takes priority if it changed
-        if frame_direct != frame_idx:
-            frame_idx = int(frame_direct)
-        st.session_state["nav_frame"] = frame_idx
+            st.number_input("Index", 0, n - 1,
+                            value=st.session_state["nav_frame"],
+                            step=1, key="frame_num",
+                            on_change=_on_num_change,
+                            label_visibility="visible")
+        # Merge: number_input change wins (handled by on_change above)
+        frame_idx = st.session_state["nav_frame"]
+        # Keep slider in sync with nav_frame
+        if frame_idx != st.session_state.get("frame_slider", frame_idx):
+            st.session_state["nav_frame"] = st.session_state["frame_slider"]
+            frame_idx = st.session_state["frame_slider"]
 
         st.divider()
         show_pivots  = st.toggle("Show pivot points", value=True)
@@ -685,8 +707,7 @@ def main():
         )
 
         st.divider()
-        DEFAULT_VIDEO = "D:/Jdownloader/TeLtlTig2226pWBLHMAXDlyVsonHECAtms1LUX/The.Little.Things.2021.2160p.WEB-DL.HMAX.Dolby.Vision.HEVC.Atmos.5.1-FLUX/The Little Things (2021) 2160p WEB-DL HMAX Dolby Vision HEVC Atmos 5.1-FLUX.mp4"
-        video_path = st.text_input("Video file (for frame decode)", value=DEFAULT_VIDEO)
+        video_path = st.text_input("Video file (for frame decode)", value=default_video)
         show_frames = st.toggle("Decode & show frames", value=True)
         out_nits    = st.select_slider(
             "Target display (nits)",
@@ -719,7 +740,7 @@ def main():
     st.markdown(f"### Scene {sid:04d}  |  frame {int(cur.frame_idx):05d}  |  t={t:.2f}s")
 
     # Timeline
-    st.plotly_chart(build_timeline(df, frame_idx), use_container_width=True,
+    st.plotly_chart(build_timeline(df, frame_idx), width="stretch",
                     key=f"timeline_{frame_idx}")
 
     # 3-curve plot + luminance panel
@@ -730,9 +751,9 @@ def main():
                                            knee_adaptation=knee_adaptation,
                                            slope_tuning=slope_tuning,
                                            tone_mapper=tone_mapper),
-                        use_container_width=True, key=f"curves_{frame_idx}")
+                        width="stretch", key=f"curves_{frame_idx}")
     with col_lum:
-        st.plotly_chart(build_luminance_figure(cur), use_container_width=True,
+        st.plotly_chart(build_luminance_figure(cur), width="stretch",
                         key=f"lum_{frame_idx}")
 
     # Coefficients expander
@@ -758,7 +779,7 @@ def main():
                 "c1f": f"{float(c1)*COEF_SCALE:.6f}" if c1 and not pd.isna(c1) else None,
                 "c2f": f"{float(c2)*COEF_SCALE:.6f}" if c2 and not pd.isna(c2) else None,
             })
-        st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
+        st.dataframe(pd.DataFrame(rows), width="stretch", hide_index=True)
 
     # --- Frame panel ---
     if show_frames and video_path and __import__("os").path.exists(video_path):
@@ -781,7 +802,7 @@ def main():
             for col, (name, img) in zip(cols, images.items()):
                 with col:
                     st.caption(name)
-                    st.image(img, use_container_width=True, clamp=True)
+                    st.image(img, width="stretch", clamp=True)
 
             if show_diff and diffs:
                 st.markdown("#### Difference vs DV gold  (brighter = larger error)")
@@ -793,7 +814,7 @@ def main():
                         fig, ax = plt.subplots(figsize=(6, 3.4))
                         ax.imshow(diff, cmap="inferno", vmin=0, vmax=30)
                         ax.axis("off")
-                        st.pyplot(fig, use_container_width=True)
+                        st.pyplot(fig, width="stretch")
                         plt.close(fig)
     elif show_frames:
         st.info("Enter a video file path in the sidebar to enable frame decoding.")
