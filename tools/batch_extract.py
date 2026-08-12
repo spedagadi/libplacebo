@@ -1,14 +1,23 @@
 """
 Batch Stage 1 manifest extraction for all Cal/Train/Val titles.
 
-Runs dv_metadata_extract.py --no-pixels on every title, handling BDMV folders,
-MKV files, and ISOs (auto-mount/unmount via PowerShell Mount-DiskImage).
+Stage 1 (default): --no-pixels, --sample-fps 0 (ALL frames) — fast RPU-only
+  pass that captures every frame's polynomial + L1 + scene_refresh. Stratification
+  and Stage 2 frame selection are applied to this base manifest.
+
+Stage 2: --full-pixels — adds pixel decode (maxscl, histogram, SAT zones).
+  Slower; run after Stage 1 to fill in pixel feature columns.
+
+Parallel: --workers N (default 2) runs N titles concurrently. Keep ≤3 for
+  a single HDD source drive; more workers thrash disk with random seeks.
 
 Usage:
-    python tools/batch_extract.py                    # Cal + Train + Val
-    python tools/batch_extract.py --splits train val  # specific splits
-    python tools/batch_extract.py --dry-run           # print commands only
-    python tools/batch_extract.py --full-pixels       # Stage 2: include pixel decode
+    python tools/batch_extract.py                          # Stage 1, all frames, 2 workers
+    python tools/batch_extract.py --workers 3              # 3 parallel titles
+    python tools/batch_extract.py --splits train val       # specific splits
+    python tools/batch_extract.py --full-pixels --workers 1 # Stage 2 (slower, serial)
+    python tools/batch_extract.py --dry-run                # print commands only
+    python tools/batch_extract.py --title rush             # single title rerun
 """
 
 import subprocess
@@ -17,6 +26,7 @@ import sys
 import time
 import os
 from pathlib import Path
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 EXTRACTOR = "C:/Code/libplacebo/tools/dv_metadata_extract.py"
 OUT_ROOT  = "F:/DTMModelData"
@@ -124,11 +134,14 @@ def extract_title(split, name, source, is_iso, no_pixels, dry_run):
             actual_source = mount_iso(source)
             mount_point = actual_source
 
+    # Stage 1: all frames (sample-fps 0) so stratification has the full manifest.
+    # Stage 2: same rate but with pixel decode enabled.
+    sample_fps = "0" if no_pixels else "1"
     cmd = [
         sys.executable, EXTRACTOR,
         actual_source,
         "-o", str(out_csv),
-        "--sample-fps", "1",
+        "--sample-fps", sample_fps,
         "--chunk-secs", "60",
     ]
     if no_pixels:
@@ -168,9 +181,11 @@ def main():
     ap.add_argument("--dry-run", action="store_true",
                     help="Print commands without running")
     ap.add_argument("--full-pixels", action="store_true",
-                    help="Stage 2: include pixel decode (much slower). Default is Stage 1 manifest only.")
+                    help="Stage 2: include pixel decode (slower). Default is Stage 1 manifest only.")
     ap.add_argument("--title", metavar="NAME",
                     help="Process only this title (short name, e.g. 'rush')")
+    ap.add_argument("--workers", type=int, default=2,
+                    help="Parallel titles (default 2; keep ≤3 for single HDD source)")
     args = ap.parse_args()
 
     no_pixels = not args.full_pixels
@@ -181,24 +196,32 @@ def main():
             print(f"Title '{args.title}' not found. Available: {[n for _,n,_,_ in TITLES]}")
             sys.exit(1)
 
-    mode = "MANIFEST (Stage 1 — no pixels)" if no_pixels else "FULL PIXELS (Stage 2)"
+    mode = "MANIFEST Stage 1 — all frames, no pixels" if no_pixels else "FULL PIXELS Stage 2 — 1fps + pixel decode"
+    workers = 1 if args.dry_run else min(args.workers, len(titles))
     print(f"\nBatch extraction — {mode}")
-    print(f"Splits: {args.splits}  |  Titles: {len(titles)}")
+    print(f"Splits: {args.splits}  |  Titles: {len(titles)}  |  Workers: {workers}")
     print(f"Output: {OUT_ROOT}\n")
 
     ok_count = 0
     fail_count = 0
-    skip_count = 0
+    t_start = time.time()
 
-    for split, name, source, is_iso in titles:
-        result = extract_title(split, name, source, is_iso, no_pixels, args.dry_run)
-        if result:
-            ok_count += 1
-        else:
-            fail_count += 1
+    def _run(item):
+        split, name, source, is_iso = item
+        return name, extract_title(split, name, source, is_iso, no_pixels, args.dry_run)
 
+    with ThreadPoolExecutor(max_workers=workers) as pool:
+        futures = {pool.submit(_run, t): t[1] for t in titles}
+        for fut in as_completed(futures):
+            name, ok = fut.result()
+            if ok:
+                ok_count += 1
+            else:
+                fail_count += 1
+
+    elapsed = (time.time() - t_start) / 60
     print(f"\n{'='*60}")
-    print(f"Done. OK={ok_count}  Failed={fail_count}  Skipped={skip_count}")
+    print(f"Done in {elapsed:.1f} min. OK={ok_count}  Failed={fail_count}")
 
 
 if __name__ == "__main__":
