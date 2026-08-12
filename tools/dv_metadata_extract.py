@@ -29,6 +29,7 @@ Usage:
   python dv_metadata_extract.py INPUT.mkv -o dataset.csv --sample-fps 0.5 --resume
 """
 
+import os
 import subprocess
 import json
 import csv
