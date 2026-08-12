@@ -153,15 +153,21 @@ Scale targets for XGBoost and cross-title generalisation:
 
 ---
 
-##### Calibration (3 titles — hyperparameter search only)
+##### Calibration (5 titles — HPO + Kalman smoother tuning)
 
-> Used exclusively for Bayesian HPO over GBR hyperparameters (`n_estimators`, `max_depth`, `learning_rate`, `subsample`, `min_samples_leaf`). Titles are run many times during search — they must be separate from Train to avoid overfitting hyperparameters to the training distribution, and separate from Val/Test to preserve their independence. German audio is irrelevant here since calibration uses only pixel features + RPU labels.
+> **Two calibration roles — same set serves both:**
+> 1. **Bayesian HPO** (per-frame GBR): tune `n_estimators`, `max_depth`, `learning_rate`, `subsample`, `min_samples_leaf`. Run 50-100 trials; must be isolated from Train/Val/Test.
+> 2. **Kalman smoother tuning**: fit process noise Q (within-scene drift), measurement noise R (ML prediction trust), and cut-inflation factor λ (rapid adaptation at scene boundaries). Requires **temporal sequences** extracted at ≥5fps (not the 1fps training sample) to capture frame-to-frame dynamics. Scene-refresh flags from the RPU provide ground-truth cut markers.
+>
+> German audio has no effect on either role. All 5 titles confirmed DOVI.
 
-| Title | Year | Genre | Format | DV | P | Tier | Why |
+| Title | Year | Genre | Format | DV | P | Tier | Calibration rationale |
 |---|---|---|---|---|---|---|---|
-| Everest | 2015 | Drama/Adventure | MKV | ✅ | **8** | H | Extreme bright snow + deep shadow — widest dynamic range; stresses both ends of the polynomial |
-| The Hurt Locker | 2008 | War/Drama | MKV | ✅ | **7** | P | Dark, muted, high contrast — stresses shadow region and low-light polynomial segments |
-| Troy (DC) | 2004 | Epic/Action | MKV | ✅ | **7** | P | Mixed daylight/interior, high EL bitrate — stresses highlight region and slope transitions |
+| Everest | 2015 | Drama/Adventure | MKV | ✅ | **8** | H | Wide dynamic range (snow→shadow); calibrates Q at both extremes |
+| The Hurt Locker | 2008 | War/Drama | MKV | ✅ | **7** | P | Dark/muted; calibrates Q for stable low-light sequences |
+| Troy (DC) | 2004 | Epic/Action | MKV | ✅ | **7** | P | Mixed light, high EL bitrate; calibrates R and highlight slope |
+| John Wick: Ch4 | 2023 | Action | MKV | ✅ | **7** | P | Many rapid scene cuts, neon/dark contrast; best title for tuning λ (cut inflation) |
+| Kingdom of Heaven (DC) | 2005 | Epic | MKV | ✅ | **7** | P | Long stable medieval scenes + battle transitions; calibrates Q within-scene vs across-scene |
 
 ---
 
@@ -212,9 +218,8 @@ Scale targets for XGBoost and cross-title generalisation:
 | **Spider-Man: ATSV** * | 2023 | Animation | MKV | ✅ | **7** | ⚠️ | Animation HDR benchmark; German audio |
 | **John Wick: Ch4** * | 2023 | Action | MKV | ✅ | **7** | ⚠️ | Neon geometry benchmark; currently German — get EN |
 | Predator Badlands | 2025 | Sci-Fi/Action | BDMV | ✅ | 7 | ⚠️ | EL stream needed |
-| Gladiator II | 2024 | Action/Epic | ISO | 🔍 | ? | ⚠️ | ISO — mount + ffprobe to confirm |
-| No Time to Die | 2021 | Action | ISO | 🔍 | ? | ⚠️ | ISO — mount + ffprobe to confirm |
-| Wonder Woman 2017 | 2017 | Superhero | ISO | 🔍 | ? | ⚠️ | ISO — mount + ffprobe to confirm |
+| Gladiator II | 2024 | Action/Epic | ISO | ✅ | **7** | ⚠️ | DV P7 confirmed — v:1 RPU 121 NALs/5s; use v:1 for extraction |
+| No Time to Die | 2021 | Action | ISO | ✅ | **7** | ⚠️ | DV P7 confirmed — v:1 RPU 121 NALs/5s; use v:1 for extraction |
 | **The Batman** * _(download)_ | 2022 | Superhero/Noir | — | ✅ | — | ⬇️ | Rain noir — contrast to WW1984; WB UHD |
 | **Blade Runner 2049** * _(download)_ | 2017 | Sci-Fi/Noir | — | ✅ | — | ⬇️ | Most-discussed AVForums HDR benchmark; not on disk |
 | **Joker** * _(download)_ | 2019 | Superhero/Drama | — | ✅ | — | ⬇️ | Grimy Gotham; community DV discussion title |
@@ -225,21 +230,25 @@ Scale targets for XGBoost and cross-title generalisation:
 
 | Title | Year | Genre | Format | DV | P | Notes |
 |---|---|---|---|---|---|---|
-| John Wick: Ch4 | 2023 | Action | MKV | ✅ | **7** | German audio — replace with EN download (D9) |
-| Kingdom of Heaven (DC) | 2005 | Epic | MKV | ✅ | **7** | German audio; DOVI confirmed |
-| V for Vendetta | 2005 | Action/Sci-Fi | ISO | 🔍 | ? | ISO — mount + ffprobe |
-| MI: Dead Reckoning Pt 1 | 2023 | Action | ISO | 🔍 | ? | ISO — mount + ffprobe |
+| MI: Dead Reckoning Pt 1 | 2023 | Action | ISO | ✅ | **7** | DV P7 confirmed — v:1 RPU 121 NALs/5s; use if more Action needed |
 
 #### On disk — no DV (skip for training)
 
-| Title | Year | Location | HDR | Note |
+DV verified by stream probe (RPU NAL scan and/or BDNFO EL track check). All confirmed HDR10 only.
+
+| Title | Year | Location | HDR | How confirmed |
 |---|---|---|---|---|
-| Oppenheimer | 2023 | `G:\Oppenheimer...ESiR` | HDR10 | EUR disc — HDR10 only; US disc has DV |
-| Se7en | 1995 | `G:\Se7en...` | HDR10 | Disc confirmed HDR10 only |
-| Last Breath | 2025 | `G:\Last.Breath...` | HDR10 | No DV track on disc |
-| Heat | 1995 | `G:\Heat.1995...mkv` | HDR10+ | No DV |
-| Nope | 2022 | `G:\Nope 2022...mkv` | HDR10 | No DV |
-| Exodus: Gods and Kings | 2014 | `G:\Exodus Gods and Kings.m2ts` | HDR10 | Single m2ts, likely no DV |
+| Oppenheimer | 2023 | `G:\Oppenheimer...ESiR` | HDR10 | BDNFO — single video track; EUR disc (US disc has DV) |
+| Se7en | 1995 | `G:\Se7en...` | HDR10 | BDNFO — single video track |
+| Last Breath | 2025 | `G:\Last.Breath...` | HDR10 | BDNFO — single video track |
+| Heat | 1995 | `G:\Heat.1995...mkv` | HDR10+ | Filename — no DV tag; HDR10+ only |
+| Nope | 2022 | `G:\Nope 2022...mkv` | HDR10 | Filename — no DV tag |
+| Exodus: Gods and Kings | 2014 | `G:\Exodus Gods and Kings.m2ts` | HDR10 | Single m2ts, no RPU NALs |
+| V for Vendetta | 2005 | `G:\V.for.Vendetta...iso` | HDR10 | ISO probed — 0 RPU NALs v:0; v:1 is H.264 BD combo track |
+| Wonder Woman 2017 | 2017 | `G:\Wonder.Woman.2017...iso` | HDR10 | ISO probed — 0 RPU NALs; single HEVC stream; pre-DV Warner press |
+| American Sniper | 2014 | `G:\American.Sniper...MTeam` | HDR10 | BDNFO — single video track; pre-DV Warner 2014 |
+| Edge of Tomorrow | 2014 | `G:\Edge.of.Tomorrow...MAXAGAZ` | HDR10 | BDNFO — single video track; pre-DV Warner 2014 |
+| Monkey Man | 2024 | `G:\Monkey.Man...B0MBARDiERS` | HDR10 | BDNFO — single video track; Universal disc HDR10 only |
 
 #### Download needed
 
