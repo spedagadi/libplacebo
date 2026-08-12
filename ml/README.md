@@ -212,7 +212,7 @@ Scale targets for XGBoost and cross-title generalisation:
 | Title | Year | Genre | Format | DV | P | Status | Notes |
 |---|---|---|---|---|---|---|---|
 | **Dune: Part Two** * | 2024 | Sci-Fi | BDMV | ✅ | 7 | ✅ | EL auto-discovered; pass disc folder as input |
-| **Top Gun: Maverick** * | 2022 | Action | RAR | ✅ | ? | ⚠️ | Extract RAR first → then pass as BDMV folder |
+| **Top Gun: Maverick** * | 2022 | Action | ISO | ✅ | **7** | ⚠️ | P7 v:1 confirmed; mount ISO then pass mount point as folder |
 | **Godzilla Minus One** * | 2023 | Sci-Fi | BDMV | ✅ | 7 | ✅ | JPN disc; EL auto-discovered |
 | **Civil War** * | 2024 | War/Action | MKV | ✅ | **7** | ✅ | P7; DOVI confirmed |
 | **Spider-Man: ATSV** * | 2023 | Animation | MKV | ✅ | **7** | ⚠️ | German audio — DV extraction works; need EN disc for community demo |
