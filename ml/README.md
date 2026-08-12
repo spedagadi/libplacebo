@@ -174,11 +174,12 @@ Scale targets for XGBoost and cross-title generalisation:
 
 ---
 
-##### Train (13 titles)
+##### Train (14 titles)
 
 | Title | Year | Genre | Format | DV | P | Tier | Status | Notes |
 |---|---|---|---|---|---|---|---|---|
 | Alien: Romulus | 2024 | Sci-Fi/Horror | BDMV | ✅ | **7** | P | ✅ | P7 v:1; EL 5528 kbps; EL auto-discovered |
+| Atomic Blonde | 2017 | Action/Spy | BDMV | ✅ | **7** | P | ✅ | P7 v:1; stream-probed; previously missed (no BDNFO) |
 | Furiosa | 2024 | Action | BDMV | ✅ | **7** | P | ✅ | P7 v:1; EL 2106 kbps; EL auto-discovered |
 | Warfare | 2025 | War/Action | BDMV | ✅ | **7** | P | ✅ | P7 v:1 interleaved; EL auto-discovered |
 | Spotlight | 2015 | Drama | BDMV | ✅ | **7** | P | ✅ | **Tested** — 124 rows, P7 v:1 interleaved, all features populated |

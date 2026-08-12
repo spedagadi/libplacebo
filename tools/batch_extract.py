@@ -38,6 +38,8 @@ TITLES = [
      r"G:\Koenigreich.der.Himmel.2005.Directors.Cut.Roadshow.Version.German.DL.2160p.UHD.BluRay.DV.HDR.HEVC.Remux-QfG.mkv", False),
 
     # ---- Train ----
+    ("train", "atomic_blonde",
+     r"G:\Atomic.Blonde.2017.MULTi.COMPLETE.UHD.BLURAY-OLDHAM", False),
     ("train", "alien_romulus",
      r"G:\Alien.Romulus.2024.2160p.COMPLETE.UHD.BLURAY-DOUHD", False),
     ("train", "furiosa",
