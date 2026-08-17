@@ -189,17 +189,34 @@ Already added to `tools/batch_extract.py` TITLES registry as "train".
 
 **Expected value:** Fill the (bright, S-curve) training cell — boost-curve + midtone preservation for bright outdoor content. Currently only ~966 boost training scenes; these should add ~500-1000 more.
 
-**Extraction steps:**
+### ⚠️ CRITICAL: Correct Extraction Pipeline
+
+**DO NOT use `batch_extract.py` for Stage 1** — it calls `dv_metadata_extract.py` which uses
+ffprobe `-show_frames` to decode the full video stream. This takes **~30 min/episode**.
+
+**The fast path for Stage 1 (seconds/episode):**
+
 ```bat
-python3 tools\batch_extract.py --titles our_living_world_s01 --no-pixels
-python3 tools\batch_extract.py --titles our_oceans_s01 --no-pixels
+REM Step 1: Extract RPU binary files via dovi_tool (~90s/episode, parallel)
+python3 tools\rpu_extract_batch.py -o F:\DTMModelData\rpu --title our_living_world_s01
+python3 tools\rpu_extract_batch.py -o F:\DTMModelData\rpu --title our_oceans_s01
+
+REM Step 2: Stage 1 CSVs from RPU — pure dovi_tool JSON parse, no HEVC decode (~5-15s/episode)
+python3 tools\rpu_stage1_extract.py --rpu-dir F:\DTMModelData\rpu --title our_living_world_s01
+python3 tools\rpu_stage1_extract.py --rpu-dir F:\DTMModelData\rpu --title our_oceans_s01
+
+REM Step 3: Verify boost curves exist before committing to Stage 2
+python3 tools\check_black_bars.py
+
+REM Step 4: Stage 2 pixel features (daemon, ~3-4h per title)
 python3 tools\stage2_pixel_extract.py --split train --workers 2
 ```
 
-After Stage 1, verify boost curves exist before committing to Stage 2 (full day):
-```bash
-python3 tools/check_black_bars.py  # check polynomial types for new titles
-```
+**New titles must also be added to `tools/rpu_extract_batch.py::TITLES` dict** (already done for
+our_living_world_s01 and our_oceans_s01).
+
+`batch_extract.py` is for Stage 2 only (full pixels via `--full-pixels` flag).
+Stage 1 always uses the two-step rpu_extract_batch → rpu_stage1_extract pipeline.
 
 ### Improve Curve Quality
 
