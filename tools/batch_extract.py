@@ -25,6 +25,7 @@ import argparse
 import sys
 import time
 import os
+import csv
 from pathlib import Path
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
@@ -34,44 +35,62 @@ OUT_ROOT  = "F:/DTMModelData"
 # ---------------------------------------------------------------------------
 # Title registry  — (split, short_name, source_path, is_iso)
 # ---------------------------------------------------------------------------
-# MKV titles removed — all tested as 100% identity polynomials (DV via colour matrix only).
-# Download pure-disc COMPLETE.UHD.BLURAY or USA.UHD disc versions for real luma curves.
-# BDMV folders only below — these have actual per-scene DV polynomial data.
+# Aug 2026: BDMV disc titles removed — confirmed 100% identity luma polynomials
+# (HDR10 base layer already tone-mapped in mastering; DV is colour-matrix-only
+# on disc). P5 streaming corpus is now primary — real per-scene polynomials
+# authored directly against the streaming encode. See ml/README.md.
+#
+# Source paths are folders of per-episode MKVs under G:\Dataset\ (real release
+# folder names, confirmed on disk Aug 2026). extract_title() detects a loose
+# episode folder (vs a single file or BDMV disc) and iterates episodes itself.
+#
+# Note: Witcher downloaded as S04, not the originally planned S02 — S04 is
+# what's on disk, kept as-is (see ml/README.md).
 
 TITLES = [
-    # ---- Train (BDMV only) ----
-    ("train", "atomic_blonde",
-     r"G:\Atomic.Blonde.2017.MULTi.COMPLETE.UHD.BLURAY-OLDHAM", False),
-    ("train", "alien_romulus",
-     r"G:\Alien.Romulus.2024.2160p.COMPLETE.UHD.BLURAY-DOUHD", False),
-    ("train", "furiosa",
-     r"G:\Furiosa.A.Mad.Max.Saga.2024.2160p.MULTi.COMPLETE.UHD.BLURAY-GLiMMER", False),
-    ("train", "warfare",
-     r"G:\Warfare.2025.2160p.USA.UHD.Blu-ray.DV.HDR.HEVC.TrueHD.7.1.Atmos-TMT", False),
-    ("train", "spotlight",
-     r"G:\Spotlight.2015.UHD.BluRay.2160p.HEVC.DTS-HD.MA5.1-MTeam", False),
-    ("train", "zodiac",
-     r"G:\Zodiac.2007.UHD.BluRay.2160p.HEVC.TrueHD5.1-CHDBits", False),
-    ("train", "wonder_woman_1984",
-     r"G:\Wonder.Woman.1984.2020.2160p.CEE.UHD.Blu-ray.HDR.DV.HEVC.TrueHD.7.1.Atmos", False),
-    ("train", "first_blood",
-     r"G:\First.Blood.1982.2160p.USA.UHD.Blu-ray.DV.HDR.HEVC.TrueHD.7.1.Atmos-BLoz", False),
-    ("train", "28_years_later",
-     r"G:\28.Years.Later.2025.2160p.USA.UHD.Blu-ray.DV.HDR.HEVC.TrueHD.7.1.Atmos-TMT", False),
+    # ---- Train ----
+    ("train", "andor_s02",
+     r"G:\Dataset\Andor.S02.2160p.DSNP.WEB-DL.DDP5.1.DV.H.265-NTb", False),
+    ("train", "euphoria_s03",
+     r"G:\Dataset\Euphoria.US.S03.2160p.HMAX.WEB-DL.DDP5.1.DV.H.265-NTb", False),
+    ("train", "for_all_mankind_s05",
+     r"G:\Dataset\For.All.Mankind.S05.2160p.ATVP.WEB-DL.DDP5.1.DV.H.265-NTb", False),
+    ("train", "house_of_the_dragon_s03",
+     r"G:\Dataset\House.of.the.Dragon.S03.2160p.HMAX.WEB-DL.DDP5.1.DV.H.265-NTb", False),
+    ("train", "mindhunter_s01",
+     r"G:\Dataset\Mindhunter.S01.2160p.NF.WEB-DL.DDP5.1.DV.H.265-Kitsune", False),
+    ("train", "monarch_s02",
+     r"G:\Dataset\Monarch.Legacy.of.Monsters.S02.2160p.ATVP.WEB-DL.DDP5.1.DV.H.265-NTb", False),
+    ("train", "sandman_s01",
+     r"G:\Dataset\The.Sandman.S01.2160p.NF.WEB-DL.DDP.5.1.Atmos.DV.H.265-CHDWEB", False),
+    ("train", "stranger_things_s05",
+     r"G:\Dataset\Stranger.Things.S05.2160p.NF.WEB-DL.DDP5.1.DV.H.265-NTb", False),
+    ("train", "ted_lasso_s03",
+     r"G:\Dataset\Ted.Lasso.S03.2160p.ATVP.WEB-DL.DDP5.1.DoVi.H.265-NTb", False),
+    ("train", "the_last_of_us_s02",
+     r"G:\Dataset\The.Last.of.Us.S02.2160p.MAX.WEB-DL.DDP5.1.DV.x265-NTb", False),
+    ("train", "the_mandalorian_s01",
+     r"G:\Dataset\The.Mandalorian.S01.2160p.DSNP.WEB-DL.DDP5.1.Atmos.DV.HEVC-MZABI", False),
+    ("train", "the_witcher_s04",
+     r"G:\Dataset\The.Witcher.S04.2160p.NF.WEB-DL.DDP5.1.DV.H.265-NTb", False),
+    # Nature documentaries — bright outdoor S-curve content (fills bright/S-curve training gap)
+    # No stratification cap applied — full extraction to maximise boost-curve coverage
+    ("train", "our_living_world_s01",
+     r"G:\Dataset\Our.Living.World.S01.2160p.NF.WEB-DL.DDP5.1.Atmos.DV.H.265-FLUX", False),
+    ("train", "our_oceans_s01",
+     r"G:\Dataset\Our.Oceans.(2024).S01.(2160p.NF.WEB-DL.H265.DV.DDP.Atmos.5.1.English.-.HONE)", False),
 
-    # ---- Val (BDMV only) ----
-    ("val", "how_to_train_your_dragon",
-     r"G:\How.to.Train.Your.Dragon.2025.2160p.COMPLETE.UHD.BLURAY-B3LLUM", False),
-    ("val", "mi_final_reckoning",
-     r"G:\Mission.Impossible-The.Final.Reckoning.2025.2160p.UHD.Blu-ray.HEVC.TrueHD-Tasko", False),
-    ("val", "invisible_man",
-     r"G:\The.Invisible.Man.2020.UHD.BluRay.2160p.HEVC.TrueHD.Atmos.7.1-BeyondHD", False),
-    ("val", "tron_legacy",
-     r"G:\Tron.Legacy.2010.2160p.USA.UHD.Blu-ray.DV.HDR.HEVC.TrueHD.7.1.Atmos-TMT", False),
-    ("val", "f1_movie",
-     r"G:\F1.The.Movie.2025.2160p.USA.UHD.Blu-ray.DV.HDR.HEVC.TrueHD.7.1.Atmos-TMT", False),
-    ("val", "ballerina",
-     r"G:\Ballerina.2025.2160p.USA.UHD.Blu-ray.DV.HDR.HEVC.TrueHD.7.1.Atmos", False),
+    # ---- Val ----
+    ("val", "born_to_be_wild_s01",
+     r"G:\Dataset\Born.to.Be.Wild.2025.S01.2160p.ATVP.WEB-DL.DDP5.1.DV.HEVC-NTb", False),
+    ("val", "our_planet_s01",
+     r"G:\Dataset\Our.Planet.2019.S01.2160p.NF.WEB-DL.DDP5.1.Atmos.DV.H.265-FLUX", False),
+    ("val", "prehistoric_planet_s03",
+     r"G:\Dataset\Prehistoric.Planet.2022.S03.2160p.ATVP.WEB-DL.DDP5.1.Atmos.DV.H.265-FLUX", False),
+    ("val", "rings_of_power_s02",
+     r"G:\Dataset\The.Lord.of.the.Rings.The.Rings.of.Power.S02.2160p.AMZN.WEB-DL.DDP5.1.Atmos.DV.H.265-FLUX", False),
+    ("val", "wondla_s03",
+     r"G:\Dataset\WondLa.S03.2160p.ATVP.WEB-DL.DDP5.1.DV.HEVC-BYNDR", False),
 ]
 
 
@@ -104,9 +123,99 @@ def _is_complete(csv_path: Path, min_rows: int = 1000) -> bool:
         return False
 
 
+def _concat_episodes(ep_dir: Path, out_csv: Path):
+    """Concatenate per-episode CSVs into one title CSV.
+
+    Each episode's scene_id restarts at 0, so a plain concat would collide
+    scene_ids across episodes. Tag every row with an 'episode' column instead
+    of touching scene_id — GroupKFold should group on (episode, scene_id).
+    """
+    ep_csvs = sorted(ep_dir.glob("*.csv"))
+    if not ep_csvs:
+        return
+    writer = None
+    with open(out_csv, "w", newline="") as out_f:
+        for ep_csv in ep_csvs:
+            with open(ep_csv, "r", newline="") as in_f:
+                reader = csv.DictReader(in_f)
+                if reader.fieldnames is None:
+                    continue
+                if writer is None:
+                    writer = csv.DictWriter(out_f, fieldnames=["episode"] + list(reader.fieldnames))
+                    writer.writeheader()
+                for row in reader:
+                    row["episode"] = ep_csv.stem
+                    writer.writerow(row)
+    print(f"  [concat] {len(ep_csvs)} episode CSV(s) -> {out_csv}")
+
+
+def extract_episode_dir(split, name, source_dir, no_pixels, dry_run, nvdec=False):
+    """Iterate loose per-episode MKVs in source_dir (P5 streaming season folders
+    have no BDMV structure, so the extractor must run once per episode file)."""
+    episodes = sorted(source_dir.glob("*.mkv")) or sorted(source_dir.glob("*.mp4"))
+    if not episodes:
+        print(f"  [skip]   {name} — no .mkv/.mp4 files found in {source_dir}")
+        return False
+
+    out_dir = Path(OUT_ROOT) / split
+    out_csv = out_dir / f"{name}.csv"
+    ep_dir = out_dir / f"{name}_episodes"
+    if not dry_run:
+        ep_dir.mkdir(parents=True, exist_ok=True)
+
+    sample_fps = "0" if no_pixels else "1"
+    all_ok = True
+    for ep in episodes:
+        ep_csv = ep_dir / f"{ep.stem}.csv"
+        resume = False
+        if not dry_run and ep_csv.exists():
+            size = ep_csv.stat().st_size
+            if size <= 512:
+                ep_csv.unlink()
+            elif _is_complete(ep_csv, min_rows=2000):
+                print(f"  [done]   {name}/{ep.stem} — complete, skipping")
+                continue
+            else:
+                resume = True
+
+        cmd = [sys.executable, EXTRACTOR, str(ep), "-o", str(ep_csv),
+               "--sample-fps", sample_fps, "--chunk-secs", "60"]
+        if no_pixels:
+            cmd.append("--no-pixels")
+        if resume:
+            cmd.append("--resume")
+        if not no_pixels and nvdec:
+            cmd.append("--nvdec")
+
+        if dry_run:
+            print(f"  [dry] {' '.join(str(c) for c in cmd)}")
+            continue
+
+        print(f"\n{'='*60}")
+        print(f"  {split.upper()} | {name} / {ep.stem}")
+        print(f"{'='*60}")
+        t0 = time.time()
+        result = subprocess.run(cmd, check=False)
+        elapsed = time.time() - t0
+        ok = result.returncode == 0
+        print(f"  -> {'OK' if ok else f'FAILED (rc={result.returncode})'} in {elapsed/60:.1f} min")
+        all_ok = all_ok and ok
+
+    if dry_run:
+        return True
+
+    _concat_episodes(ep_dir, out_csv)
+    return all_ok
+
+
 def extract_title(split, name, source, is_iso, no_pixels, dry_run, nvdec=False):
     out_dir = Path(OUT_ROOT) / split
     out_csv = out_dir / f"{name}.csv"
+
+    source_path = Path(source)
+    if not is_iso and source_path.is_dir() and not any(source_path.rglob("*.m2ts")) \
+            and (any(source_path.glob("*.mkv")) or any(source_path.glob("*.mp4"))):
+        return extract_episode_dir(split, name, source_path, no_pixels, dry_run, nvdec=nvdec)
 
     resume = False
     if out_csv.exists():

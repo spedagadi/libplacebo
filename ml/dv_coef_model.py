@@ -71,13 +71,18 @@ TARGET_DIM   = 1 + MAX_PIVOTS + MAX_SEGS * 4   # 42
 # Spatial zone columns (3x3 SAT grid — 18 features)
 _SAT_ROWS, _SAT_COLS = 3, 3
 SAT_FEATURE_COLS = (
-    [f'zone_mean_r{r}_c{c}' for r in range(_SAT_ROWS) for c in range(_SAT_COLS)] +
-    [f'zone_max_r{r}_c{c}'  for r in range(_SAT_ROWS) for c in range(_SAT_COLS)]
+    [f'zone_mean_3x3_r{r}_c{c}' for r in range(_SAT_ROWS) for c in range(_SAT_COLS)] +
+    [f'zone_max_3x3_r{r}_c{c}'  for r in range(_SAT_ROWS) for c in range(_SAT_COLS)]
 )
 
 BASE_FEATURE_COLS = (
+    # Pixel-derived statistics (ICtCp-I, [0,1])
     ['maxscl', 'average_maxrgb', 'fraction_bright_pixels'] +
-    [f'distrib_val_{i}' for i in range(3, 9)]
+    [f'distrib_val_{i}' for i in range(3, 9)] +
+    # L1 scene luminance metadata (normalised /4095):
+    #   training: RPU L1 block max/avg measured by colorist's metering
+    #   inference: pl_peak_detect max_pq_y / avg_pq_y from GPU histogram
+    ['l1_max_pq', 'l1_avg_pq']
 )
 
 # 5 derived SAT features — compact spatial representation.
@@ -100,8 +105,17 @@ DERIVED_SAT_COLS = [
     'highlight_edge_flag',          # 1 if peak zone is on frame edge
 ]
 
-# Full 27-feature set (base + all 18 raw SAT zones)
+# 5x5 SAT grid — 50 additional features (finer spatial resolution)
+_SAT5_ROWS, _SAT5_COLS = 5, 5
+SAT_FEATURE_COLS_5X5 = (
+    [f'zone_mean_5x5_r{r}_c{c}' for r in range(_SAT5_ROWS) for c in range(_SAT5_COLS)] +
+    [f'zone_max_5x5_r{r}_c{c}'  for r in range(_SAT5_ROWS) for c in range(_SAT5_COLS)]
+)
+
+# Full 27-feature set (base + 3x3 zones)
 FEATURE_COLS = BASE_FEATURE_COLS + SAT_FEATURE_COLS
+# Extended 77-feature set (base + 3x3 + 5x5 zones) — use with --use-5x5
+FEATURE_COLS_5X5 = BASE_FEATURE_COLS + SAT_FEATURE_COLS + SAT_FEATURE_COLS_5X5
 
 # Feature set variants — select via FEATURE_SET constant
 FEATURE_SET = "derived14"  # "base9" | "derived14" | "full27" | "auto"
@@ -123,7 +137,14 @@ SAT_MIN_SCENES_FULL    = 3000   # min scenes for full27
 def row_to_target(row):
     """Extract RPU poly params as a flat normalised vector. Returns None if invalid."""
     try:
-        pivots = [float(p) / INPUT_MAX for p in str(row['poly_pivots']).split()]
+        # poly_pivots stores delta values between adjacent pivots, not absolute positions.
+        # Cumulate them first: [0, 173, 110, ...] → [0, 173, 283, 392, ..., 1023] → /1023
+        raw_deltas = [float(p) for p in str(row['poly_pivots']).split()]
+        cumsum = 0.0
+        pivots = []
+        for d in raw_deltas:
+            cumsum += d
+            pivots.append(cumsum / INPUT_MAX)
     except Exception:
         return None
 
@@ -314,15 +335,15 @@ def write_rpu_lut(t, path):
 # ---------------------------------------------------------------------------
 def add_derived_sat(df):
     """Compute 5 derived SAT features from raw zone columns if present."""
-    has_zones = 'zone_max_r1_c1' in df.columns
+    has_zones = 'zone_max_3x3_r1_c1' in df.columns
     if not has_zones:
         return df
 
     # Centre max (subject brightness)
-    df['sat_centre_max'] = df['zone_max_r1_c1']
+    df['sat_centre_max'] = df['zone_max_3x3_r1_c1']
 
     # Peak zone max (brightest point anywhere)
-    max_cols = [f'zone_max_r{r}_c{c}' for r in range(3) for c in range(3)]
+    max_cols = [f'zone_max_3x3_r{r}_c{c}' for r in range(3) for c in range(3)]
     df['sat_peak_zone_max'] = df[max_cols].max(axis=1)
 
     # Highlight concentration: how clustered are highlights (1.0 = all in one zone)
@@ -331,14 +352,14 @@ def add_derived_sat(df):
     ).clip(0, 2)
 
     # Centre vs edge: subject brightness relative to background
-    edge_mean_cols = [f'zone_mean_r{r}_c{c}' for r in range(3) for c in range(3)
+    edge_mean_cols = [f'zone_mean_3x3_r{r}_c{c}' for r in range(3) for c in range(3)
                       if not (r == 1 and c == 1)]
     edge_mean = df[edge_mean_cols].mean(axis=1).clip(lower=1e-6)
-    df['sat_centre_vs_edge'] = (df['zone_mean_r1_c1'] / edge_mean).clip(0, 5)
+    df['sat_centre_vs_edge'] = (df['zone_mean_3x3_r1_c1'] / edge_mean).clip(0, 5)
 
     # Vertical gradient: top half vs bottom half mean brightness
-    top_cols    = [f'zone_mean_r0_c{c}' for c in range(3)]
-    bottom_cols = [f'zone_mean_r2_c{c}' for c in range(3)]
+    top_cols    = [f'zone_mean_3x3_r0_c{c}' for c in range(3)]
+    bottom_cols = [f'zone_mean_3x3_r2_c{c}' for c in range(3)]
     bottom_mean = df[bottom_cols].mean(axis=1).clip(lower=1e-6)
     df['sat_vertical_gradient'] = (
         df[top_cols].mean(axis=1) / bottom_mean
@@ -362,7 +383,18 @@ def load_data(dataset_csv, l1_csv=None, stratify=None):
     are equally represented in the training data.
     """
     df = pd.read_csv(dataset_csv)
-    df['scene_id'] = df['scene_refresh'].cumsum()
+    if 'scene_refresh' in df.columns:
+        df['scene_id'] = df['scene_refresh'].cumsum()
+    elif 'scene_id' not in df.columns:
+        df['scene_id'] = np.arange(len(df))
+    # Bar features are NaN for titles without L5 active-area data — treat as no bars
+    for _c in ['top_bar_norm', 'bottom_bar_norm']:
+        if _c in df.columns:
+            df[_c] = df[_c].fillna(0.0)
+    # Normalise L1 PQ features to [0,1] — raw values are in 0–4095 PQ units
+    for _c in ['l1_min_pq', 'l1_max_pq', 'l1_avg_pq']:
+        if _c in df.columns and df[_c].max() > 1.5:
+            df[_c] = df[_c] / 4095.0
     if l1_csv:
         l1 = pd.read_csv(l1_csv).sort_values('pts_approx').rename(
             columns={'pts_approx': 'pts_time'})

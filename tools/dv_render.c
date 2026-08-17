@@ -190,6 +190,36 @@ static void ml_tone_map(float *lut, const struct pl_tone_map_params *params)
     }
 }
 
+/* Parse a simple 2-column LUT file (x y per line, PQ normalised [0,1]).
+ * Written by ml_inference.py when running on HDR10 content. */
+static MlLut *load_ml_lut(const char *path)
+{
+    FILE *f = fopen(path, "r");
+    if (!f) { fprintf(stderr, "Cannot open ML LUT: %s\n", path); return NULL; }
+
+    float *xs = malloc(4096 * sizeof(float));
+    float *ys = malloc(4096 * sizeof(float));
+    int n = 0;
+    char line[256];
+    while (n < 4096 && fgets(line, sizeof(line), f)) {
+        if (line[0] == '#' || line[0] == '\n') continue;
+        float x, y;
+        if (sscanf(line, "%f %f", &x, &y) == 2) {
+            xs[n] = x;
+            ys[n] = y;
+            n++;
+        }
+    }
+    fclose(f);
+    if (n < 2) { free(xs); free(ys); return NULL; }
+
+    MlLut *ml = malloc(sizeof(MlLut));
+    ml->n  = n;
+    ml->xs = xs;
+    ml->ys = ys;
+    return ml;
+}
+
 /* Parse RPU_POLY_1D file (written by dv_coef_model.py write_rpu_lut).
  * Returns false and leaves dovi->comp[0] untouched on failure. */
 static bool parse_rpu_poly(const char *path, struct pl_dovi_metadata *dovi)
@@ -482,6 +512,33 @@ int main(int argc, char **argv)
         else
             cmap.tone_mapping_function = &pl_tone_map_spline;
 
+        cmap.metadata = PL_HDR_METADATA_CIE_Y;
+        if (a.l1_max_pq > 0) {
+            image.color.hdr.max_pq_y = a.l1_max_pq;
+            image.color.hdr.avg_pq_y = a.l1_avg_pq;
+        }
+
+    } else if (!strcmp(a.mode, "ml-lut")) {
+        /* HDR10-compatible ML mode: apply ML polynomial as a 1D tone map LUT.
+         * Works on any HDR10 source — no DV RPU context needed.
+         * LUT format: one "x y" pair per line, PQ normalised [0,1].
+         * Written by ml_write_lut() in ml_viewer.py. */
+        if (!a.lut_file) {
+            fprintf(stderr, "--mode ml-lut requires --lut <lut_file>\n");
+            return 1;
+        }
+        MlLut *ml_lut = load_ml_lut(a.lut_file);
+        if (!ml_lut) {
+            fprintf(stderr, "Failed loading ML LUT: %s\n", a.lut_file);
+            return 1;
+        }
+        static struct pl_tone_map_function ml_fn = {0};
+        ml_fn.name        = "ml";
+        ml_fn.description = "ML-predicted polynomial tone curve";
+        ml_fn.scaling     = PL_HDR_PQ;
+        ml_fn.map         = ml_tone_map;
+        ml_fn.priv        = ml_lut;
+        cmap.tone_mapping_function = &ml_fn;
         cmap.metadata = PL_HDR_METADATA_CIE_Y;
         if (a.l1_max_pq > 0) {
             image.color.hdr.max_pq_y = a.l1_max_pq;
