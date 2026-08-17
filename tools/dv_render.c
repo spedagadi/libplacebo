@@ -69,6 +69,9 @@ typedef struct {
     float       perceptual_strength; /* 0.0-1.0, default 0.8 — chroma restoration after tone map */
     int         gamut_expansion;     /* 0/1, default 0 — allow chroma expansion beyond source */
     float       spline_contrast; /* 0-1.5,   default 0.5 */
+    /* Letterbox bar masking: zero output rows in bar region after rendering */
+    float       top_bar_norm;   /* top_bar_pixels / source_height (0 = no bars) */
+    float       bot_bar_norm;   /* bottom bar fraction */
 } Args;
 
 static void usage(const char *argv0)
@@ -119,6 +122,8 @@ static bool parse_args(int argc, char **argv, Args *a)
         else if (!strcmp(argv[i], "--out-nits")       && i+1 < argc) { a->out_nits        = atof(argv[++i]); }
         else if (!strcmp(argv[i], "--l1-max")         && i+1 < argc) { a->l1_max_pq       = atof(argv[++i]); }
         else if (!strcmp(argv[i], "--l1-avg")         && i+1 < argc) { a->l1_avg_pq       = atof(argv[++i]); }
+        else if (!strcmp(argv[i], "--top-bar-norm")   && i+1 < argc) { a->top_bar_norm    = atof(argv[++i]); }
+        else if (!strcmp(argv[i], "--bot-bar-norm")   && i+1 < argc) { a->bot_bar_norm    = atof(argv[++i]); }
         else if (!strcmp(argv[i], "--knee-adaptation") && i+1 < argc) { a->knee_adaptation = atof(argv[++i]); }
         else if (!strcmp(argv[i], "--knee-minimum")   && i+1 < argc) { a->knee_minimum    = atof(argv[++i]); }
         else if (!strcmp(argv[i], "--knee-maximum")   && i+1 < argc) { a->knee_maximum    = atof(argv[++i]); }
@@ -580,6 +585,20 @@ int main(int argc, char **argv)
         .row_pitch = row_pitch,
     ));
     if (!ok) { fprintf(stderr, "pl_tex_download failed\n"); return 1; }
+
+    /* Zero out letterbox bar rows — bars must stay pure black regardless of LUT.
+     * top_bar_norm/bot_bar_norm are fractional (pixels / source_height).
+     * We clamp to the rendered height so they work for any output resolution. */
+    if (a.top_bar_norm > 0.0f || a.bot_bar_norm > 0.0f) {
+        int top_rows = (int)(a.top_bar_norm * a.height + 0.5f);
+        int bot_rows = (int)(a.bot_bar_norm * a.height + 0.5f);
+        top_rows = top_rows < a.height ? top_rows : a.height;
+        bot_rows = bot_rows < a.height ? bot_rows : a.height;
+        for (int y = 0; y < top_rows; y++)
+            memset(&pixels[y * a.width * 4], 0, (size_t)a.width * 4);
+        for (int y = a.height - bot_rows; y < a.height; y++)
+            memset(&pixels[y * a.width * 4], 0, (size_t)a.width * 4);
+    }
 
     /* Write RGB8 to stdout (drop alpha channel) */
     for (int y = 0; y < a.height; y++) {

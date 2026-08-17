@@ -135,7 +135,8 @@ def get_frame_count(video_path):
         return 100000
 
 def render_frame(video_path, pts, mode, out_nits,
-                 lut_path=None, l1_max=None, l1_avg=None):
+                 lut_path=None, l1_max=None, l1_avg=None,
+                 top_bar=0.0, bot_bar=0.0):
     if not DV_RENDER.exists():
         return None
     cmd = [str(DV_RENDER), '--input', video_path,
@@ -145,6 +146,9 @@ def render_frame(video_path, pts, mode, out_nits,
     if lut_path:           cmd += ['--lut', lut_path]
     if l1_max is not None: cmd += ['--l1-max', f'{l1_max:.6f}']
     if l1_avg is not None: cmd += ['--l1-avg', f'{l1_avg:.6f}']
+    # Zero out bar rows so LUT cannot lift them above true black
+    if top_bar > 0.01:     cmd += ['--top-bar-norm', f'{top_bar:.6f}']
+    if bot_bar > 0.01:     cmd += ['--bot-bar-norm', f'{bot_bar:.6f}']
     try:
         result = subprocess.run(cmd, capture_output=True, timeout=25)
         if len(result.stdout) != RENDER_W * RENDER_H * 3:
@@ -559,7 +563,8 @@ else:
             prog.progress(0.7, 'Rendering ML model...')
             rendered_h['ml-lut'] = render_frame(hdr10_path, pts, 'ml-lut',
                                                   out_nits, lut_path_h,
-                                                  l1_max_h, l1_avg_h)
+                                                  l1_max_h, l1_avg_h,
+                                                  top_bar=top_bar, bot_bar=top_bar)
         prog.empty()
         st.session_state['hdr10_rendered'] = rendered_h
         st.session_state['hdr10_ml_target'] = ml_target_h
