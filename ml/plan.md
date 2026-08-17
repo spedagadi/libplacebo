@@ -233,11 +233,92 @@ python3 ml\dv_mlp_model.py ^
   --log F:\DTMModelData\train_log12.txt
 ```
 
-**2. Stratification improvement**
-Current stratification is luminance-only. Issue: dark drama titles dominate the "mid-brightness" stratum with strong-compress polynomials, while nature docs with S-curves are absent. Fix:
-- Add `gold_dev` (polynomial shape) as a stratification axis
-- Ensure (bright, S-curve) and (dark, compress) are distinct strata
-- Weighted loss (already implemented) compensates in the meantime
+**2. Curve-shape stratification (replaces luminance stratification)**
+
+Current stratification selects scenes by L1 luminance stats only. Critical flaw: two scenes
+with identical L1 stats but different polynomial shapes (dark drama → compress, nature doc →
+lift) land in the same stratum → contradictory gradients → model learns the average (near-linear).
+
+**Replace luminance axes with curve-shape axes:**
+
+For each scene, compute three regional polynomial deviations:
+```python
+shadow_dev    = mean(gold(x) - x)  for x ∈ [0.0, 0.2]   # + = lift, - = crush
+midtone_dev   = mean(gold(x) - x)  for x ∈ [0.2, 0.5]   # + = lift, - = compress
+highlight_dev = mean(gold(x) - x)  for x ∈ [0.5, maxscl] # + = boost, - = rolloff
+```
+
+Stratification cells: shadow × midtone × highlight bands (3×3×4 = 36 cells).
+Under-represented cells (e.g., lift+preserve+compress = S-curve) fill from Our Living World / Our Oceans.
+Abundant cells (dark drama, strong-compress) are capped.
+
+This can be computed from existing Stage 1 CSVs — no re-extraction needed.
+
+**3. Zone-masked texture features (Phase 1 — no re-extraction)**
+
+Colorists use a "qualifier" to grade within specific luminance bands. The model currently
+has no concept of texture within a brightness region. Add derived features:
+
+```python
+# For each of 9 (3×3) zones, compute local contrast proxy:
+local_contrast = zone_max_3x3 - zone_mean_3x3
+
+# Classify each zone by its mean luminance, then aggregate:
+shadow_texture    = mean(local_contrast for zones where zone_mean < 0.25)
+midtone_texture   = mean(local_contrast for zones where 0.25 <= zone_mean <= 0.65)
+highlight_texture = mean(local_contrast for zones where zone_mean > 0.65)
+```
+
+Why it helps: high `highlight_texture` (explosion debris, specular surfaces) tells the model
+it cannot clip those highlights without destroying texture. Low `highlight_texture` (smooth sky,
+blank wall) signals safe aggressive compression.
+
+Implementable in `load_data()` in `dv_coef_model.py` from existing columns — zero new extraction.
+Adds 3 features (84 total). Implement in `compute_zone_texture(df)` function.
+
+---
+
+### ⚠️ Model Behaviour Warning: Identity Case / Over-lifting
+
+**Observed on Heat 1995 t=15:01 (dark scene, maxscl=0.445, target=143 nits):**
+- Scene peaks at ~65 nits, display target is 143 nits → expansion case (target_yn=1.22)
+- ML model applies +0.086 PQ shadow lift at midtones — 10× more than libplacebo's +0.009
+- Visual result: "washed out" lifted scene that destroys Michael Mann's intentional dark grading
+- libplacebo correctly outputs near-identity (content is already close to display range)
+
+**Root cause:** Model learned from DV dark drama training that "dark + low avg = apply shadow lift."
+This was correct for DV because the colorist *chose* to apply shadow lift. For HDR10, no such
+creative decision was made — the correct answer is near-identity linear expansion.
+
+**Two concrete fixes needed before production:**
+
+**Fix A — Near-identity penalty in training loss:**
+```python
+# When expansion case (content darker than display), penalise deviation from identity
+if target_yn >= 1.0:
+    expansion_penalty = MSE(pred_curve, identity_curve) * expansion_weight
+    total_loss += expansion_penalty
+```
+This teaches the model: "when display is brighter than content, don't impose DV shadow lift."
+
+**Fix B — Strict positive derivative in LUT (no plateau/clipping):**
+```python
+# After UnivariateSpline fitting, enforce minimum slope to prevent plateaus
+min_slope = target_yn / n_pts * 0.1  # 10% of average slope as floor
+dy = np.maximum(np.diff(ys), min_slope)
+ys = np.concatenate([[ys[0]], ys[0] + np.cumsum(dy)])
+```
+Eliminates the hard clip that destroys highlight texture in bright-specular regions.
+
+**Context gate principle:**
+The loss function should be asymmetric:
+- Expansion (`target_yn > 1`): penalise any deviation from linear expansion more heavily
+- Compression (`target_yn < 1`): allow the learned DV-style shaping
+
+Currently the model applies compression/lift patterns regardless of whether expansion or
+compression is needed — it has no context gate between these two regimes.
+
+---
 
 ### Near-term — Trim Model
 
