@@ -1,8 +1,59 @@
 # ML Dynamic Tone-Mapping for Dolby Vision
 
+**Status (2026-08-14)**: 🚧 **Refactored to libplacebo-based feature extraction**
+
 ML pipeline that predicts per-scene DV RPU piecewise polynomial coefficients from
 decoded frame statistics, enabling DV-quality tone mapping for HDR10 content and
 stripped/HDMI DV streams where the RPU is unavailable.
+
+---
+
+## 🆕 New Architecture (August 2026)
+
+**Critical change**: Feature extraction moved from Python/numpy to libplacebo C library to eliminate train/test feature skew.
+
+### Why the Change?
+
+Training with Python/numpy and inference with libplacebo GPU created risk of silent model degradation due to:
+- Different percentile interpolation methods
+- Different SAT zone boundary rounding
+- Different PQ normalization precision
+
+**Solution**: Single source of truth - both training and inference use identical libplacebo C code.
+
+### New Files (Start Here)
+
+| Document | Purpose |
+|---|---|
+| **[PLAN.md](PLAN.md)** | Complete architecture + training strategy (755 lines) |
+| **[EXTRACTION_INTEGRATION.md](EXTRACTION_INTEGRATION.md)** | Integration guide for libplacebo feature extraction |
+| **[IMPLEMENTATION_STATUS.md](IMPLEMENTATION_STATUS.md)** | Current status + next steps |
+
+### Quick Start (New Pipeline)
+
+```bash
+# 1. Build libplacebo with ML feature extraction
+cd c:/Code/libplacebo
+meson setup build
+meson compile -C build pl_extract_features
+
+# 2. Extract features for training (uses libplacebo + Python RPU parsing)
+python tools/dv_metadata_extract.py INPUT.mkv -o dataset.csv --sample-fps 1
+
+# 3. Train MLP model (multi-task: DTM curve + L2 trim)
+python ml/train_mlp.py --data-dir F:/DTMModelData/train --output models/ml_dtm_v1.pt
+
+# 4. Export to C for inference
+python ml/export_model.py --model models/ml_dtm_v1.pt --output ml/ml_model.c
+```
+
+**Key changes**:
+- **77 features** (was 27) - added multi-scale SAT (3×3 + 5×5)
+- **Multi-task learning** - predicts curve + L2 color trim simultaneously
+- **libplacebo feature extraction** - ensures bit-exact train/inference matching
+- **RPU parsing stays in Python** - training-only, zero skew risk
+
+---
 
 ## Quick start
 
@@ -132,165 +183,170 @@ Scale targets for XGBoost and cross-title generalisation:
 **DV key:** ✅ Stream-verified · ❌ No DV  
 **Format:** BDMV = complete disc folder · ISO = disc image · MKV = remux/encode  
 **Profile support:**
-- **P7** (dual-layer BL+EL) — primary training format; all USA UHD discs and COMPLETE.UHD.BLURAY rips. EL carries the RPU, auto-discovered via `discover_sources()`.
-- **P8** (HDR10-compatible single layer) — hybrid remuxes (disc video + streaming RPU); supported, lower priority.
-- **P5** (pure DV single layer) — streaming/WEB-DL only; **excluded from training corpus** (pixel stats don't match the mastering environment). Used only for initial hypothesis testing.
+- **P5** (pure DV single layer) — **primary training format.** Streaming/WEB-DL seasonal content. Confirmed real, non-identity per-scene polynomials — the actual DTM curve authored for the streaming encode.
+- **P7** (dual-layer BL+EL) — **excluded from training** (Aug 2026 finding: all BDMV/disc titles tested show 100% identity luma polynomials — HDR10 BL is already tone-mapped, DV is colour-matrix-only on disc). Retained only for **Test** — community-benchmark visual rendering, not curve training.
+- **P8** (HDR10-compatible single layer) — same disc-identity finding as P7; visual rendering only.
 
-> **Extractor — source auto-discovery (Aug 2026):** `dv_metadata_extract.py` now accepts any source format. Pass a disc folder path for BDMV titles — `discover_sources()` probes for UNSPEC62 RPU NALs in v:0 and v:1, finds the EL stream automatically, and calibrates BDMV timestamp offsets. Tested: Rush P7 MKV (126 rows) and Spotlight P7 BDMV (124 rows), both with full polynomial + pixel + SAT features. ISOs: mount via `Mount-DiskImage` in PowerShell, then pass the mount point (`E:\`) as the folder input.
+> **Extractor — source auto-discovery (Aug 2026):** `dv_metadata_extract.py` accepts any source format. For P5 streaming files, pass the per-episode `.mkv` directly. For legacy BDMV/disc titles, pass the disc folder path — `discover_sources()` probes for UNSPEC62 RPU NALs in v:0 and v:1, finds the EL stream automatically, and calibrates BDMV timestamp offsets. ISOs: mount via `Mount-DiskImage` in PowerShell, then pass the mount point (`E:\`) as the folder input.
 
-> **Source quality note:** Training data should come from **disc remuxes only** (BDMV/MKV remux). WEB-DL and streaming encodes are re-compressed from a different master than the one the colorist used when authoring the DV RPU metadata. The pixel statistics extracted from a WEB-DL do not faithfully represent the feature distribution the DV colorist was responding to — this adds noise to the feature→label relationship. WEB-DL titles may be used for **hypothesis testing and prototyping** but should not be part of the training corpus.
+> **Source quality note (revised Aug 2026):** Disc remuxes (BDMV/P7/P8) looked like the right training source, but the HDR10 base layer on disc is already tone-mapped in mastering — DV there is colour-matrix-only, so `comp[0]` is always the identity polynomial. **P5 streaming encodes are the only confirmed source of real per-scene DTM polynomials** — the streaming colorist authors the curve directly into the P5 RPU against that same encode's pixel statistics. Disc titles are kept only as **Test** visual-rendering benchmarks (colour-matrix correctness, not curve prediction).
 
-#### Hypothesis baseline — WEB-DL (prototype only, excluded from training corpus)
+#### Movies — WEB-DL P5 (unassigned to a split yet)
+
+> These validated the P5 hypothesis before the seasonal corpus below existed. Real per-scene polynomials confirmed on The Little Things; the other three are unconfirmed profile (`?`) and need a stream probe before use.
 
 | Title | Year | Location | Format | DV | Profile | Note |
 |---|---|---|---|---|---|---|
-| The Little Things | 2021 | `D:\Jdownloader\TeLtlTig...` | WEB-DL mp4 | ✅ | 5 | 2060 scenes extracted; initial hypothesis validation only |
-| 28 Years Later: The Bone Temple | 2026 | `G:\28.Years.Later.The.Bone.Temple...mkv` | WEB-DL MKV | ✅ | ? | MA/HBO streaming encode |
-| A House of Dynamite | 2025 | `G:\A House of Dynamite...mkv` | WEB-DL MKV | ✅ | ? | Netflix streaming encode |
-| Predator: Killer of Killers | 2025 | `G:\Predator - Killer of Killers...mkv` | WEB-DL MKV | ✅ | ? | Disney+ streaming encode |
+| The Little Things | 2021 | `D:\Jdownloader\TeLtlTig...` | WEB-DL mp4 | ✅ | 5 | 2060 scenes extracted; original hypothesis validation |
+| 28 Years Later: The Bone Temple | 2026 | `G:\28.Years.Later.The.Bone.Temple...mkv` | WEB-DL MKV | ✅ | ? | MA/HBO streaming encode — needs profile probe |
+| A House of Dynamite | 2025 | `G:\A House of Dynamite...mkv` | WEB-DL MKV | ✅ | ? | Netflix streaming encode — needs profile probe |
+| Predator: Killer of Killers | 2025 | `G:\Predator - Killer of Killers...mkv` | WEB-DL MKV | ✅ | ? | Disney+ streaming encode — needs profile probe |
 
-#### On disk — G:\ disc remuxes
+#### On disk / to download — G:\Dataset\ P5 streaming seasons (primary corpus)
 
-**Source tiers:** P = Pure disc (pixel+RPU from same master) · H = Hybrid disc (disc video, streaming RPU) · W = WEB-DL (excluded)  
-**Status:** ✅ Ready · ⚠️ Needs work · 🔍 Unverified (ISO)
+**Storage layout:** `G:\Dataset\<Title>\S0#E0#.mkv` — one folder per show/season, per-episode MKV files.
+**Status:** ✅ Ready to extract · ⬇️ Download needed
 
 ---
 
-##### Calibration (0 on disk — downloads needed)
+##### Train (P5 streaming — 6 shows)
 
-> **Aug 2026 finding:** All 5 original calibration titles (Everest, Hurt Locker, Troy DC, John Wick Ch4, Kingdom of Heaven DC) are **P7/P8 MKV remuxes with 100% identity luma polynomials** — DV is colour-matrix-only for these titles. Useless for Bayesian HPO of the DTM luma polynomial model. Moved to Reserve-MKV below.
+Picked to spread bright/dark and colour-cast extremes across the set — not just genre variety.
+
+| Title | Season | Genre | HDR content type | Location | Status |
+|---|---|---|---|---|---|
+| Ted Lasso | S03 | Comedy | Naturalistic daylight pitch/office; floodlit night matches — dynamic-range **baseline**, few extremes | `G:\Dataset\Ted.Lasso.S03...\` | ✅ 12 eps on disk |
+| For All Mankind | S05 | Sci-Fi/Drama | Spacewalk sun glare vs void black (extreme highlight/shadow pair); console/HUD glow; Mars daylight | `G:\Dataset\For.All.Mankind.S05...\` | ✅ 10 eps on disk |
+| The Witcher | **S04** ⚠️ | Fantasy | Torchlit castles/dungeons (low-key); magic-FX bright particles; forest daylight | `G:\Dataset\The.Witcher.S04...\` | ✅ 8 eps on disk |
+| Andor | S02 | Sci-Fi/Action | Industrial low-key interiors; blaster/ship explosions; neon-lit Coruscant night city | `G:\Dataset\Andor.S02...\` | ✅ 12 eps on disk |
+| Stranger Things | S05 | Horror/Sci-Fi | Upside Down practical darkness (deep black, sparse highlight); 80s neon; climactic fire/explosions | `G:\Dataset\Stranger.Things.S05\` | ⬇️ downloading |
+| The Mandalorian | S01 | Sci-Fi/Action | Tatooine desert sun (extreme highlight); dark cantina interiors; lava/explosion finale | `G:\Dataset\The.Mandalorian.S01...\` | ✅ 8 eps on disk |
+
+> ⚠️ **Witcher season correction (Aug 2026):** planned as S02, but S04 is what downloaded — kept as-is rather than re-downloading. `batch_extract.py` and the short name (`the_witcher_s04`) already reflect this.
+
+---
+
+##### Val (P5 streaming — 4 shows)
+
+Chosen to cover content types **absent from Train** — nature daylight, underwater, and non-photoreal animation grading — so held-out performance isn't just "more of the same six shows."
+
+| Title | Season | Genre | HDR content type | Location | Status |
+|---|---|---|---|---|---|
+| Prehistoric Planet | S03 | Documentary/Nature | Savanna sun extremes; underwater desaturated blue-green; night bioluminescence; volcanic lava | `G:\Dataset\Prehistoric.Planet.2022.S03...\` | ✅ 5 eps on disk |
+| Born to Be Wild | S01 | Documentary/Nature | Global wildlife daylight — arctic snow/ice (high-key diffuse), desert, jungle canopy shade | `G:\Dataset\Born.to.Be.Wild.2025.S01...\` | ✅ 6 eps on disk |
+| WondLa | S03 | Animation | Stylized high-saturation alien vistas — non-photoreal grading, stresses colour-cast generalisation | `G:\Dataset\WondLa.S03...\` | ✅ 6 eps on disk |
+| Monarch: Legacy of Monsters | S02 | Sci-Fi/Action | Kaiju-scale fire/explosions; bioluminescent creature glow; dark urban destruction | `G:\Dataset\Monarch.Legacy.of.Monsters.S02\` | ⬇️ downloading |
+
+**Coverage check (Train + Val combined):** explosions/fire (Witcher, Andor, Stranger Things, Mandalorian, Monarch), extreme highlight/glare (For All Mankind, Mandalorian, Prehistoric Planet), dark low-key interiors (Witcher, Andor, Stranger Things, Mandalorian), neon/night urban (Andor, Stranger Things, Monarch), natural daylight baseline (Ted Lasso, Prehistoric Planet, Born to Be Wild), underwater (Prehistoric Planet only), snow/ice (Born to Be Wild only), non-photoreal animation (WondLa only). **Gaps to watch:** underwater, snow/ice, and stylized-animation grading each rely on a single title — if that title fails to extract cleanly (profile mismatch, block-addition errors, etc.) that content type drops out entirely with no backup.
+
+---
+
+##### Calibration — TBD
+
+> Previous disc-based Cal titles (Mad Max: Fury Road, The Revenant, Sicario) are deprioritized — disc DV is colour-matrix-only, no polynomial diversity to tune against. A Cal set should be carved from held-out episodes of the Train/Val shows above once extraction confirms per-scene polynomial diversity, rather than sourced separately.
 >
-> New calibration titles must be BDMV pure disc with real per-scene luma polynomials (confirmed by non-trivial polynomial diversity after extraction).
-
-| Title | Year | Genre | Format | Priority | Split | Calibration rationale |
-|---|---|---|---|---|---|---|
-| **Mad Max: Fury Road** | 2015 | Action | BDMV | ⬇️ **Critical** | Cal | Hundreds of rapid cuts (best for λ tuning); extreme highlights vs shadow; Warner COMPLETE.UHD.BLURAY |
-| **The Revenant** | 2015 | Drama/Adventure | BDMV | ⬇️ **Critical** | Cal | Slow pacing, gradual illumination (best for Q within-scene); extreme snow/fire contrast; Fox UHD |
-| **Sicario** | 2015 | Thriller | BDMV | ⬇️ **Critical** | Cal | Precise studio lighting, tension-driven cuts (calibrates R); Lionsgate UHD; fills Thriller calibration gap |
+> When selecting which held-out episodes to use, match the original Cal rationale to content type rather than picking arbitrarily: **λ** (segment-boundary weight) wants rapid-cut, mixed-content episodes (Mandalorian or Stranger Things action episodes); **Q** (within-scene smoothness) wants slow, gradually-changing illumination (Ted Lasso dialogue-heavy episodes, Prehistoric Planet long wildlife takes); **R** (highlight rolloff) wants scenes with precise, deliberate highlight control (For All Mankind console/glare scenes, Witcher torchlit interiors).
 
 ---
 
-##### Train (9 titles — BDMV only)
+##### Test (community benchmarks — BDMV, disc-based visual rendering only)
 
-> **Aug 2026:** All P7/P8 MKV remuxes removed — confirmed 100% identity luma polynomials, useless for DTM training. BDMV-only corpus going forward.
+> Kept from the original disc corpus — disc DV here is used for AVForums/AVS-style visual comparison (colour-matrix correctness), not curve training. `*` = primary community benchmark.
 
-| Title | Year | Genre | Format | DV | P | Status | Notes |
-|---|---|---|---|---|---|---|---|
-| Alien: Romulus | 2024 | Sci-Fi/Horror | BDMV | ✅ | **7** | ✅ | EL 5528 kbps; extraction in progress |
-| Atomic Blonde | 2017 | Action/Spy | BDMV | ✅ | **7** | ✅ | Extraction in progress |
-| Furiosa | 2024 | Action | BDMV | ✅ | **7** | ✅ | EL 2106 kbps; extraction in progress |
-| Warfare | 2025 | War/Action | BDMV | ✅ | **7** | ✅ | Extraction pending |
-| Spotlight | 2015 | Drama | BDMV | ✅ | **7** | ✅ | EL 8522 kbps — high bitrate EL, expected real polynomials |
-| Zodiac | 2007 | Crime/Thriller | BDMV | ✅ | **7** | ✅ | EL 14879 kbps — highest EL bitrate, priority extraction |
-| Wonder Woman 1984 | 2020 | Superhero | BDMV | ✅ | **7** | ✅ | Extraction pending |
-| First Blood | 1982 | Action | BDMV | ✅ | **7** | ✅ | Extraction pending |
-| 28 Years Later | 2025 | Horror | BDMV | ✅ | **7** | ✅ | Extraction pending |
+> These are titles AVForums / AVS Forum members actively post DV comparisons for. Results shown on these titles to the community prove generalisation, not memorisation. `*` = primary community benchmark. Since these render visually rather than train the curve, content-type diversity here matters for **exposing rendering bugs** (colour-matrix edge cases, block-addition parsing) rather than for model generalisation.
 
----
+| Title | Year | Genre | HDR content type | Format | DV | P | Status | Notes |
+|---|---|---|---|---|---|---|---|---|
+| **Dune: Part Two** * | 2024 | Sci-Fi | Desert extreme highlight; dark cave/night battles; nuclear explosion flash | BDMV | ✅ | **7** | ✅ | P7 v:1; EL auto-discovered |
+| **Top Gun: Maverick** * | 2022 | Action | Bright aerial sky glare; cockpit HUD glow; explosions | ISO | ✅ | **7** | ✅ | P7 v:1 confirmed; mount ISO → pass mount point as folder |
+| **Godzilla Minus One** * | 2023 | Sci-Fi | Dark night ocean; atomic-breath extreme highlight; fire/explosions | BDMV | ✅ | **7** | ✅ | JPN disc; EL auto-discovered |
+| **Civil War** * | 2024 | War/Action | War explosions/fire; daylight urban; night raids | MKV | ✅ | **7** | ✅ | P7; identity polynomial (visual rendering demo only) |
+| **Spider-Man: ATSV** * | 2023 | Animation | Highly stylized neon, mixed animation styles/colour grading | MKV | ✅ | **7** | ✅ | P7; identity polynomial; German audio; visual demo only |
+| **John Wick: Ch4** * | 2023 | Action | Neon-lit night action; dark practical interiors | MKV | ✅ | **7** | ✅ | P7; identity polynomial; German audio; visual demo only |
+| Predator Badlands | 2025 | Sci-Fi/Action | Dark jungle; practical low-light creature scenes | BDMV | ✅ | **7** | ✅ | P7 v:1; EL auto-discovered |
+| Gladiator II | 2024 | Action/Epic | Arena daylight; torchlit interiors; blood/fire | ISO | ✅ | **7** | ✅ | P7 v:1 confirmed; mount ISO → pass mount point as folder |
+| No Time to Die | 2021 | Action | Daylight exteriors; night action; explosions | ISO | ✅ | **7** | ✅ | P7 v:1 confirmed; mount ISO → pass mount point as folder |
+| **The Batman** * _(download)_ | 2022 | Superhero/Noir | Perpetual rain noir — extreme low-key darkness; contrast to WW1984 | — | ✅ | — | ⬇️ | WB UHD |
+| **Blade Runner 2049** * _(download)_ | 2017 | Sci-Fi/Noir | Neon noir extreme; desert daylight extremes (Vegas ruins) | — | ✅ | — | ⬇️ | Most-discussed AVForums HDR benchmark; not on disk |
+| **Joker** * _(download)_ | 2019 | Superhero/Drama | Grimy low-key urban; neon subway | — | ✅ | — | ⬇️ | Community DV discussion title |
 
-##### Val (6 titles — BDMV only)
+## Extraction Pipeline — Data-Driven Stratification (Phase 0 → Stage 1 → Stage 2)
 
-| Title | Year | Genre | Format | DV | P | Status | Notes |
-|---|---|---|---|---|---|---|---|
-| How to Train Your Dragon | 2025 | Animation | BDMV | ✅ | **7** | ✅ | EL 5917 kbps |
-| MI: The Final Reckoning | 2025 | Action | BDMV | ✅ | **7** | ✅ | EL 4029 kbps |
-| The Invisible Man | 2020 | Horror/Sci-Fi | BDMV | ✅ | **7** | ✅ | EL 7082 kbps |
-| Tron: Legacy | 2010 | Sci-Fi | BDMV | ✅ | **7** | ✅ | Extraction pending |
-| F1: The Movie | 2025 | Sport/Drama | BDMV | ✅ | **7** | ✅ | Extraction pending |
-| Ballerina | 2025 | Action | BDMV | ✅ | **7** | ✅ | Extraction pending |
+Traditional "extract all episodes" wastes terabytes on redundant mid-tone dialogue frames. XGBoost needs **balanced feature space** — edge cases (shadow floors, HDR peaks, colorist interventions) must have equal weight to neutral scenes. The RPU itself is the oracle: L1 delta spikes, heavy L2 trim corrections, and active L8 saturation blocks explicitly mark "this scene is hard."
 
----
+### Phase 0: RPU Stratification (Metadata-Only, Fast)
 
-##### Test (community benchmarks — never used in Train/Val)
+Lightweight RPU scanner — reads NAL metadata only (no pixel decode), runs in seconds per episode.
 
-> These are titles AVForums / AVS Forum members actively post DV comparisons for. Results shown on these titles to the community prove generalisation, not memorisation. `*` = primary community benchmark.
+```bash
+# Scan all titles (outputs stratification_manifest.csv with L1/L2/L8 per scene)
+python tools/rpu_stratify.py --output F:/DTMModelData/stratification_manifest.csv
 
-| Title | Year | Genre | Format | DV | P | Status | Notes |
-|---|---|---|---|---|---|---|---|
-| **Dune: Part Two** * | 2024 | Sci-Fi | BDMV | ✅ | **7** | ✅ | P7 v:1; EL auto-discovered |
-| **Top Gun: Maverick** * | 2022 | Action | ISO | ✅ | **7** | ✅ | P7 v:1 confirmed; mount ISO → pass mount point as folder |
-| **Godzilla Minus One** * | 2023 | Sci-Fi | BDMV | ✅ | **7** | ✅ | JPN disc; EL auto-discovered |
-| **Civil War** * | 2024 | War/Action | MKV | ✅ | **7** | ✅ | P7; identity polynomial (visual rendering demo only) |
-| **Spider-Man: ATSV** * | 2023 | Animation | MKV | ✅ | **7** | ✅ | P7; identity polynomial; German audio; visual demo only |
-| **John Wick: Ch4** * | 2023 | Action | MKV | ✅ | **7** | ✅ | P7; identity polynomial; German audio; visual demo only |
-| Predator Badlands | 2025 | Sci-Fi/Action | BDMV | ✅ | **7** | ✅ | P7 v:1; EL auto-discovered |
-| Gladiator II | 2024 | Action/Epic | ISO | ✅ | **7** | ✅ | P7 v:1 confirmed; mount ISO → pass mount point as folder |
-| No Time to Die | 2021 | Action | ISO | ✅ | **7** | ✅ | P7 v:1 confirmed; mount ISO → pass mount point as folder |
-| **The Batman** * _(download)_ | 2022 | Superhero/Noir | — | ✅ | — | ⬇️ | Rain noir — contrast to WW1984; WB UHD |
-| **Blade Runner 2049** * _(download)_ | 2017 | Sci-Fi/Noir | — | ✅ | — | ⬇️ | Most-discussed AVForums HDR benchmark; not on disk |
-| **Joker** * _(download)_ | 2019 | Superhero/Drama | — | ✅ | — | ⬇️ | Grimy Gotham; community DV discussion title |
+# Or single title
+python tools/rpu_stratify.py --title ted_lasso_s03
+```
 
----
+**Output**: `stratification_manifest.csv` — per-scene L1 min/max/avg, L1 delta (scene-to-scene luma jump), L2 trim variance (colorist intervention magnitude), L8 saturation activity.
 
-##### Reserve — BDMV ISOs (usable for visual rendering, polynomial TBD)
+### Bucket Selection: 5-Variance Target Quotas
 
-| Title | Year | Genre | Format | DV | P | Notes |
-|---|---|---|---|---|---|---|
-| MI: Dead Reckoning Pt 1 | 2023 | Action | ISO | ✅ | **7** | ✅ | P7 v:1 confirmed; use if more Action needed |
+Rank scenes by variance, allocate ~150-200 high-information scenes per title across 5 buckets:
 
-##### Reserve — MKV only (identity polynomial confirmed — visual rendering only)
+| Bucket | Filter criterion | Target | Why XGBoost needs it |
+|---|---|---|---|
+| **Deep shadow floor** | `L1_min < 50` AND `L1_avg < 200` | 25 scenes | Shadow detail preservation, prevents clipping dark regions |
+| **High DR peaks** | `L1_max > 2000` | 35 scenes | Highlight rolloff, compression without blowing specular extremes |
+| **Heavy trim variance** | `L2_trim_variance > 90th percentile` | 35 scenes | Human colorist interventions — the model learns where linear formulas failed |
+| **High L1 delta** | `L1_delta > 500` | 25 scenes | Extreme transitions (dark cockpit → blinding desert), aggressive curve shifts |
+| **Mid-tone neutral** | `L1_delta < 100`, fill remainder | 50-60 scenes | Baseline — prevents over-correcting standard daylight frames |
 
-> These titles have confirmed 100% identity luma polynomials. Usable in the Streamlit viewer for frame comparison (DV colour matrices apply correctly) but provide no useful training signal for the DTM luma polynomial model.
+```bash
+# Apply bucket quotas, output prioritized episode/scene list
+python tools/rpu_bucket_select.py \
+    --input F:/DTMModelData/stratification_manifest.csv \
+    --output F:/DTMModelData/priority_extraction_list.csv \
+    --quota 180
+```
 
-| Title | Notes |
-|---|---|
-| Everest (P8 Hybrid MKV) | Identity |
-| Hurt Locker (P7 MKV, German custom dub) | Identity + MKV block addition errors (pts<500 fail in dv_render) |
-| Troy DC (P7 MKV) | Identity; renders OK for pts>500 |
-| John Wick Ch4 (P7 MKV, German) | Identity; 2-pivot single segment |
-| Kingdom of Heaven DC (P7 MKV, German) | Identity; 2-pivot single segment |
-| Rush (P7 MKV) | Identity; MKV block addition errors |
-| Pacific Rim / Prometheus / The Creator / KotPotA (P8 Hybrid MKV) | Identity |
-| Weapons (P7 Hybrid MKV) | Identity |
+**Output**: `priority_extraction_list.csv` — filtered to ~180 scenes/title, tagged with bucket assignments. This becomes the extraction plan for Stage 1.
 
-#### On disk — no DV (skip for training)
+### Stage 1: Manifest Extraction (RPU + Polynomials, No Pixels)
 
-DV verified by stream probe (RPU NAL scan and/or BDNFO EL track check). All confirmed HDR10 only.
+Fast RPU-only pass — extracts polynomial coefficients + L1 metadata for all frames in prioritized episodes (or full episodes if running exhaustive first-pass). No pixel decode yet.
 
-| Title | Year | Location | HDR | How confirmed |
-|---|---|---|---|---|
-| Oppenheimer | 2023 | `G:\Oppenheimer...ESiR` | HDR10 | BDNFO — single video track; EUR disc (US disc has DV) |
-| Se7en | 1995 | `G:\Se7en...` | HDR10 | BDNFO — single video track |
-| Last Breath | 2025 | `G:\Last.Breath...` | HDR10 | BDNFO — single video track |
-| Heat | 1995 | `G:\Heat.1995...mkv` | HDR10+ | Filename — no DV tag; HDR10+ only |
-| Nope | 2022 | `G:\Nope 2022...mkv` | HDR10 | Filename — no DV tag |
-| Exodus: Gods and Kings | 2014 | `G:\Exodus Gods and Kings.m2ts` | HDR10 | Single m2ts, no RPU NALs |
-| V for Vendetta | 2005 | `G:\V.for.Vendetta...iso` | HDR10 | ISO probed — 0 RPU NALs v:0; v:1 is H.264 BD combo track |
-| Wonder Woman 2017 | 2017 | `G:\Wonder.Woman.2017...iso` | HDR10 | ISO probed — 0 RPU NALs; single HEVC stream; pre-DV Warner press |
-| American Sniper | 2014 | `G:\American.Sniper...MTeam` | HDR10 | BDNFO — single video track; pre-DV Warner 2014 |
-| Edge of Tomorrow | 2014 | `G:\Edge.of.Tomorrow...MAXAGAZ` | HDR10 | BDNFO — single video track; pre-DV Warner 2014 |
-| Monkey Man | 2024 | `G:\Monkey.Man...B0MBARDiERS` | HDR10 | BDNFO — single video track; Universal disc HDR10 only |
+```bash
+# All prioritized titles
+python tools/batch_extract.py --workers 2
 
-#### Download needed
+# Single title
+python tools/batch_extract .py --title ted_lasso_s03
+```
 
-`*` = community benchmark (Test only). All downloads must be **COMPLETE.UHD.BLURAY** or equivalent pure disc BDMV format — MKV remuxes confirmed as identity polynomial and excluded from training.
+**Output**: `F:\DTMModelData\{split}\{title}.csv` — concatenated per-episode CSVs with RPU polynomial + L1 + scene_refresh for every frame.
 
-| # | Title | Year | Genre | Format | Priority | Split | Why needed |
-|---|---|---|---|---|---|---|---|
-| C1 | **Mad Max: Fury Road** | 2015 | Action | BDMV | **Critical** | **Cal** | Replaces 5 identity-polynomial MKV calibration titles; hundreds of cuts (λ tuning) + extreme dynamic range |
-| C2 | **The Revenant** | 2015 | Drama/Adv | BDMV | **Critical** | **Cal** | Slow pacing + snow/fire extremes; calibrates Q within-scene; Fox/Disney UHD |
-| C3 | **Sicario** | 2015 | Thriller | BDMV | **Critical** | **Cal** | Precise studio lighting, tension-driven cuts; Lionsgate UHD; fills Thriller calibration gap |
-| D1 | Knives Out | 2019 | Comedy | BDMV | **Critical** | Train | Only Comedy candidate; Lionsgate UHD |
-| D2 | A Quiet Place | 2018 | Horror | BDMV | **Critical** | Train | Need 2nd Horror Train title |
-| D3 | **The Batman** * | 2022 | Superhero/Noir | BDMV | High | **Test** | Community benchmark; perpetual rain noir |
-| D4 | **Blade Runner 2049** * | 2017 | Sci-Fi/Noir | BDMV | High | **Test** | Most-discussed AVForums HDR benchmark |
-| D5 | **Joker** * | 2019 | Superhero/Drama | BDMV | High | **Test** | Community DV benchmark; grimy Gotham |
-| D6 | 1917 | 2019 | Drama/War | BDMV | Medium | Train | Universal UHD; fills pure Drama Train slot |
-| D7 | The Grand Budapest Hotel | 2014 | Comedy | BDMV | Medium | Val | Fox/Disney; fills Comedy Val |
-| D8 | All Quiet on the Western Front | 2022 | Drama/War | BDMV | Medium | Val | Netflix DV; fills Drama Val |
-| D9 | Interstellar | 2014 | Sci-Fi | BDMV | Low | Train | Paramount UHD; IMAX grain |
-| D10 | Lord of the Rings: Fellowship | 2001 | Epic | BDMV | Low | Train | WB 4K Extended; Classic/Epic Train |
-| D11 | Encanto | 2021 | Animation | BDMV | Low | Val | Disney+; fills Animation Val |
+### Stage 2: Pixel Extraction (Full Features)
 
-## Next steps
+Decode pixels for prioritized scenes only (filtered by `priority_extraction_list.csv` scene IDs), extract histogram + SAT features. Slower; optionally use `--nvdec` for 4× GPU speedup.
 
-1. **Re-extract dataset** with SAT spatial features → `dv_dataset_sat.csv`
-2. **Retrain + evaluate** — does frame 1334 MAE improve from 0.042?
-3. **HDR10 experiment** — get HDR10 copy of The Little Things, apply ML model,
-   compare pixel-level output to DV gold (VMAF/SSIM + difference heatmap)
-4. **More titles** — 5 titles from the list above → validate XGBoost + generalisation
-5. **libplacebo C integration** — register ML model as custom `pl_tone_map_function`
-   using m2cgen-generated C code (no runtime dependencies)
+```bash
+python tools/batch_extract.py --full-pixels --nvdec --workers 1
+```
+
+**Output**: Same CSVs, now with `maxscl`, `average_maxrgb`, `distrib_val_3..8`, `zone_mean/max_rR_cC` columns filled.
+
+### Critical: Pixel Pipeline Safety
+
+The current decoder outputs **raw YUV** (`yuv420p10le`) via plain ffmpeg `scale` — **no RPU is applied**. libplacebo's `pl_peak_detect` histogram runs on the untouched HDR PQ frame. If the pipeline accidentally bakes DV processing into the video before libplacebo calculates features, the model trains on already-transformed data and learns nothing.
+
+**Verified safe**: `dv_metadata_extract.py` line 491-505 uses `-vf scale` only, no `-vf dovi` or `map_dowi=true`.
+
+### Next Steps (Post-Extraction)
+
+1. **Confirm polynomial diversity per title** — non-identity, non-trivial segment counts — before committing a title to Train/Val
+2. **Retrain + evaluate** on the P5 stratified corpus; compare held-out MAE against the single-title WEB-DL prototype baseline
+3. **Carve a Calibration split** from held-out episodes (λ/Q/R tuning) once per-scene polynomial diversity is confirmed
+4. **Download P5 community benchmarks** (Dune Part Two, Joker, Blade Runner 2049 WEB-DL variants) for blind Test
+5. **libplacebo C integration** — register ML model as custom `pl_tone_map_function` using m2cgen-generated C code (no runtime dependencies)
 
 ## Notes on colour science
 

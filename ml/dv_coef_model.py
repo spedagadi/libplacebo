@@ -117,6 +117,38 @@ FEATURE_COLS = BASE_FEATURE_COLS + SAT_FEATURE_COLS
 # Extended 77-feature set (base + 3x3 + 5x5 zones) — use with --use-5x5
 FEATURE_COLS_5X5 = BASE_FEATURE_COLS + SAT_FEATURE_COLS + SAT_FEATURE_COLS_5X5
 
+# Spline knot features: libplacebo spline sampled at 8 MCP x-knot positions
+# linspace(0,1,8) → indices [0,36,73,109,146,182,219,255] in 256-pt spline
+# Added by tools/stage2_add_spline_knots.py; use with --spline-feats
+SPLINE_KNOT_COLS   = [f"spline_k{i}" for i in range(8)]   # K=8 positions (existing)
+SPLINE_KNOT12_COLS = [f"spline_q{i}" for i in range(12)]  # K=12 positions (Run 20)
+K12_INDICES        = [round(k * 255 / 11) for k in range(12)]  # [0,23,46..255]
+
+# Pruned feature set derived from permutation importance analysis (Run 14):
+#   sat_5x5_mean: +11.5%   spline_k1..k4: +0.4-0.8%   sat_3x3_mean: +1.0%
+#   lum_global:   +1.8%    → keep maxscl + fraction_bright_pixels only
+#   DROP: sat_5x5_max (-1.1%), sat_3x3_max (-0.5%), distrib_val_* (-3.5%),
+#         l1_max/avg_pq (0%), average_maxrgb (~0%), spline_k0/k5-k7 (~0%)
+# Run 17 derived features — inference-compatible, computed from existing data
+# See tools/stage2_add_derived_features.py
+DERIVED_FEAT_COLS = [
+    "sat_centre_vs_edge",    # centre zone / edge zones — subject prominence
+    "sat_vertical_gradient", # top/bottom row ratio — sky vs ground
+    "dark_zone_count",       # fraction 3x3 zones < 0.10 — shadow extent
+    "highlight_zone_count",  # fraction 3x3 zones > 0.50 — highlight extent
+    "sat_peak_zone_max",     # max zone_max_3x3 — brightest highlight anywhere
+    "spline_compression",    # spline_k4 - spline_k7 — highlight rolloff amount
+    "spline_knee_slope",     # (spline_k3-spline_k1)/0.286 — midtone compression slope
+    "l1_peak_to_avg_ratio",  # l1_max/l1_avg — dynamic range of scene
+]
+
+FEATURE_COLS_PRUNED = (
+    ['maxscl', 'fraction_bright_pixels'] +                                  # 2
+    [f'zone_mean_3x3_r{r}_c{c}' for r in range(3) for c in range(3)] +    # 9
+    [f'zone_mean_5x5_r{r}_c{c}' for r in range(5) for c in range(5)] +    # 25
+    ['spline_k1', 'spline_k2', 'spline_k3', 'spline_k4']                  # 4
+)  # Total: 40 features
+
 # Feature set variants — select via FEATURE_SET constant
 FEATURE_SET = "derived14"  # "base9" | "derived14" | "full27" | "auto"
 # Stratification: enable when rare cells have >= 50 scenes (multi-title training)

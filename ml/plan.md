@@ -1,8 +1,8 @@
 # ML Dynamic Tone-Mapping — Implementation Plan
 
-**Last Updated**: 2026-08-17
+**Last Updated**: 2026-08-18
 **Branch**: build-v7.360.1
-**Status**: Curve model + HDR10 inference viewer working — 61% better than libplacebo baseline
+**Status**: 25-title master schema consolidated; curve-stratify master script ready
 
 ---
 
@@ -19,6 +19,9 @@ tail -20 F:/DTMModelData/train_log11.txt
 
 # Val/train dataset sanity
 cd c:/Code/libplacebo && python3 tools/check_both_splits.py
+
+# Master stratification manifest
+ls F:/DTMModelData/balanced_manifest.csv
 
 # Launch Streamlit inference viewer
 streamlit run tools/ml_viewer.py
@@ -117,13 +120,78 @@ Heat 2.39:1 detected as ≈0.128 ✓. Implemented in `tools/ml_viewer.py::detect
 
 No tier embedding (`--no-tier`). Total params: ~37,165.
 
-### Loss (current)
+### Loss (current / legacy)
 
 ```
 total = weighted_curve_MSE(eval_poly(pred_42), gold_256) + 50.0 × monotonicity_penalty
 ```
 
 Weights: boost=5×, near_identity=6×, mild=1.5×, strong=1× (`--weighted-loss`).
+
+### Naka-Rushton Model (Run 12+) — `--nr`
+
+**Replace 42 unconstrained coefficients with 2 physically-bounded NR parameters.**
+
+```
+[27+ features] → encoder: Linear(→128) + LayerNorm + SiLU + Dropout(0.3) × 2
+    → NR head: Linear(128→2) → [σ, n] via [softplus, sigmoid×3+1]
+    → DifferentiableNakaRushton → [256-pt curve]
+```
+
+**Naka-Rushton equation:** `Y = Xⁿ / (Xⁿ + σⁿ)`
+
+| Parameter | Range | Activation | Physical meaning |
+|---|---|---|---|
+| σ (sigma) | (1e-5, ∞) | softplus(raw) + 1e-5 | Semi-saturation / curve bend point |
+| n (exponent) | (1, 4) | sigmoid(raw) × 3 + 1 | Contrast steepness |
+
+**Guarantees (why this beats polynomials):**
+- **Monotonicity:** f'(x) > 0 for all x > 0 — mathematically impossible to invert
+- **Zero anchor:** f(0) = 0ⁿ / (0ⁿ + σⁿ) = 0 — black pinned to black, no letterbox lifting
+- **C∞ continuity:** infinitely differentiable — no blocky posterization or step-jumps
+- **No solarization:** no negative coefficients to flip the curve — physically valid at every step
+
+**Loss: BoundedDTMLoss (`--envelope`)**
+
+```
+envelope_lower = min(gold_curve, spline_baseline)  per evaluation point
+envelope_upper = max(gold_curve, spline_baseline)
+
+base_loss = MSE(gold, predicted)                    inside envelope (λ=1.0)
+hinge_loss = clamp(lower - predicted, min=0)        below envelope
+         + clamp(predicted - upper, min=0)          above envelope (λ=10.0)
+
+total = (base_loss × cell_weight) + (hinge_loss × 10.0)
+```
+
+Cell weights force exploration of rare cells:
+| Cell | Weight | Rationale |
+|---|---|---|
+| boost-boost-boost | 6× | Global expansion — model has almost zero examples |
+| boost-boost-neutral | 6× | Extreme expansion — critical for bright HDR content |
+| neutral-crush-crush | 4× | Standard DV — anchor identity behavior |
+| neutral-neutral-boost | 4× | Pure expansion — prevents over-compression |
+
+**Two-Phase Training (`--phase 1` / `--phase 2`)**
+
+```
+Phase 1 (tone mapping):  Train backbone + NR head  (freeze color trim)
+Phase 2 (color):         Freeze backbone + NR head → Train color trim head only
+```
+
+Phase 2 uses `--resume-from ckpt_nr_run12_best.pt` to load Phase 1 weights.
+
+**Enabling NR mode:**
+```bat
+python3 ml\dv_mlp_model.py ^
+  --dataset F:\DTMModelData\train\train_dataset.csv ^
+  --val-dataset F:\DTMModelData\val\val_dataset.csv ^
+  --val-titles andor,euphoria,prehistoric,our,wondla ^
+  --split-episodes our:E07,E08 ^
+  --epochs 100 --dropout 0.3 --use-5x5 --no-trim --no-tier --nr --envelope ^
+  --save F:\DTMModelData\ckpt_nr_run12 ^
+  --log F:\DTMModelData\train_log_nr_run12.txt
+```
 
 ### Val Split (run 11)
 
@@ -178,23 +246,116 @@ python3 tools/ml_compare.py \
 
 ## Pending Work
 
-### Immediate — Add New Training Titles
+### Immediate — Run 12: Naka-Rushton + Bounded Loss
 
-Two confirmed DV P5 nature documentaries downloaded to `G:\Dataset\`:
-- `Our.Living.World.S01.2160p.NF.WEB-DL.DDP5.1.Atmos.DV.H.265-FLUX`
-- `Our.Oceans.(2024).S01.(2160p.NF.WEB-DL.H265.DV.DDP.Atmos.5.1.English.-.HONE)`
+**Goal:** Beat identity floor (0.00650) by replacing unconstrained polynomial output with
+physically-bounded Naka-Rushton parameters and envelope-constrained loss.
 
-Both confirmed P5 by daemon feature extraction (maxscl [0.35-0.69] range = ICtCp P5).
-Already added to `tools/batch_extract.py` TITLES registry as "train".
+```bat
+REM Phase 1: Train backbone + NR head
+python3 ml\dv_mlp_model.py ^
+  --dataset F:\DTMModelData\train\train_dataset.csv ^
+  --val-dataset F:\DTMModelData\val\val_dataset.csv ^
+  --val-titles andor,euphoria,prehistoric,our,wondla ^
+  --split-episodes our:E07,E08 ^
+  --epochs 100 --dropout 0.3 --use-5x5 --no-trim --no-tier --nr --envelope ^
+  --save F:\DTMModelData\ckpt_nr_run12 ^
+  --log F:\DTMModelData\train_log_nr_run12.txt
 
-**Expected value:** Fill the (bright, S-curve) training cell — boost-curve + midtone preservation for bright outdoor content. Currently only ~966 boost training scenes; these should add ~500-1000 more.
+REM Phase 2 (optional): Freeze backbone+NR, train color trim
+REM python3 ml\dv_mlp_model.py ^
+REM   --dataset ... --val-dataset ... --val-titles ... ^
+REM   --phase 2 --resume-from F:\DTMModelData\ckpt_nr_run12_best.pt ^
+REM   --epochs 5 --lr 1e-4 --nr --envelope ^
+REM   --save F:\DTMModelData\ckpt_nr_run12 ^
+REM   --log F:\DTMModelData\train_log_nr_run12_phase2.txt
+```
+
+**Expected improvements over Run 11:**
+| Issue | Run 10/11 (poly) | Run 12 (NR) |
+|---|---|---|
+| Val MSE | 0.00923 | Target < 0.00650 |
+| Monotonicity | 50× penalty (imperfect) | Guaranteed by NR equation |
+| Letterbox lifting | Shadow artifacts | f(0)=0 pins black |
+| Boost curves | 2.2% wins | Better — envelope guides expansion |
+| Over-compression | Identity scenes damaged | Envelope anchors to identity |
+| Gradient competition | Trim head steals gradients | Two-phase training isolates |
+
+### Immediate — 25-Title Master Extraction (2026-08-18)
+
+**Status:** All 25 titles registered in pipeline scripts. Ready for full re-extraction with curve-shape stratification.
+
+The old 19-title dataset (94K scenes, L1 luminance-based stratification) is being replaced by:
+- 25 titles (add: Shōgun, Silo, The Penguin, Bad.Batch, Tales.of.the.Empire, Ahsoka)
+- Curve-shape stratification (shadow_dev / midtone_dev / highlight_dev bands)
+- Algorithmic balancing (15K/cell cap on dominant cells)
+- Inter-episode 80/20 split with zero frame-level leakage
+
+**Pipeline:** `rpu_stage1_extract.py` → spot-check (`check_both_splits.py` + `curve_stratify_master.py --max-cell 0`) → balance → `stage2_pixel_extract.py`
+
+Old titles are already on disk at `G:\Dataset\`. New titles must be placed there before extraction.
+
+See `ml/plan.md` "Master 25-Title Pipeline" section and `tools/curve_stratify_master.py` for the full schema.
 
 ### ⚠️ CRITICAL: Correct Extraction Pipeline
 
 **DO NOT use `batch_extract.py` for Stage 1** — it calls `dv_metadata_extract.py` which uses
 ffprobe `-show_frames` to decode the full video stream. This takes **~30 min/episode**.
 
-**The fast path for Stage 1 (seconds/episode):**
+**Master 25-Title Pipeline (use for all future extraction):**
+
+```bat
+REM Step 1: Stage 1 RPU → CSV for all 25 titles
+python3 tools\rpu_stage1_extract.py --workers 8
+
+REM ★ SPOT-CHECK (MANDATORY): Aggregate train/val before proceeding ★
+python3 tools\check_both_splits.py
+REM Also run: python3 tools\curve_stratify_master.py --stage1 F:\DTMModelData\stage1_output.csv --output F:\DTMModelData\master_manifest.csv --max-cell 0
+REM Verify: val has at least 20% of scenes per title; train has no val episode leakage
+REM If spot-check fails, fix TITLES dict or VAL_EPISODE_THRESHOLDS before Step 3
+
+REM Step 2: Balance + stratify (curves, not L1 luminance)
+python3 tools\curve_stratify_master.py --stage1 F:\DTMModelData\stage1_output.csv --output F:\DTMModelData\balanced_manifest.csv
+
+REM Step 3: Pixel extraction (daemon, ~0.4 scenes/s)
+python3 tools\stage2_pixel_extract.py --split both --workers 1
+```
+
+**25-Title Inter-Episode Split Schema (80/20, zero leakage):**
+
+| Title | Train episodes | Val episodes | Threshold |
+|---|---|---|---|
+| Andor S02 | 01–09 | 10–12 | ≥10 → val |
+| Born.to.Be.Wild S01 | 01–05 | 06 | ≥6 → val |
+| Euphoria S03 | 01–06 | 07–08 | ≥7 → val |
+| For.All.Mankind S05 | 01–08 | 09–10 | ≥9 → val |
+| House.of.the.Dragon S03 | 01–06 | 07–08 | ≥7 → val |
+| Mindhunter S01 | 01–08 | 09–10 | ≥9 → val |
+| Monarch S02 | 01–08 | 09–10 | ≥9 → val |
+| Our.Living.World S01 | 01–03 | 04 | ≥4 → val |
+| Our.Oceans S01 | 01–04 | 05 | ≥5 → val |
+| Our.Planet S01 | 01–06 | 07–08 | ≥7 → val |
+| Prehistoric.Planet S03 | 01–04 | 05 | ≥5 → val |
+| Stranger.Things S05 | 01–06 | 07–08 | ≥7 → val |
+| Ted.Lasso S03 | 01–09 | 10–12 | ≥10 → val |
+| Last.of.Us S02 | 01–07 | 08–09 | ≥8 → val |
+| Rings.of.Power S02 | 01–06 | 07–08 | ≥7 → val |
+| Mandalorian S01 | 01–06 | 07–08 | ≥7 → val |
+| Sandman S01 | 01–08 | 09–11 | ≥9 → val |
+| Witcher S04 | 01–06 | 07–08 | ≥7 → val |
+| WondLa S03 | 01–05 | 06 | ≥6 → val |
+| Shōgun S01 | 01–08 | 09–10 | ≥9 → val |
+| Silo S03 | 01–07 | — | all train (S03 only, 7 eps) |
+| The.Penguin S01 | 01–06 | 07–08 | ≥7 → val |
+| Bad.Batch S03 | 01–13 | 14–16 | ≥14 → val |
+| Tales.of.the.Empire S01 | 01–05 | 06 | ≥6 → val |
+| Ahsoka S01 | 01–06 | 07–08 | ≥7 → val |
+
+**Key invariant:** episode boundaries are the isolation boundary — NO frame-level mixing
+between train and val. This prevents temporal leakage where adjacent scenes in the same
+episode share lighting/color grading that the model could memorize rather than generalise.
+
+**Old fast path (legacy — only for single-title incremental runs):**
 
 ```bat
 REM Step 1: Extract RPU binary files via dovi_tool (~90s/episode, parallel)
@@ -212,11 +373,30 @@ REM Step 4: Stage 2 pixel features (daemon, ~3-4h per title)
 python3 tools\stage2_pixel_extract.py --split train --workers 2
 ```
 
-**New titles must also be added to `tools/rpu_extract_batch.py::TITLES` dict** (already done for
-our_living_world_s01 and our_oceans_s01).
-
 `batch_extract.py` is for Stage 2 only (full pixels via `--full-pixels` flag).
 Stage 1 always uses the two-step rpu_extract_batch → rpu_stage1_extract pipeline.
+
+### Spot-Check After Stage 1 (MANDATORY)
+
+After running `rpu_stage1_extract.py`, always verify the data quality before proceeding:
+
+```bat
+REM Check both splits have reasonable coverage
+python3 tools\check_both_splits.py
+
+REM Quick stratification overview WITHOUT balancing (max-cell=0 = no cap)
+python3 tools\curve_stratify_master.py --stage1 F:\DTMModelData\stage1_output.csv --output F:\DTMModelData\quick_check.csv --max-cell 0
+
+REM Check:
+REM   - Each title has scenes in BOTH train and val
+REM   - Val has at least 20% of title's scenes
+REM   - No title is 100% in one split (episode threshold is working)
+REM   - Major cells (neutral-crush-crush, neutral-neutral-boost) are well-populated
+REM   - Rare cells (boost-boost-boost, boost-boost-crush) have at least a few scenes
+```
+
+If spot-check reveals missing titles or split issues, fix `TITLES` dict in
+`rpu_stage1_extract.py` or `VAL_EPISODE_THRESHOLDS` in `curve_stratify_master.py`.
 
 ### Improve Curve Quality
 
@@ -239,7 +419,7 @@ Current stratification selects scenes by L1 luminance stats only. Critical flaw:
 with identical L1 stats but different polynomial shapes (dark drama → compress, nature doc →
 lift) land in the same stratum → contradictory gradients → model learns the average (near-linear).
 
-**Replace luminance axes with curve-shape axes:**
+**Use `tools/curve_stratify_master.py`** — the definitive master stratification for all 25 titles.
 
 For each scene, compute three regional polynomial deviations:
 ```python
@@ -248,11 +428,18 @@ midtone_dev   = mean(gold(x) - x)  for x ∈ [0.2, 0.5]   # + = lift, - = compre
 highlight_dev = mean(gold(x) - x)  for x ∈ [0.5, maxscl] # + = boost, - = rolloff
 ```
 
-Stratification cells: shadow × midtone × highlight bands (3×3×4 = 36 cells).
-Under-represented cells (e.g., lift+preserve+compress = S-curve) fill from Our Living World / Our Oceans.
-Abundant cells (dark drama, strong-compress) are capped.
+Stratification cells: shadow × midtone × highlight bands (3×3×3 = 27 observed, up to 36 possible).
 
-This can be computed from existing Stage 1 CSVs — no re-extraction needed.
+**Balancing strategy:** cap dominant cells (`neutral-crush-crush`, `neutral-neutral-boost`) at
+`MAX_FRAMES_PER_CELL = 15000`. This forces the model to see rare cells (boost-boost-boost,
+boost-boost-crush) that are currently <0.5% of training data.
+
+**Band thresholds:** shadow (< -0.06: crush, > 0.02: boost), midtone (< -0.04: compress, > 0.02: boost),
+highlight (< -0.03: rolloff, > 0.02: boost).
+
+Observed from 120K+ scenes: 9 cells cover >99.9% of content. The 3 critical missing cells for
+model training: `boost-boost-boost` (global expansion), `boost-boost-crush` (classic S-curve),
+`boost-neutral-boost` (dual expansion).
 
 **3. Zone-masked texture features (Phase 1 — no re-extraction)**
 
@@ -389,12 +576,14 @@ Schema (148 cols): Stage 1 (65) + 77 daemon pixel features + `top_bar_norm` + `b
 
 | Metric | Target | Current | Status |
 |---|---|---|---|
-| Val MSE vs libplacebo | beat by >2× | **2.6×** | ✅ Achieved |
-| Val MSE vs identity | beat identity | 0.00923 vs 0.00650 | ⏳ Not yet |
-| Boost curve wins | >50% | 2.2% | ❌ Needs new training data |
-| Near_identity wins | >60% | 22.2% | ⏳ Improving |
-| Held-out MAE | < 0.05 PQ | **0.064** | Close |
-| Inference time | < 0.5ms CPU | Not measured | ⏳ Pending |
+| Val MSE vs libplacebo | beat by >2× | **2.6×** (Run 11) | ✅ Achieved |
+| Val MSE vs identity | beat identity | 0.00923 vs 0.00650 (Run 11) | ⏳ Run 12 NR target < 0.00650 |
+| Boost curve wins | >50% | 2.2% (Run 11) | ❌ Run 12 + new data |
+| Near_identity wins | >60% | 22.2% (Run 11) | ⏳ NR envelope helps |
+| Monotonicity violations | 0% | Non-zero (poly kinks) | ✅ NR guarantees 0 |
+| Letterbox artifacts | None | Present (shadow lift) | ✅ NR f(0)=0 |
+| Held-out MAE | < 0.05 PQ | **0.064** (Run 11) | Close |
+| Inference time | < 0.5ms CPU | Not measured | ⏳ NR simpler = faster |
 | No temporal pumping | — | Not tested | ⏳ Pending |
 
 ---
@@ -409,7 +598,10 @@ Schema (148 cols): Stage 1 (65) + 77 daemon pixel features + `top_bar_norm` + `b
 | `tools/ml_viewer.py` | Streamlit interactive viewer (DV + HDR10) | — |
 | `tools/ml_compare.py` | Command-line frame comparison | — |
 | `tools/dv_render.c` | Headless DV frame renderer (all modes incl. ml-lut) | ~3-5s/frame |
+| `tools/rpu_extract_batch.py` | Extract RPU binaries from MKV | ~90s/episode |
 | `tools/rpu_stage1_extract.py` | Stage 1 CSVs from RPU (no HEVC decode) | ~5-15s/episode |
+| `tools/curve_stratify_master.py` | Master: curve-stratify + 25-title balance + 80/20 split | ~30s/120K scenes |
+| `tools/curve_stratify.py` | Legacy curve stratification (19 titles) | — |
 | `tools/stage2_pixel_extract.py` | Stage 2 pixel extraction via daemon | ~0.4 scenes/s |
 | `tools/batch_extract.py` | Full pipeline: RPU + Stage1 + Stage2 per title | — |
 | `tools/check_stage2_progress.py` | Dataset progress check | instant |
