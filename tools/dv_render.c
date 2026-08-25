@@ -418,6 +418,11 @@ typedef struct {
     float       radiance_knee;    /* output-luma knee for adaptive highlight lift */
     float       radiance_strength;
     enum dv_control_mode radiance_mode;
+    enum dv_control_mode chroma_mode;
+    float       chroma_neutral_boost;
+    float       chroma_fire_boost;
+    float       chroma_knee;
+    float       chroma_skin_protect;
     int         server;
     int         playback_server;
     bool        write_output;
@@ -939,6 +944,10 @@ struct dv_frame_info {
     float fire_pop_strength;
     float radiance_knee;
     float radiance_strength;
+    float chroma_neutral_boost;
+    float chroma_fire_boost;
+    float chroma_knee;
+    float chroma_skin_protect;
 };
 
 static int render_frame_with_decoder(Args a, pl_gpu gpu, pl_renderer renderer,
@@ -978,8 +987,10 @@ static int render_frame_with_decoder(Args a, pl_gpu gpu, pl_renderer renderer,
         if (!ok) { fprintf(stderr, "pl_map_avframe_ex failed\n"); return 1; }
     }
 
-    if (a.fire_pop_mode != DV_CONTROL_MANUAL)
+    if (a.fire_pop_mode == DV_CONTROL_OFF)
         a.fire_pop_strength = 0.0f;
+    else if (a.fire_pop_mode == DV_CONTROL_AUTO)
+        a.fire_pop_strength = 1.0f;  /* auto: default strength */
 
     /* For spline/ml: keep the DV colour matrix but replace the RPU reshaping
      * curves with identity. Allocate a mutable copy of pl_dovi_metadata,
@@ -1074,32 +1085,14 @@ static int render_frame_with_decoder(Args a, pl_gpu gpu, pl_renderer renderer,
     struct pl_render_params rparams = pl_render_high_quality_params;
     rparams.color_map_params = &cmap;
     rparams.antiringing_strength = 0.80f;
-    struct fire_pop_hook_state fire_hook_state = {
-        .strength = a.fire_pop_strength,
-    };
-    struct l2_hook_state l2_hook_state = { .gamma = 1.0f, .saturation = 1.0f };
     struct pl_ml_radiance radiance = {0};
-    struct pl_hook fire_hook = {
-        .stages = PL_HOOK_OUTPUT,
-        .input = PL_HOOK_SIG_COLOR,
-        .priv = &fire_hook_state,
-        .hook = fire_pop_output_hook,
-        .signature = 0x4456504649524550ull,
-    };
-    struct pl_hook l2_hook = {
-        .stages = PL_HOOK_OUTPUT,
-        .input = PL_HOOK_SIG_COLOR,
-        .priv = &l2_hook_state,
-        .hook = l2_output_hook,
-        .signature = 0x44564C325452494Dull,
-    };
-    struct pl_hook radiance_hook = {0};
-    const struct pl_hook *hooks[3];
+    struct pl_hook hooks[4];
+    struct pl_ml_render_result ml_result = { .l2_power = 2048.0f, .l2_saturation = 2048.0f };
+    bool have_ml_result = false;
     bool gpu_fire_pop = a.fire_pop_strength > 0.0f;
     bool gpu_l2 = false;
     bool gpu_radiance = false;
-    struct pl_ml_render_result ml_result = {0};
-    bool have_ml_result = false;
+    struct l2_hook_state l2_hook_state = { .gamma = 1.0f, .saturation = 1.0f };
 
     /* Apply user-supplied spline constants — negative sentinel means keep default */
 #define APPLY_IF_SET(field, arg) if ((arg) >= 0.0f) cmap.tone_constants.field = (arg)
@@ -1245,6 +1238,11 @@ static int render_frame_with_decoder(Args a, pl_gpu gpu, pl_renderer renderer,
                 .knee = a.radiance_knee,
                 .strength = a.radiance_strength,
             },
+            .chroma_mode = (enum pl_ml_control_mode)a.chroma_mode,
+            .chroma_neutral_boost = a.chroma_neutral_boost,
+            .chroma_fire_boost = a.chroma_fire_boost,
+            .chroma_knee = a.chroma_knee,
+            .chroma_skin_protect = a.chroma_skin_protect,
             .target_nits = a.out_nits,
             .l1_max_pq = a.l1_max_pq,
             .l1_avg_pq = a.l1_avg_pq,
@@ -1267,6 +1265,19 @@ static int render_frame_with_decoder(Args a, pl_gpu gpu, pl_renderer renderer,
         }
         if (ml_result.model_used)
             fprintf(stderr, "Native ML gamma: %.3f (88 features)\n", ml_result.gamma);
+
+        // Apply chroma params unconditionally — not populated by fallback path
+        if (a.chroma_mode == DV_CONTROL_MANUAL) {
+            ml_result.chroma_neutral_boost = a.chroma_neutral_boost;
+            ml_result.chroma_fire_boost    = a.chroma_fire_boost;
+            ml_result.chroma_knee          = a.chroma_knee;
+            ml_result.chroma_skin_protect  = a.chroma_skin_protect;
+        } else if (a.chroma_mode == DV_CONTROL_AUTO) {
+            ml_result.chroma_neutral_boost = 1.20f;
+            ml_result.chroma_fire_boost    = 1.35f;
+            ml_result.chroma_knee          = 0.55f;
+            ml_result.chroma_skin_protect  = 0.95f;
+        }
 
         float gamma = ml_result.gamma;
         float power = ml_result.l2_power;
@@ -1292,14 +1303,12 @@ static int render_frame_with_decoder(Args a, pl_gpu gpu, pl_renderer renderer,
          * Auto-scales based on predicted gamma — punchy scenes get more
          * micro-contrast injection, flat scenes back off to avoid noise. */
         if (a.cr_mode == DV_CONTROL_OFF) {
-            cmap.contrast_recovery = ml_result.cr_strength;
-            fprintf(stderr, "  CR strength: off\n");
+            cmap.contrast_recovery = 0.0f;
+            fprintf(stderr, "  CR strength: off (disabled)\n");
         } else if (a.cr_mode == DV_CONTROL_MANUAL) {
-            cmap.contrast_recovery = ml_result.cr_strength;
-            fprintf(stderr, "  CR strength: %.3f (explicit)\n", cmap.contrast_recovery);
+            cmap.contrast_recovery = a.cr_strength >= 0.0f ? a.cr_strength : ml_result.cr_strength;
+            fprintf(stderr, "  CR strength: %.3f (manual)\n", cmap.contrast_recovery);
         } else {
-            /* Scale inversely: lower gamma → more detail injection.
-             * gamma=0.7 → 0.42, gamma=1.0 → 0.28, gamma=1.2 → 0.25 */
             cmap.contrast_recovery = ml_result.cr_strength;
             fprintf(stderr, "  CR strength: %.3f (auto from gamma %.3f)\n",
                     cmap.contrast_recovery, gamma);
@@ -1322,7 +1331,7 @@ static int render_frame_with_decoder(Args a, pl_gpu gpu, pl_renderer renderer,
             frame_info->flags |= a.cr_mode == DV_CONTROL_MANUAL ? DV_FRAME_INFO_CR_MANUAL :
                 a.cr_mode == DV_CONTROL_OFF ? DV_FRAME_INFO_CR_OFF : DV_FRAME_INFO_CR_AUTO;
             frame_info->flags |= a.fire_pop_mode == DV_CONTROL_MANUAL ? DV_FRAME_INFO_FIRE_MANUAL :
-                a.fire_pop_mode == DV_CONTROL_AUTO ? DV_FRAME_INFO_FIRE_FALLBACK : DV_FRAME_INFO_FIRE_OFF;
+                a.fire_pop_mode == DV_CONTROL_AUTO ? DV_FRAME_INFO_FIRE_MANUAL : DV_FRAME_INFO_FIRE_OFF;
             frame_info->gamma = gamma;
             frame_info->l1_max_pq = a.l1_max_pq;
             frame_info->l1_avg_pq = a.l1_avg_pq;
@@ -1346,22 +1355,19 @@ static int render_frame_with_decoder(Args a, pl_gpu gpu, pl_renderer renderer,
             DV_FRAME_INFO_RADIANCE_AUTO : DV_FRAME_INFO_RADIANCE_OFF;
         frame_info->radiance_knee = radiance.knee;
         frame_info->radiance_strength = radiance.strength;
+        frame_info->chroma_neutral_boost = ml_result.chroma_neutral_boost;
+        frame_info->chroma_fire_boost = ml_result.chroma_fire_boost;
+        frame_info->chroma_knee = ml_result.chroma_knee;
+        frame_info->chroma_skin_protect = ml_result.chroma_skin_protect;
     }
-    int num_hooks = 0;
-    if (gpu_fire_pop)
-        hooks[num_hooks++] = &fire_hook;
-    if (gpu_l2)
-        hooks[num_hooks++] = &l2_hook;
-    if (gpu_radiance)
-        pl_ml_radiance_get_hook(&radiance, &radiance_hook);
-    if (gpu_radiance)
-        hooks[num_hooks++] = &radiance_hook;
+    int num_hooks = pl_ml_render_get_hooks(&ml_result, hooks);
     if (num_hooks) {
-        rparams.hooks = hooks;
+        const struct pl_hook *hook_ptrs[4];
+        for (int i = 0; i < num_hooks; i++) hook_ptrs[i] = &hooks[i];
+        rparams.hooks = hook_ptrs;
         rparams.num_hooks = num_hooks;
-        fprintf(stderr, "GPU output hooks: fire-pop=%s L2=%s radiance=%s\n",
-            gpu_fire_pop ? "on" : "off", gpu_l2 ? "on" : "off",
-            gpu_radiance ? "on" : "off");
+        fprintf(stderr, "GPU output hooks: %d active (chroma=%s)\n", num_hooks,
+            (ml_result.chroma_neutral_boost > 1.0f || ml_result.chroma_fire_boost > 1.0f) ? "on" : "off");
     }
 
     /* --- Render --- */
@@ -1972,6 +1978,11 @@ typedef struct {
     enum dv_control_mode cr_mode;
     enum dv_control_mode fire_pop_mode;
     enum dv_control_mode radiance_mode;
+    enum dv_control_mode chroma_mode;
+    float chroma_neutral_boost;
+    float chroma_fire_boost;
+    float chroma_knee;
+    float chroma_skin_protect;
 } ServerRequest;
 
 static bool server_json_number(const char *line, const char *key, double *value)
@@ -2019,6 +2030,11 @@ static bool parse_server_request(const char *line, ServerRequest *request)
     request->cr_mode = DV_CONTROL_AUTO;
     request->fire_pop_mode = DV_CONTROL_OFF;
     request->radiance_mode = DV_CONTROL_OFF;
+    request->chroma_mode = DV_CONTROL_OFF;
+    request->chroma_neutral_boost = 1.20f;
+    request->chroma_fire_boost = 1.35f;
+    request->chroma_knee = 0.55f;
+    request->chroma_skin_protect = 0.95f;
 
     const char *key = strstr(line, "\"input\"");
     if (!key) key = strstr(line, "\"mkv_path\"");
@@ -2052,6 +2068,11 @@ static bool parse_server_request(const char *line, ServerRequest *request)
     request->cr_mode = server_control_mode(line, "cr_mode", request->cr_mode);
     request->fire_pop_mode = server_control_mode(line, "fire_pop_mode", request->fire_pop_mode);
     request->radiance_mode = server_control_mode(line, "radiance_mode", request->radiance_mode);
+    request->chroma_mode = server_control_mode(line, "chroma_mode", request->chroma_mode);
+    if (server_json_number(line, "chroma_neutral_boost", &number)) request->chroma_neutral_boost = (float)number;
+    if (server_json_number(line, "chroma_fire_boost", &number)) request->chroma_fire_boost = (float)number;
+    if (server_json_number(line, "chroma_knee", &number)) request->chroma_knee = (float)number;
+    if (server_json_number(line, "chroma_skin_protect", &number)) request->chroma_skin_protect = (float)number;
     return request->width > 0 && request->height > 0;
 }
 
@@ -2081,12 +2102,14 @@ static bool write_server_header(const ServerRequest *request)
 
 static bool write_server_frame_info(const struct dv_frame_info *info)
 {
-    return write_u32_le(3) && write_u32_le(36) &&
+    return write_u32_le(3) && write_u32_le(52) &&
            write_u32_le(info->flags) && write_f32_le(info->gamma) &&
            write_f32_le(info->l1_max_pq) && write_f32_le(info->l1_avg_pq) &&
            write_f32_le(info->cr_strength) && write_f32_le(info->l2_power) &&
            write_f32_le(info->fire_pop_strength) &&
-           write_f32_le(info->radiance_knee) && write_f32_le(info->radiance_strength);
+           write_f32_le(info->radiance_knee) && write_f32_le(info->radiance_strength) &&
+           write_f32_le(info->chroma_neutral_boost) && write_f32_le(info->chroma_fire_boost) &&
+           write_f32_le(info->chroma_knee) && write_f32_le(info->chroma_skin_protect);
 }
 
 static bool write_server_record(uint32_t mode, const ServerRequest *request,
@@ -2126,6 +2149,11 @@ static bool write_server_record(uint32_t mode, const ServerRequest *request,
     args.radiance_knee = request->radiance_knee;
     args.radiance_strength = request->radiance_strength;
     args.radiance_mode = request->radiance_mode;
+    args.chroma_mode = mode == 1 ? DV_CONTROL_OFF : request->chroma_mode;
+    args.chroma_neutral_boost = request->chroma_neutral_boost;
+    args.chroma_fire_boost = request->chroma_fire_boost;
+    args.chroma_knee = request->chroma_knee;
+    args.chroma_skin_protect = request->chroma_skin_protect;
     args.mode = mode == 1 ? "spline" : "contrast-recovery";
     args.contrast_recovery = mode == 2;
 

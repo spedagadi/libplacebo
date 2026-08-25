@@ -69,7 +69,9 @@ class PersistentRenderer:
 
     def render_pair(self, video, pts, nits, gamma_mode, gamma, cr_mode,
                     cr_strength, fire_pop_mode, fire_pop, radiance_mode,
-                    radiance_knee, radiance_strength):
+                    radiance_knee, radiance_strength,
+                    chroma_mode="off", chroma_neutral=1.20, chroma_fire=1.35,
+                    chroma_knee=0.55, chroma_skin=0.95):
         request = json.dumps({
             "input": str(video), "pts": float(pts), "width": W, "height": H,
             "out_nits": float(nits),
@@ -78,6 +80,11 @@ class PersistentRenderer:
             "fire_pop_mode": fire_pop_mode, "fire_pop_strength": float(fire_pop),
             "radiance_mode": radiance_mode, "radiance_knee": float(radiance_knee),
             "radiance_strength": float(radiance_strength),
+            "chroma_mode": chroma_mode,
+            "chroma_neutral_boost": float(chroma_neutral),
+            "chroma_fire_boost": float(chroma_fire),
+            "chroma_knee": float(chroma_knee),
+            "chroma_skin_protect": float(chroma_skin),
         }).encode("utf-8") + b"\n"
         with self.lock:
             for attempt in range(2):
@@ -98,13 +105,15 @@ class PersistentRenderer:
                         mode, length = struct.unpack("<2I", self._read_exact(8))
                         payload = self._read_exact(length)
                         if mode == 3:
-                            if length != 36:
+                            if length != 52:
                                 raise RuntimeError(f"unexpected frame-info payload size: {length}")
-                            values = struct.unpack("<I8f", payload)
+                            values = struct.unpack("<I12f", payload)
                             frame_info = dict(zip(
                                 ("flags", "gamma", "l1_max_pq", "l1_avg_pq",
                                  "cr_strength", "l2_power", "fire_pop_strength",
-                                 "radiance_knee", "radiance_strength"), values))
+                                 "radiance_knee", "radiance_strength",
+                                 "chroma_neutral_boost", "chroma_fire_boost",
+                                 "chroma_knee", "chroma_skin_protect"), values))
                             continue
                         expected = W * H * 3
                         if length != expected:
@@ -134,11 +143,14 @@ _PERSISTENT_RENDERER = PersistentRenderer()
 # ── Core functions ────────────────────────────────────────────────────────────
 def render_persistent_pair(video, pts, nits, gamma_mode, gamma, cr_mode,
                             cr_strength, fire_pop_mode, fire_pop, radiance_mode,
-                            radiance_knee, radiance_strength):
+                            radiance_knee, radiance_strength,
+                            chroma_mode="off", chroma_neutral=1.20, chroma_fire=1.35,
+                            chroma_knee=0.55, chroma_skin=0.95):
     """Render both diagnostic views through one persistent native process."""
     return _PERSISTENT_RENDERER.render_pair(
         video, pts, nits, gamma_mode, gamma, cr_mode, cr_strength,
-        fire_pop_mode, fire_pop, radiance_mode, radiance_knee, radiance_strength
+        fire_pop_mode, fire_pop, radiance_mode, radiance_knee, radiance_strength,
+        chroma_mode, chroma_neutral, chroma_fire, chroma_knee, chroma_skin
     )
 
 def render_frame(video, pts, nits, maxscl, avg, mode="spline",
@@ -319,6 +331,12 @@ HTML = """<!DOCTYPE html>
     <div><label>Radiance mode</label><select id="radiance-mode"><option value="off">Off</option><option value="auto">Auto</option><option value="manual">Manual</option></select></div>
     <div><label>Manual radiance knee</label><input type="number" id="radiance-knee" value="0.60" min="0.40" max="0.90" step="0.05"></div>
     <div><label>Manual radiance strength</label><input type="number" id="radiance-strength" value="0.30" min="0" max="0.60" step="0.05"></div>
+    <div style="width:100%;margin-top:10px;padding-top:10px;border-top:1px solid #444"><label style="color:#f39c12;font-weight:bold">Chroma Vector Tuner</label></div>
+    <div><label>Chroma mode</label><select id="chroma-mode"><option value="off">Off</option><option value="auto">Auto</option><option value="manual">Manual</option></select></div>
+    <div><label>Neutral boost</label><input type="number" id="chroma-neutral" value="1.20" min="1.00" max="1.50" step="0.05"></div>
+    <div><label>Fire boost</label><input type="number" id="chroma-fire" value="1.35" min="1.00" max="1.50" step="0.05"></div>
+    <div><label>Knee point</label><input type="number" id="chroma-knee" value="0.55" min="0.10" max="0.90" step="0.05"></div>
+    <div><label>Skin protect</label><input type="number" id="chroma-skin" value="0.95" min="0.50" max="1.00" step="0.05"></div>
     <div><button id="forward-btn" onclick="run()">&#9654; Step +1 Frame</button></div>
 </div>
 <div class="imgs">
@@ -348,7 +366,12 @@ function run(){
             fire_pop:parseFloat(document.getElementById('fire-pop').value),
         radiance_mode:document.getElementById('radiance-mode').value,
         radiance_knee:parseFloat(document.getElementById('radiance-knee').value),
-        radiance_strength:parseFloat(document.getElementById('radiance-strength').value)})})
+        radiance_strength:parseFloat(document.getElementById('radiance-strength').value),
+        chroma_mode:document.getElementById('chroma-mode').value,
+        chroma_neutral:parseFloat(document.getElementById('chroma-neutral').value),
+        chroma_fire:parseFloat(document.getElementById('chroma-fire').value),
+        chroma_knee:parseFloat(document.getElementById('chroma-knee').value),
+        chroma_skin:parseFloat(document.getElementById('chroma-skin').value)})})
   .then(r=>r.json()).then(d=>{
     document.getElementById('log').textContent=d.log;
         if(d.next_frame !== undefined){
@@ -393,6 +416,11 @@ def run_pipeline():
     radiance_mode = data.get("radiance_mode", "off")
     radiance_knee = float(data.get("radiance_knee", 0.60))
     radiance_strength = float(data.get("radiance_strength", 0.30))
+    chroma_mode = data.get("chroma_mode", "off")
+    chroma_neutral = float(data.get("chroma_neutral", 1.20))
+    chroma_fire = float(data.get("chroma_fire", 1.35))
+    chroma_knee = float(data.get("chroma_knee", 0.55))
+    chroma_skin = float(data.get("chroma_skin", 0.95))
     log   = []
     L     = lambda msg: (log.append(msg), print(msg, flush=True))
 
@@ -415,7 +443,7 @@ def run_pipeline():
         r = subprocess.run(
             [ffprobe, "-v", "error", "-select_streams", "v:0",
              "-show_entries", "stream=r_frame_rate", "-of", "csv=p=0", video],
-            capture_output=True, text=True, timeout=8, env=subprocess_env)
+            capture_output=True, text=True, timeout=30, env=subprocess_env)
         L(f"ffprobe stdout={r.stdout.strip()!r} stderr={r.stderr.strip()!r} retcode={r.returncode}")
         tok = r.stdout.strip().split(",")[0]
         if not tok:
@@ -434,13 +462,15 @@ def run_pipeline():
             L(f"CR: {cr_mode}" + (f" ({cr_strength:.3f})" if cr_mode == "manual" else ""))
             L(f"Fire pop: {fire_pop_mode}" + (f" ({fire_pop:.2f}x)" if fire_pop_mode == "manual" else ""))
             L(f"Radiance: {radiance_mode}" + (f" (knee={radiance_knee:.2f} strength={radiance_strength:.2f})" if radiance_mode == "manual" else ""))
+            L(f"Chroma: {chroma_mode}" + (f" (neutral={chroma_neutral:.2f} fire={chroma_fire:.2f} knee={chroma_knee:.2f} skin={chroma_skin:.2f})" if chroma_mode == "manual" else ""))
 
             render_start = time.perf_counter()
             L("Rendering spline and contrast-recovery...")
             img_spl, img_cr, frame_info = render_persistent_pair(
                 video, pts, nits, gamma_mode, gamma, cr_mode, cr_strength,
                 fire_pop_mode, fire_pop, radiance_mode, radiance_knee,
-                radiance_strength
+                radiance_strength, chroma_mode, chroma_neutral, chroma_fire,
+                chroma_knee, chroma_skin
             )
             render_ms = (time.perf_counter() - render_start) * 1000.0
             if img_spl is None or img_cr is None:
@@ -467,6 +497,9 @@ def run_pipeline():
             L("  L1 max={:.4f} avg={:.4f}  L2 power={:.0f}".format(
                 frame_info["l1_max_pq"], frame_info["l1_avg_pq"],
                 frame_info["l2_power"]))
+            L("  chroma neutral={:.2f} fire={:.2f} knee={:.2f} skin={:.2f}".format(
+                frame_info["chroma_neutral_boost"], frame_info["chroma_fire_boost"],
+                frame_info["chroma_knee"], frame_info["chroma_skin_protect"]))
             total_ms = (time.perf_counter() - frame_start) * 1000.0
             L(f"Frame {current_frame} complete in {total_ms:.1f} ms")
             record = {
