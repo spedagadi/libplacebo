@@ -1,22 +1,26 @@
 /*
  * libplacebo_baseline_eval.c
  * ==========================
- * Evaluates libplacebo's pl_tone_map_spline curve for each scene in the
- * val dataset and outputs the 256-point curve in PQ signal space.
+ * Evaluates libplacebo's pl_tone_map_spline for each scene and outputs
+ * the 256-point curve in PQ signal space [0, 1].
  *
- * Used to compare the ML model's predicted curves against libplacebo's
- * built-in adaptive spline tone mapper.
+ * Design decisions (fixed):
+ *   - Target display: 143 nits (no-tier training — polynomial is tier-independent)
+ *   - Evaluation domain: x = linspace(0, 1, 256) — full PQ range, same as gold curves
+ *   - Scene peak: l1_max_pq from RPU L1 metadata (NOT GPU-derived maxscl)
+ *     Reason: DV P5 decoded without native DV support produces wrong chroma
+ *     (green/purple cast). RPU metadata is read directly from the bitstream
+ *     and is always correct. For luma tone mapping the I channel is unaffected,
+ *     but we use RPU metadata to be safe and consistent.
+ *   - For x > l1_max_pq: pl_tone_map_sample returns target_pq (clips to output max)
+ *     This is valid — the gold curve also continues the polynomial above the scene
+ *     peak, and both are compared in the same [0,1] PQ domain in BoundedDTMLoss.
  *
- * Input  (stdin):  CSV with header: scene_id,maxscl,l1_avg_pq,target_nits
- * Output (stdout): CSV: scene_id,y_0,y_1,...,y_255
- *
- * Both input and output curves are in PQ signal space [0,1].
- * The 256 points are evaluated at x = linspace(0, maxscl, 256) so both
- * libplacebo and the gold RPU polynomial are compared on the same domain
- * (the meaningful content range up to the scene peak).
+ * Input  (stdin):  CSV with header: scene_id,l1_max_pq,l1_avg_pq
+ * Output (stdout): CSV:             scene_id,spline_y_0,...,spline_y_255
  *
  * Build: see tools/meson.build (libplacebo_baseline_eval target)
- * Run:   python3 tools/libplacebo_baseline_eval.py
+ * Run:   python3 tools/gen_spline_baselines.py
  */
 
 #include <stdio.h>
@@ -27,7 +31,8 @@
 #include <libplacebo/tone_mapping.h>
 #include <libplacebo/colorspace.h>
 
-#define N_PTS 256
+#define N_PTS         256
+#define TARGET_NITS   143.0f   /* fixed: no-tier, 143-nit reference display */
 
 /* ST.2084 (PQ) forward transform: linear light (nits/10000) -> PQ signal */
 static float nits_to_pq(float nits)
@@ -43,6 +48,7 @@ static float nits_to_pq(float nits)
 int main(void)
 {
     char line[4096];
+    const float target_pq = nits_to_pq(TARGET_NITS);
 
     /* Skip CSV header */
     if (!fgets(line, sizeof(line), stdin))
@@ -51,25 +57,22 @@ int main(void)
     /* Print output header */
     printf("scene_id");
     for (int i = 0; i < N_PTS; i++)
-        printf(",y_%d", i);
+        printf(",spline_y_%d", i);
     printf("\n");
 
     int scene_id;
-    float maxscl, l1_avg_pq, target_nits;
+    float l1_max_pq, l1_avg_pq;
 
     while (fgets(line, sizeof(line), stdin)) {
-        /* Parse: scene_id,maxscl,l1_avg_pq,target_nits */
-        if (sscanf(line, "%d,%f,%f,%f",
-                   &scene_id, &maxscl, &l1_avg_pq, &target_nits) != 4)
+        /* Parse: scene_id,l1_max_pq,l1_avg_pq */
+        if (sscanf(line, "%d,%f,%f", &scene_id, &l1_max_pq, &l1_avg_pq) != 3)
             continue;
 
-        /* Clamp inputs to valid PQ range */
-        if (maxscl    < 0.001f) maxscl    = 0.001f;
-        if (maxscl    > 1.0f  ) maxscl    = 1.0f;
+        /* Clamp to valid PQ range — use RPU L1 values directly */
+        if (l1_max_pq < 0.001f) l1_max_pq = 0.001f;
+        if (l1_max_pq > 1.0f  ) l1_max_pq = 1.0f;
         if (l1_avg_pq < 0.0f  ) l1_avg_pq = 0.0f;
-        if (l1_avg_pq > maxscl) l1_avg_pq = maxscl;
-
-        float target_pq = nits_to_pq(target_nits);
+        if (l1_avg_pq > l1_max_pq) l1_avg_pq = l1_max_pq;
 
         struct pl_tone_map_params params = {
             .function       = &pl_tone_map_spline,
@@ -77,21 +80,24 @@ int main(void)
             .input_scaling  = PL_HDR_PQ,
             .output_scaling = PL_HDR_PQ,
             .input_min      = 0.0f,
-            .input_max      = maxscl,
-            .input_avg      = l1_avg_pq,
+            .input_max      = l1_max_pq,   /* scene peak from RPU metadata */
+            .input_avg      = l1_avg_pq,   /* scene avg from RPU metadata */
             .output_min     = 0.0f,
-            .output_max     = target_pq,
+            .output_max     = target_pq,   /* 143 nits, fixed */
             .lut_size       = N_PTS,
         };
 
         pl_tone_map_params_infer(&params);
 
-        /* Sample at N_PTS evenly spaced points over [0, maxscl] */
+        /*
+         * Evaluate at N_PTS evenly spaced points over [0, 1] — full PQ range.
+         * Same domain as gold RPU polynomial curves in training.
+         * For x > l1_max_pq: pl_tone_map_sample clips to target_pq (valid).
+         */
         printf("%d", scene_id);
         for (int i = 0; i < N_PTS; i++) {
-            float x = maxscl * (float)i / (float)(N_PTS - 1);
+            float x = (float)i / (float)(N_PTS - 1);
             float y = pl_tone_map_sample(x, &params);
-            /* Clamp to [0,1] — output is in PQ units */
             if (y < 0.0f) y = 0.0f;
             if (y > 1.0f) y = 1.0f;
             printf(",%f", y);

@@ -62,6 +62,14 @@ TITLES = {
     "euphoria_s03": "Euphoria.US.S03.2160p.HMAX.WEB-DL.DDP5.1.DV.H.265-NTb",
     "mindhunter_s01": "Mindhunter.S01.2160p.NF.WEB-DL.DDP5.1.DV.H.265-Kitsune",
     "sandman_s01": "The.Sandman.S01.2160p.NF.WEB-DL.DDP.5.1.Atmos.DV.H.265-CHDWEB",
+
+    # Master 25-title additions
+    "shogun_s01": "Shogun.2024.S01.2160p.DSNP.WEB-DL.DDP5.1.DV.H.265-Kitsune",
+    "silo_s03": "Silo.S03E01.Who.Are.You.2160p.ATVP.WEB-DL.DDP5.1.DV.H.265",
+    "penguin_s01": "The.Penguin.S01.2160p.MAX.WEB-DL.DDP5.1.DoVi.x265-NTb",
+    "bad_batch_s03": "Star.Wars.The.Bad.Batch.S03.2160p.DSNP.WEB-DL.DDP5.1.DoVi.H.265-NTb",
+    "tales_empire_s01": "Star.Wars.Tales.of.the.Empire.S01.REPACK.2160p.DSNP.WEB-DL.DDP5.1.DoVi.HEVC-NTb",
+    "ahsoka_s01": "Ahsoka.S01.2160p.DSNP.WEB-DL.DDP5.1.DoVi.H.265-NTb",
 }
 
 

@@ -54,6 +54,8 @@
 #include <libplacebo/shaders/custom.h>
 #include <libplacebo/ml_features.h>
 #include <libplacebo/ml_model.h>
+#include <libplacebo/ml_radiance.h>
+#include <libplacebo/ml_render.h>
 
 #define PL_LIBAV_IMPLEMENTATION 1
 #include <libplacebo/utils/libav.h>
@@ -413,6 +415,9 @@ typedef struct {
      * saturation injection, anti-pink hue constraint. */
     float       fire_pop_strength;/* 0.0-2.0, default 1.0 (scales chroma boost scalars) */
     enum dv_control_mode fire_pop_mode;
+    float       radiance_knee;    /* output-luma knee for adaptive highlight lift */
+    float       radiance_strength;
+    enum dv_control_mode radiance_mode;
     int         server;
     int         playback_server;
     bool        write_output;
@@ -490,6 +495,9 @@ static bool parse_args(int argc, char **argv, Args *a)
     a->cr_smoothness   = -1.f;  /* -1 = use 2.5 default */
     a->fire_pop_strength = 0.f;  /* 0 = disabled (not enabled unless explicitly set) */
     a->fire_pop_mode = DV_CONTROL_OFF;
+    a->radiance_knee = 0.60f;
+    a->radiance_strength = 0.30f;
+    a->radiance_mode = DV_CONTROL_OFF;
     a->write_output = true;
 
     for (int i = 1; i < argc; i++) {
@@ -526,6 +534,8 @@ static bool parse_args(int argc, char **argv, Args *a)
         else if (!strcmp(argv[i], "--cr-smoothness")      && i+1 < argc) { a->cr_smoothness= atof(argv[++i]); }
         else if (!strcmp(argv[i], "--highlight-knee")     && i+1 < argc) { a->highlight_knee = atof(argv[++i]); }
         else if (!strcmp(argv[i], "--fire-pop-strength")  && i+1 < argc) { a->fire_pop_strength = atof(argv[++i]); a->fire_pop_mode = DV_CONTROL_MANUAL; }
+        else if (!strcmp(argv[i], "--radiance-knee")      && i+1 < argc) { a->radiance_knee = atof(argv[++i]); a->radiance_mode = DV_CONTROL_MANUAL; }
+        else if (!strcmp(argv[i], "--radiance-strength")  && i+1 < argc) { a->radiance_strength = atof(argv[++i]); a->radiance_mode = DV_CONTROL_MANUAL; }
         else if (!strcmp(argv[i], "--contrast-recovery")) { a->contrast_recovery = 1; }
         else { fprintf(stderr, "Unknown argument: %s\n", argv[i]); return false; }
     }
@@ -901,34 +911,6 @@ static AVFrame *native_decoder_decode(NativeDecoder *decoder, double target_pts)
  * Reusable single-request renderer. GPU and renderer ownership belongs to the
  * caller so server mode can retain the expensive native context.
  * ---------------------------------------------------------------------- */
-static bool build_gamma_model_features(pl_gpu gpu, const struct pl_frame *image,
-                                       const Args *args, float features[88])
-{
-    if (!pl_extract_ml_features(gpu, image, pl_ml_feature_params(
-            .target_nits = args->out_nits), features))
-        return false;
-
-    struct pl_tone_map_params spline = {
-        .function = &pl_tone_map_spline,
-        .constants = { PL_TONE_MAP_CONSTANTS },
-        .input_scaling = PL_HDR_PQ,
-        .output_scaling = PL_HDR_PQ,
-        .lut_size = 256,
-        .input_max = fmaxf(args->l1_max_pq, features[0]),
-        .input_avg = args->l1_avg_pq > 0.0f ? args->l1_avg_pq : features[1],
-        .output_max = 0.5444f,
-    };
-    float spline_lut[256];
-    pl_tone_map_params_infer(&spline);
-    pl_tone_map_generate(spline_lut, &spline);
-    const int knot_indices[8] = { 0, 36, 73, 109, 146, 182, 219, 255 };
-    for (int index = 0; index < 8; index++)
-        features[77 + index] = spline_lut[knot_indices[index]];
-    features[85] = args->top_bar_norm;
-    features[86] = args->bot_bar_norm;
-    features[87] = 0.5444f / fmaxf(features[0], 1e-6f);
-    return true;
-}
 
 enum dv_frame_info_flags {
     DV_FRAME_INFO_AUTO = 1 << 0,
@@ -942,6 +924,9 @@ enum dv_frame_info_flags {
     DV_FRAME_INFO_FIRE_MANUAL = 1 << 8,
     DV_FRAME_INFO_FIRE_OFF = 1 << 9,
     DV_FRAME_INFO_FIRE_FALLBACK = 1 << 10,
+    DV_FRAME_INFO_RADIANCE_AUTO = 1 << 11,
+    DV_FRAME_INFO_RADIANCE_MANUAL = 1 << 12,
+    DV_FRAME_INFO_RADIANCE_OFF = 1 << 13,
 };
 
 struct dv_frame_info {
@@ -952,6 +937,8 @@ struct dv_frame_info {
     float cr_strength;
     float l2_power;
     float fire_pop_strength;
+    float radiance_knee;
+    float radiance_strength;
 };
 
 static int render_frame_with_decoder(Args a, pl_gpu gpu, pl_renderer renderer,
@@ -1084,12 +1071,14 @@ static int render_frame_with_decoder(Args a, pl_gpu gpu, pl_renderer renderer,
 
     /* --- Tone mapping params --- */
     struct pl_color_map_params cmap = *(&pl_color_map_default_params);
-    struct pl_render_params rparams = pl_render_default_params;
+    struct pl_render_params rparams = pl_render_high_quality_params;
     rparams.color_map_params = &cmap;
+    rparams.antiringing_strength = 0.80f;
     struct fire_pop_hook_state fire_hook_state = {
         .strength = a.fire_pop_strength,
     };
     struct l2_hook_state l2_hook_state = { .gamma = 1.0f, .saturation = 1.0f };
+    struct pl_ml_radiance radiance = {0};
     struct pl_hook fire_hook = {
         .stages = PL_HOOK_OUTPUT,
         .input = PL_HOOK_SIG_COLOR,
@@ -1104,9 +1093,13 @@ static int render_frame_with_decoder(Args a, pl_gpu gpu, pl_renderer renderer,
         .hook = l2_output_hook,
         .signature = 0x44564C325452494Dull,
     };
-    const struct pl_hook *hooks[2];
+    struct pl_hook radiance_hook = {0};
+    const struct pl_hook *hooks[3];
     bool gpu_fire_pop = a.fire_pop_strength > 0.0f;
     bool gpu_l2 = false;
+    bool gpu_radiance = false;
+    struct pl_ml_render_result ml_result = {0};
+    bool have_ml_result = false;
 
     /* Apply user-supplied spline constants — negative sentinel means keep default */
 #define APPLY_IF_SET(field, arg) if ((arg) >= 0.0f) cmap.tone_constants.field = (arg)
@@ -1239,25 +1232,45 @@ static int render_frame_with_decoder(Args a, pl_gpu gpu, pl_renderer renderer,
         /* Predict gamma from the complete canonical feature vector. */
         float content_ratio = a.l1_max_pq / (a.out_nits > 0.01f ? a.out_nits / 10000.0f : 0.02f);
         float predicted_gamma = predict_gamma_from_brightness(content_ratio, a.l1_avg_pq);
-        bool native_model_used = false;
-        if (ml_context && a.gamma_mode == DV_CONTROL_AUTO) {
-            float features[88];
-            struct pl_ml_prediction prediction;
-            if (build_gamma_model_features(gpu, &image, &a, features) &&
-                pl_ml_context_predict(ml_context, features, 88, &prediction)) {
-                predicted_gamma = prediction.gamma;
-                native_model_used = true;
-                fprintf(stderr, "Native ML gamma: %.3f (88 features)\n", predicted_gamma);
-            } else {
-                fprintf(stderr, "Native ML gamma unavailable; using heuristic fallback\n");
-            }
+        have_ml_result = pl_ml_render_evaluate(gpu, &image, pl_ml_render_params(
+            .model = ml_context,
+            .gamma_mode = (enum pl_ml_control_mode)a.gamma_mode,
+            .gamma = a.contrast_gamma,
+            .cr_mode = (enum pl_ml_control_mode)a.cr_mode,
+            .cr_strength = a.cr_strength,
+            .fire_pop_mode = (enum pl_ml_control_mode)a.fire_pop_mode,
+            .fire_pop_strength = a.fire_pop_strength,
+            .radiance = {
+                .mode = (enum pl_ml_control_mode)a.radiance_mode,
+                .knee = a.radiance_knee,
+                .strength = a.radiance_strength,
+            },
+            .target_nits = a.out_nits,
+            .l1_max_pq = a.l1_max_pq,
+            .l1_avg_pq = a.l1_avg_pq,
+            .top_bar_norm = a.top_bar_norm,
+            .bottom_bar_norm = a.bot_bar_norm), &ml_result);
+        if (!have_ml_result) {
+            fprintf(stderr, "Native ML render evaluation unavailable; using heuristic fallback\n");
+            ml_result.gamma = a.gamma_mode == DV_CONTROL_MANUAL ? a.contrast_gamma :
+                a.gamma_mode == DV_CONTROL_OFF ? 1.0f : predicted_gamma;
+            ml_result.l2_power = 2048.0f / ml_result.gamma;
+            ml_result.l2_saturation = 2048.0f;
+            ml_result.cr_strength = a.cr_mode == DV_CONTROL_MANUAL ? a.cr_strength :
+                a.cr_mode == DV_CONTROL_OFF ? 0.0f : fmaxf(0.1f, fminf(0.5f,
+                    0.25f + (1.2f - ml_result.gamma) * 0.15f));
+            pl_ml_radiance_configure(&ml_result.radiance, pl_ml_radiance_params(
+                .mode = (enum pl_ml_control_mode)a.radiance_mode,
+                .average_luma = a.l1_avg_pq,
+                .knee = a.radiance_knee,
+                .strength = a.radiance_strength));
         }
+        if (ml_result.model_used)
+            fprintf(stderr, "Native ML gamma: %.3f (88 features)\n", ml_result.gamma);
 
-        /* Use predicted gamma unless manually overridden */
-        float gamma = a.gamma_mode == DV_CONTROL_MANUAL ? a.contrast_gamma :
-                  a.gamma_mode == DV_CONTROL_OFF ? 1.0f : predicted_gamma;
-        float power = 2048.0f / gamma;
-        float sat = a.contrast_sat > 0.0f ? a.contrast_sat * 2048.0f : 2048.0f;
+        float gamma = ml_result.gamma;
+        float power = ml_result.l2_power;
+        float sat = ml_result.l2_saturation;
 
         /* Report what was predicted (for verification) */
         fprintf(stderr, "Contrast recovery: gamma=%.3f power=%.0f sat=%.0f "
@@ -1279,16 +1292,15 @@ static int render_frame_with_decoder(Args a, pl_gpu gpu, pl_renderer renderer,
          * Auto-scales based on predicted gamma — punchy scenes get more
          * micro-contrast injection, flat scenes back off to avoid noise. */
         if (a.cr_mode == DV_CONTROL_OFF) {
-            cmap.contrast_recovery = 0.0f;
+            cmap.contrast_recovery = ml_result.cr_strength;
             fprintf(stderr, "  CR strength: off\n");
         } else if (a.cr_mode == DV_CONTROL_MANUAL) {
-            cmap.contrast_recovery = a.cr_strength;
-            fprintf(stderr, "  CR strength: %.3f (explicit)\n", a.cr_strength);
+            cmap.contrast_recovery = ml_result.cr_strength;
+            fprintf(stderr, "  CR strength: %.3f (explicit)\n", cmap.contrast_recovery);
         } else {
             /* Scale inversely: lower gamma → more detail injection.
              * gamma=0.7 → 0.42, gamma=1.0 → 0.28, gamma=1.2 → 0.25 */
-            cmap.contrast_recovery = fmaxf(0.1f, fminf(0.5f,
-                0.25f + (1.2f - gamma) * 0.15f));
+            cmap.contrast_recovery = ml_result.cr_strength;
             fprintf(stderr, "  CR strength: %.3f (auto from gamma %.3f)\n",
                     cmap.contrast_recovery, gamma);
         }
@@ -1306,7 +1318,7 @@ static int render_frame_with_decoder(Args a, pl_gpu gpu, pl_renderer renderer,
         if (frame_info) {
             frame_info->flags = a.gamma_mode == DV_CONTROL_MANUAL ? DV_FRAME_INFO_MANUAL :
                 a.gamma_mode == DV_CONTROL_OFF ? DV_FRAME_INFO_GAMMA_OFF :
-                DV_FRAME_INFO_AUTO | (native_model_used ? DV_FRAME_INFO_MODEL : DV_FRAME_INFO_FALLBACK);
+                DV_FRAME_INFO_AUTO | (ml_result.model_used ? DV_FRAME_INFO_MODEL : DV_FRAME_INFO_FALLBACK);
             frame_info->flags |= a.cr_mode == DV_CONTROL_MANUAL ? DV_FRAME_INFO_CR_MANUAL :
                 a.cr_mode == DV_CONTROL_OFF ? DV_FRAME_INFO_CR_OFF : DV_FRAME_INFO_CR_AUTO;
             frame_info->flags |= a.fire_pop_mode == DV_CONTROL_MANUAL ? DV_FRAME_INFO_FIRE_MANUAL :
@@ -1326,16 +1338,30 @@ static int render_frame_with_decoder(Args a, pl_gpu gpu, pl_renderer renderer,
             a.l2_sat_gain / 2048.0f : 1.0f;
         gpu_l2 = l2_hook_state.gamma != 1.0f || l2_hook_state.saturation != 1.0f;
     }
+    radiance = ml_result.radiance;
+    gpu_radiance = radiance.strength > 0.0f;
+    if (frame_info) {
+        frame_info->flags |= a.radiance_mode == DV_CONTROL_MANUAL ?
+            DV_FRAME_INFO_RADIANCE_MANUAL : a.radiance_mode == DV_CONTROL_AUTO ?
+            DV_FRAME_INFO_RADIANCE_AUTO : DV_FRAME_INFO_RADIANCE_OFF;
+        frame_info->radiance_knee = radiance.knee;
+        frame_info->radiance_strength = radiance.strength;
+    }
     int num_hooks = 0;
     if (gpu_fire_pop)
         hooks[num_hooks++] = &fire_hook;
     if (gpu_l2)
         hooks[num_hooks++] = &l2_hook;
+    if (gpu_radiance)
+        pl_ml_radiance_get_hook(&radiance, &radiance_hook);
+    if (gpu_radiance)
+        hooks[num_hooks++] = &radiance_hook;
     if (num_hooks) {
         rparams.hooks = hooks;
         rparams.num_hooks = num_hooks;
-        fprintf(stderr, "GPU output hooks: fire-pop=%s L2=%s\n",
-                gpu_fire_pop ? "on" : "off", gpu_l2 ? "on" : "off");
+        fprintf(stderr, "GPU output hooks: fire-pop=%s L2=%s radiance=%s\n",
+            gpu_fire_pop ? "on" : "off", gpu_l2 ? "on" : "off",
+            gpu_radiance ? "on" : "off");
     }
 
     /* --- Render --- */
@@ -1940,9 +1966,12 @@ typedef struct {
     float contrast_gamma;
     float cr_strength;
     float fire_pop_strength;
+    float radiance_knee;
+    float radiance_strength;
     enum dv_control_mode gamma_mode;
     enum dv_control_mode cr_mode;
     enum dv_control_mode fire_pop_mode;
+    enum dv_control_mode radiance_mode;
 } ServerRequest;
 
 static bool server_json_number(const char *line, const char *key, double *value)
@@ -1984,9 +2013,12 @@ static bool parse_server_request(const char *line, ServerRequest *request)
     request->contrast_gamma = 0.0f;
     request->cr_strength = -1.0f;
     request->fire_pop_strength = 0.0f;
+    request->radiance_knee = 0.60f;
+    request->radiance_strength = 0.30f;
     request->gamma_mode = DV_CONTROL_AUTO;
     request->cr_mode = DV_CONTROL_AUTO;
     request->fire_pop_mode = DV_CONTROL_OFF;
+    request->radiance_mode = DV_CONTROL_OFF;
 
     const char *key = strstr(line, "\"input\"");
     if (!key) key = strstr(line, "\"mkv_path\"");
@@ -2014,9 +2046,12 @@ static bool parse_server_request(const char *line, ServerRequest *request)
     if (server_json_number(line, "cr_strength", &number)) request->cr_strength = (float)number;
     if (server_json_number(line, "fire_pop_strength", &number))
         request->fire_pop_strength = (float)number;
+    if (server_json_number(line, "radiance_knee", &number)) request->radiance_knee = (float)number;
+    if (server_json_number(line, "radiance_strength", &number)) request->radiance_strength = (float)number;
     request->gamma_mode = server_control_mode(line, "gamma_mode", request->gamma_mode);
     request->cr_mode = server_control_mode(line, "cr_mode", request->cr_mode);
     request->fire_pop_mode = server_control_mode(line, "fire_pop_mode", request->fire_pop_mode);
+    request->radiance_mode = server_control_mode(line, "radiance_mode", request->radiance_mode);
     return request->width > 0 && request->height > 0;
 }
 
@@ -2046,11 +2081,12 @@ static bool write_server_header(const ServerRequest *request)
 
 static bool write_server_frame_info(const struct dv_frame_info *info)
 {
-    return write_u32_le(3) && write_u32_le(28) &&
+    return write_u32_le(3) && write_u32_le(36) &&
            write_u32_le(info->flags) && write_f32_le(info->gamma) &&
            write_f32_le(info->l1_max_pq) && write_f32_le(info->l1_avg_pq) &&
            write_f32_le(info->cr_strength) && write_f32_le(info->l2_power) &&
-           write_f32_le(info->fire_pop_strength);
+           write_f32_le(info->fire_pop_strength) &&
+           write_f32_le(info->radiance_knee) && write_f32_le(info->radiance_strength);
 }
 
 static bool write_server_record(uint32_t mode, const ServerRequest *request,
@@ -2087,6 +2123,9 @@ static bool write_server_record(uint32_t mode, const ServerRequest *request,
     args.cr_mode = request->cr_mode;
     args.fire_pop_strength = request->fire_pop_strength;
     args.fire_pop_mode = request->fire_pop_mode;
+    args.radiance_knee = request->radiance_knee;
+    args.radiance_strength = request->radiance_strength;
+    args.radiance_mode = request->radiance_mode;
     args.mode = mode == 1 ? "spline" : "contrast-recovery";
     args.contrast_recovery = mode == 2;
 

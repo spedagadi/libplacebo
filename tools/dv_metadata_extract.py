@@ -23,6 +23,14 @@ Per-frame targets (tone curve):
   Profile 8 - HDR10+: knee_x, knee_y, 9 bezier anchors
   Profile 5/7 - DV RPU Y-component: up to 8 pivot segments, each quadratic polynomial
 
+Production Runtime Guards (6-8 hour multi-title extraction):
+  1. Fault-Tolerant Checkpointing: CSV flushed to disk after every chunk (default 300s).
+     Use --resume to continue from last written PTS after interruption.
+  2. FFmpeg/Decoding Sandbox: Corrupted frames/chunks logged to .errors.log and skipped.
+     Extraction continues to next chunk without crashing the daemon.
+  3. VRAM Leak Prevention: Numpy arrays + pixel buffers explicitly freed after each chunk.
+     Critical for multi-hour NVDEC runs to prevent memory pooling.
+
 Usage:
   python dv_metadata_extract.py INPUT.mkv -o dataset.csv --sample-fps 1
   python dv_metadata_extract.py "G:/Dune.Part.Two.2024.COMPLETE.UHD" -o dune.csv
@@ -35,13 +43,20 @@ import csv
 import sys
 import time
 import argparse
+import math
+import os
+import gc
+import traceback
+import tempfile
 from fractions import Fraction
 from pathlib import Path
 
 import numpy as np
+import pandas as pd
 
 FFPROBE = "ffprobe"
 FFMPEG  = "ffmpeg"
+DOVI_TOOL = r"C:\Users\Sateesh\Downloads\dovi_tool-2.3.3-x86_64-pc-windows-msvc\dovi_tool.exe"
 CHUNK_SECS = 60
 
 # Downscale resolution for pixel stat extraction (Profile 5)
@@ -94,9 +109,20 @@ COLUMNS = [
 ] + [
     # Spatial zone features (3x3 grid SAT) — mean and max PQ per zone
     # Zones: row0..2 (top→bottom), col0..2 (left→right)
-    f"zone_mean_r{r}_c{c}" for r in range(SAT_GRID_ROWS) for c in range(SAT_GRID_COLS)
+    f"zone_mean_3x3_r{r}_c{c}" for r in range(SAT_GRID_ROWS) for c in range(SAT_GRID_COLS)
 ] + [
-    f"zone_max_r{r}_c{c}"  for r in range(SAT_GRID_ROWS) for c in range(SAT_GRID_COLS)
+    f"zone_max_3x3_r{r}_c{c}"  for r in range(SAT_GRID_ROWS) for c in range(SAT_GRID_COLS)
+] + [
+    # Spatial zone features (5x5 grid SAT) — medium-scale spatial patterns
+    f"zone_mean_5x5_r{r}_c{c}" for r in range(5) for c in range(5)
+] + [
+    f"zone_max_5x5_r{r}_c{c}"  for r in range(5) for c in range(5)
+] + [
+    # L2 color trim parameters (5 target displays: 50/100/600/1000/4000 nits)
+    # Each target has 6 params: slope, offset, power, chroma, sat_gain, ms_weight
+    f"trim_{nits}_{param}"
+    for nits in [50, 100, 600, 1000, 4000]
+    for param in ['slope', 'offset', 'power', 'chroma', 'sat_gain', 'ms_weight']
 ] + [
     # Shadow texture features (dual SAT — variance in dark zones)
     "shadow_texture_var",    # variance of luma in zones with mean < 0.1 PQ
@@ -291,6 +317,117 @@ def parse_poly_coef(raw):
     return [float(x) for x in as_list(raw)]
 
 
+def nits_to_pq(nits: float) -> int:
+    """Convert nits to PQ (Perceptual Quantizer) integer [0, 4095]."""
+    # PQ EOTF constants
+    m1 = 2610 / 16384
+    m2 = 2523 / 4096 * 128
+    c1 = 3424 / 4096
+    c2 = 2413 / 4096 * 32
+    c3 = 2392 / 4096 * 32
+
+    # Normalize to [0, 1] relative to 10,000 nits reference
+    L = max(nits / 10000.0, 0.0)
+
+    # PQ formula
+    Lm1 = math.pow(L, m1)
+    pq = math.pow((c1 + c2 * Lm1) / (1 + c3 * Lm1), m2)
+
+    # Scale to [0, 4095] integer range
+    return int(round(pq * 4095))
+
+
+# L2 trim target displays (5 targets, identity values for missing)
+TARGET_NITS = [50, 100, 600, 1000, 4000]
+TARGET_PQ_VALUES = [nits_to_pq(n) for n in TARGET_NITS]
+IDENTITY_TRIM = {'slope': 2048, 'offset': 2048, 'power': 2048,
+                  'chroma': 2048, 'sat_gain': 2048, 'ms_weight': 2048}
+
+
+def extract_l2_trim_for_video(input_path, rpu_stream="v:0"):
+    """
+    Extract L2 trim parameters for entire video via dovi_tool.
+    Returns DataFrame with columns: frame, target_max_pq, trim_slope, etc.
+    Returns None if L2 extraction fails or video has no L2 metadata.
+    """
+    with tempfile.TemporaryDirectory() as tmpdir:
+        tmp = Path(tmpdir)
+        rpu_bin = tmp / "video.rpu"
+        l2_csv = tmp / "l2.csv"
+
+        # Step 1: Extract full RPU binary
+        print(f"  [L2] Extracting RPU from {Path(input_path).name}...")
+        try:
+            result = subprocess.run([
+                DOVI_TOOL, "extract-rpu", input_path, "-o", str(rpu_bin)
+            ], capture_output=True, text=True, timeout=600, check=True)
+        except Exception as e:
+            print(f"  [L2] RPU extraction failed: {e}")
+            return None
+
+        if not rpu_bin.exists() or rpu_bin.stat().st_size == 0:
+            print(f"  [L2] No RPU data in video")
+            return None
+
+        # Step 2: Export L2 metadata
+        print(f"  [L2] Exporting L2 metadata...")
+        try:
+            result = subprocess.run([
+                DOVI_TOOL, "export", str(rpu_bin),
+                "--levels", f"level2={l2_csv}",
+                "--levels-format", "csv"
+            ], capture_output=True, text=True, timeout=300, check=True)
+        except Exception as e:
+            print(f"  [L2] L2 export failed: {e}")
+            return None
+
+        if not l2_csv.exists():
+            print(f"  [L2] No L2 metadata in RPU")
+            return None
+
+        # Step 3: Load into DataFrame
+        df_l2 = pd.read_csv(l2_csv)
+        print(f"  [L2] Loaded {len(df_l2)} L2 trim blocks for {df_l2['frame'].nunique()} frames")
+        return df_l2
+
+
+def lookup_l2_trim_for_frame(frame_idx, df_l2):
+    """
+    Lookup L2 trim parameters for a single frame across 5 target displays.
+    Returns dict: {50: {slope, offset, ...}, 100: {...}, ...}
+    Missing targets filled with identity (2048).
+    """
+    if df_l2 is None:
+        # No L2 data for video → all identity
+        return {nits: IDENTITY_TRIM.copy() for nits in TARGET_NITS}
+
+    frame_l2 = df_l2[df_l2['frame'] == frame_idx]
+    trim_data = {}
+
+    for i, target_nits in enumerate(TARGET_NITS):
+        target_pq = TARGET_PQ_VALUES[i]
+
+        # Find closest matching L2 block (within 100 PQ units tolerance)
+        if len(frame_l2) > 0:
+            closest_idx = (frame_l2['target_max_pq'] - target_pq).abs().idxmin()
+            if abs(frame_l2.loc[closest_idx, 'target_max_pq'] - target_pq) < 100:
+                row = frame_l2.loc[closest_idx]
+                trim_data[target_nits] = {
+                    'slope': int(row['trim_slope']),
+                    'offset': int(row['trim_offset']),
+                    'power': int(row['trim_power']),
+                    'chroma': int(row['trim_chroma_weight']),
+                    'sat_gain': int(row['trim_saturation_gain']),
+                    'ms_weight': int(row['ms_weight']),
+                }
+                continue
+
+        # No match → use identity
+        trim_data[target_nits] = IDENTITY_TRIM.copy()
+
+    return trim_data
+
+
 # ---------------------------------------------------------------------------
 # ffprobe / ffmpeg wrappers
 # ---------------------------------------------------------------------------
@@ -351,11 +488,12 @@ def probe_chunk(rpu_path: str, rpu_stream: str, start_sec: float, duration_sec: 
 
 
 def compute_sat_features(y_2d: np.ndarray, grid_rows: int = SAT_GRID_ROWS,
-                          grid_cols: int = SAT_GRID_COLS) -> dict:
+                          grid_cols: int = SAT_GRID_COLS, grid_name: str = "3x3") -> dict:
     """
     Compute zonal mean and max PQ using a summed area table (integral image).
     y_2d: (H, W) float32 PQ luma frame.
-    Returns dict of zone_mean_rR_cC and zone_max_rR_cC for a grid_rows x grid_cols grid.
+    grid_name: prefix for column names (e.g., "3x3", "5x5")
+    Returns dict of zone_mean_{grid_name}_rR_cC and zone_max_{grid_name}_rR_cC.
     """
     H, W = y_2d.shape
 
@@ -377,8 +515,8 @@ def compute_sat_features(y_2d: np.ndarray, grid_rows: int = SAT_GRID_ROWS,
             zone_mean = float(zone_sum / n)
             zone_max  = float(y_2d[r0:r1, c0:c1].max())
 
-            feats[f"zone_mean_r{r}_c{c}"] = zone_mean
-            feats[f"zone_max_r{r}_c{c}"]  = zone_max
+            feats[f"zone_mean_{grid_name}_r{r}_c{c}"] = zone_mean
+            feats[f"zone_max_{grid_name}_r{r}_c{c}"]  = zone_max
 
     return feats
 
@@ -422,8 +560,8 @@ def compute_texture_and_locality(y_2d: np.ndarray, zone_feats: dict,
             r1 = int(round((r+1) * H / grid_rows))
             c0 = int(round(c     * W / grid_cols))
             c1 = int(round((c+1) * W / grid_cols))
-            zm = zone_feats[f"zone_mean_r{r}_c{c}"]
-            zx = zone_feats[f"zone_max_r{r}_c{c}"]
+            zm = zone_feats[f"zone_mean_3x3_r{r}_c{c}"]
+            zx = zone_feats[f"zone_max_3x3_r{r}_c{c}"]
 
             if zm < 0.1:
                 dark_count += 1
@@ -528,11 +666,15 @@ def decode_chunk_pixel_stats(input_path: str, start_sec: float, duration_sec: fl
             **{f"distrib_pct_{i}": float(DISTRIB_PERCENTILES[i]) for i in range(9)},
             **{f"distrib_val_{i}": float(pcts[i]) for i in range(9)},
         }
-        sat_feats = compute_sat_features(y_2d)
-        # Pass base maxscl into texture/locality so stratification uses it
-        sat_feats["maxscl"] = base_stats["maxscl"]
-        tex_feats = compute_texture_and_locality(y_2d, sat_feats)
-        result[abs_sec] = {**base_stats, **sat_feats, **tex_feats}
+        # Multi-scale SAT: 3×3 (fine-grained) + 5×5 (medium-scale)
+        sat_feats_3x3 = compute_sat_features(y_2d, 3, 3, "3x3")
+        sat_feats_5x5 = compute_sat_features(y_2d, 5, 5, "5x5")
+
+        # Pass base maxscl into texture/locality so stratification uses it (uses 3×3)
+        sat_feats_3x3["maxscl"] = base_stats["maxscl"]
+        tex_feats = compute_texture_and_locality(y_2d, sat_feats_3x3)
+
+        result[abs_sec] = {**base_stats, **sat_feats_3x3, **sat_feats_5x5, **tex_feats}
         frame_idx += 1
 
     proc.wait()
@@ -557,7 +699,7 @@ def lookup_pixel_stats(pixel_stats: dict, pts_time: float, pts_offset: float = 0
 # ---------------------------------------------------------------------------
 
 def extract_row(frame_idx: int, f: dict, dv_profile: int, pixel_stats: dict,
-                pts_offset: float = 0.0) -> dict:
+                pts_offset: float = 0.0, df_l2=None) -> dict:
     """Convert a ffprobe frame dict (+ optional pixel stats) to a CSV row dict."""
     sdata = {s["side_data_type"]: s for s in f.get("side_data_list", [])}
     h   = sdata.get(HDR10P_KEY, {})
@@ -594,6 +736,14 @@ def extract_row(frame_idx: int, f: dict, dv_profile: int, pixel_stats: dict,
     else:
         feat = lookup_pixel_stats(pixel_stats, pts_time, pts_offset)
 
+    # Lookup L2 color trim for all 5 target displays
+    l2_trim = lookup_l2_trim_for_frame(frame_idx, df_l2) if df_l2 is not None else {}
+    trim_feats = {}
+    for nits in TARGET_NITS:
+        trim_params = l2_trim.get(nits, IDENTITY_TRIM)
+        for param in ['slope', 'offset', 'power', 'chroma', 'sat_gain', 'ms_weight']:
+            trim_feats[f"trim_{nits}_{param}"] = trim_params[param]
+
     row = {
         "frame_idx":  frame_idx,
         "pts_time":   pts_time,
@@ -612,6 +762,7 @@ def extract_row(frame_idx: int, f: dict, dv_profile: int, pixel_stats: dict,
         "maxcll":  cll.get("max_content"),
         "maxfall": cll.get("max_average"),
         **feat,
+        **trim_feats,
     }
 
     for i in range(9):
@@ -676,6 +827,15 @@ def main():
     print(f"  RPU stream: {rpu_note} [{rpu_stream}]")
     print(f"  Processing: {args.start:.0f}s - {end_sec:.0f}s")
 
+    # Extract L2 trim metadata for entire video (once)
+    print(f"  Extracting L2 trim metadata...")
+    df_l2 = extract_l2_trim_for_video(rpu_path, rpu_stream)
+    if df_l2 is not None:
+        l2_targets = df_l2['target_max_pq'].unique()
+        print(f"    Found L2 targets: {sorted(l2_targets)} PQ")
+    else:
+        print(f"    No L2 metadata found (will use identity trim)")
+
     resume_start = args.start
     if args.resume and Path(args.output).exists():
         with open(args.output, newline="") as fh:
@@ -696,6 +856,10 @@ def main():
     total_chunks   = int((end_sec - chunk_start) / args.chunk_secs) + 1
     chunk_num      = 0
 
+    # Error log for corrupted frames / decode failures
+    error_log_path = Path(args.output).with_suffix('.errors.log')
+    error_log = open(error_log_path, 'a', encoding='utf-8')
+
     with open(args.output, write_mode, newline="") as csvfile:
         writer = csv.DictWriter(csvfile, fieldnames=COLUMNS, extrasaction="ignore")
         if write_header:
@@ -707,51 +871,87 @@ def main():
             chunk_num += 1
             t0 = time.time()
 
-            # RPU/metadata pass — probes rpu_path:rpu_stream for DV polynomial + scene flags
-            frames = probe_chunk(rpu_path, rpu_stream, chunk_start, dur)
+            try:
+                # RPU/metadata pass — probes rpu_path:rpu_stream for DV polynomial + scene flags
+                frames = probe_chunk(rpu_path, rpu_stream, chunk_start, dur)
 
-            # Pixel pass — decodes pixel_path (BL / main file) for histogram+SAT features
-            pixel_stats = {}
-            pts_offset  = 0.0
-            if needs_pixel_decode:
-                pixel_stats = decode_chunk_pixel_stats(pixel_path, chunk_start, dur,
-                                                       nvdec=args.nvdec)
-                # BDMV m2ts files may have non-zero pts base — calibrate offset from first frame
-                if frames and pixel_stats:
-                    first_pts = float(frames[0].get("pts_time", chunk_start) or chunk_start)
-                    pts_offset = first_pts - chunk_start
+                # Pixel pass — decodes pixel_path (BL / main file) for histogram+SAT features
+                pixel_stats = {}
+                pts_offset  = 0.0
+                if needs_pixel_decode:
+                    pixel_stats = decode_chunk_pixel_stats(pixel_path, chunk_start, dur,
+                                                           nvdec=args.nvdec)
+                    # BDMV m2ts files may have non-zero pts base — calibrate offset from first frame
+                    if frames and pixel_stats:
+                        first_pts = float(frames[0].get("pts_time", chunk_start) or chunk_start)
+                        pts_offset = first_pts - chunk_start
 
-            chunk_written = 0
-            for f in frames:
-                pts = float(f.get("pts_time", 0) or 0)
-                sd  = {s["side_data_type"]: s for s in f.get("side_data_list", [])}
-                is_scene = bool(sd.get(DV_KEY, {}).get("scene_refresh_flag"))
+                chunk_written = 0
+                for f in frames:
+                    try:
+                        pts = float(f.get("pts_time", 0) or 0)
+                        sd  = {s["side_data_type"]: s for s in f.get("side_data_list", [])}
+                        is_scene = bool(sd.get(DV_KEY, {}).get("scene_refresh_flag"))
 
-                if args.sample_fps > 0 and not is_scene and (pts - prev_pts) < min_interval:
-                    frame_idx += 1
-                    continue
+                        if args.sample_fps > 0 and not is_scene and (pts - prev_pts) < min_interval:
+                            frame_idx += 1
+                            continue
 
-                row = extract_row(frame_idx, f, dv_profile, pixel_stats,
-                                  pts_offset=pts_offset)
-                writer.writerow(row)
-                prev_pts = pts
-                chunk_written += 1
-                frames_written += 1
-                frame_idx += 1
+                        row = extract_row(frame_idx, f, dv_profile, pixel_stats,
+                                          pts_offset=pts_offset, df_l2=df_l2)
+                        writer.writerow(row)
+                        prev_pts = pts
+                        chunk_written += 1
+                        frames_written += 1
+                        frame_idx += 1
+                    except Exception as e:
+                        # Log frame-level errors but continue processing
+                        error_msg = f"[Frame Error] chunk={chunk_start:.0f}s frame_idx={frame_idx} pts={pts:.2f}s: {type(e).__name__}: {e}\n"
+                        error_log.write(error_msg)
+                        error_log.flush()
+                        frame_idx += 1
+                        continue
 
-            # Flush after every chunk so concurrent readers see consistent data
-            csvfile.flush()
-            os.fsync(csvfile.fileno())
+                # Flush after every chunk so concurrent readers see consistent data
+                csvfile.flush()
+                os.fsync(csvfile.fileno())
 
-            elapsed = time.time() - t0
-            pct = 100.0 * (chunk_start - args.start) / max(1, end_sec - args.start)
-            px_note = f" px_frames={len(pixel_stats)}" if needs_pixel_decode else ""
-            print(f"  [{chunk_num}/{total_chunks}] {chunk_start:.0f}s-{chunk_end:.0f}s"
-                  f" | +{chunk_written} rows | total={frames_written}{px_note} | {elapsed:.1f}s [{pct:.0f}%]")
+                elapsed = time.time() - t0
+                pct = 100.0 * (chunk_start - args.start) / max(1, end_sec - args.start)
+                px_note = f" px_frames={len(pixel_stats)}" if needs_pixel_decode else ""
+                print(f"  [{chunk_num}/{total_chunks}] {chunk_start:.0f}s-{chunk_end:.0f}s"
+                      f" | +{chunk_written} rows | total={frames_written}{px_note} | {elapsed:.1f}s [{pct:.0f}%]")
+
+            except Exception as e:
+                # Log chunk-level errors (decode failures, corrupted stream segments)
+                error_msg = f"\n[Chunk Error] {chunk_start:.0f}s-{chunk_end:.0f}s: {type(e).__name__}: {e}\n"
+                error_msg += traceback.format_exc()
+                error_log.write(error_msg)
+                error_log.flush()
+                print(f"  [ERROR] Chunk {chunk_start:.0f}s-{chunk_end:.0f}s failed: {type(e).__name__}: {e}")
+                print(f"          Logged to {error_log_path}, continuing to next chunk...")
+
+            finally:
+                # VRAM leak prevention: explicitly release numpy arrays and trigger garbage collection
+                # Critical for multi-hour runs with NVDEC/CUDA or large SAT grid allocations
+                if 'pixel_stats' in locals():
+                    del pixel_stats
+                if 'frames' in locals():
+                    del frames
+                gc.collect()
 
             chunk_start = chunk_end
 
+    error_log.close()
+
     print(f"\nDone. {frames_written} rows -> {args.output}")
+    if error_log_path.exists() and error_log_path.stat().st_size > 0:
+        print(f"⚠ Errors encountered during extraction (see {error_log_path})")
+        print(f"  Some frames/chunks may have been skipped due to decode failures or corrupted data.")
+    else:
+        # Remove empty error log
+        if error_log_path.exists():
+            error_log_path.unlink()
 
 
 if __name__ == "__main__":

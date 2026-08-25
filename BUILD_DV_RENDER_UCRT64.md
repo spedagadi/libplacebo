@@ -47,6 +47,72 @@ writes raw frame data there. To keep the raw output, add:
 Do not add `> output.raw` after the command when using `--output`; choose one
 output method.
 
+## Persistent server mode
+
+`dv_render --server` reads one JSON object per line from stdin and writes one
+binary response per valid request to stdout. The server retains the D3D11 GPU,
+libplacebo renderer, and native FFmpeg decoder between requests. A decoder is
+opened when the input path changes; forward requests decode from the current
+demuxer position, while backward or non-sequential requests seek and flush the
+same codec. The selected frame is cloned into decoder-owned state, so both
+server output records for one request can safely render the same frame without
+advancing the decoder. Decoder open/reuse, hardware/software selection,
+sequential decode, and seek/reset diagnostics go to stderr.
+
+Request fields are `input` (or legacy alias `mkv_path`), `pts`, and optional
+`width`, `height`, `l1_max`, `l1_avg`, and `fire_pop_strength`:
+
+```json
+{"input":"/g/movie.mkv","pts":72.5,"width":1920,"height":1080,"l1_max":1.0,"l1_avg":0.2}
+```
+
+Each response is little-endian and has this framing:
+
+```text
+4 bytes  magic "DVR1"
+u32      version (1)
+u32      width
+u32      height
+u32      frame_count (2)
+repeat twice:
+  u32    mode (1=spline, 2=contrast-recovery)
+  u32    payload length (= width*height*3)
+  bytes  packed RGB8, row-major, RGB order
+```
+
+The server emits no JSON or diagnostics on stdout. libplacebo and request
+errors remain on stderr. The response is streamed after the header, so a
+consumer must read exactly each declared payload length before sending the
+next request.
+
+## Opt-in playback server
+
+`dv_render --playback-server` is a separate protocol for sequential playback
+experiments. It keeps the same D3D11 hardware decoder selection and native
+decoder across requests, feeds decoded frames into a persistent `pl_queue`,
+and resets the queue when the requested timeline moves backward or the input
+changes. Requests use the same JSON fields as `--server` (`input` or
+`mkv_path`, `pts`, and optional `width`, `height`, `out_nits`, `l1_max`,
+`l1_avg`, `contrast_gamma`, `cr_strength`, and `fire_pop_strength`).
+
+Each response is little-endian and has this framing:
+
+```text
+4 bytes  magic "DVRP"
+u32      version (1)
+u32      width
+u32      height
+u32      selected PTS in milliseconds
+u32      payload length (= width*height*3)
+bytes    packed RGB8, row-major, RGB order
+```
+
+The playback increment uses `pl_queue` for sequential source-frame caching and
+selection, but deliberately retains the existing diagnostic renderer's direct
+single-frame map/output path. It does not enable interpolation, temporal
+smoothing, scene-cut detection, or multi-frame mixing. Decode, queue/map, and
+render timings are reported on stderr; stdout contains only DVRP responses.
+
 ## 1. Close conflicting processes
 
 Before starting:
