@@ -5,6 +5,10 @@
  * full libplacebo colour pipeline under one of three tone-mapping modes, and
  * writes the result as raw RGB8 (24 bpp, row-major) to stdout.
  *
+ * Server mode keeps the D3D11/libplacebo context and renderer alive. It accepts
+ * one JSON request per line and returns a DVR1 response containing spline and
+ * contrast-recovery RGB8 frames.
+ *
  * Modes:
  *   gold   — DV RPU polynomial (map_dowi=true, libplacebo applies RPU curve)
  *   spline — libplacebo pl_tone_map_spline driven by L1 metadata
@@ -35,7 +39,9 @@
 #include <libavformat/avformat.h>
 #include <libavcodec/avcodec.h>
 #include <libavutil/frame.h>
+#include <libavutil/hwcontext.h>
 #include <libavutil/pixdesc.h>
+#include <libavutil/time.h>
 
 #include <libplacebo/log.h>
 #include <libplacebo/renderer.h>
@@ -44,6 +50,10 @@
 #include <libplacebo/colorspace.h>
 #include <libplacebo/tone_mapping.h>
 #include <libplacebo/dither.h>
+#include <libplacebo/utils/frame_queue.h>
+#include <libplacebo/shaders/custom.h>
+#include <libplacebo/ml_features.h>
+#include <libplacebo/ml_model.h>
 
 #define PL_LIBAV_IMPLEMENTATION 1
 #include <libplacebo/utils/libav.h>
@@ -100,6 +110,105 @@ static const float *get_blue_noise_matrix(void)
         initialized = true;
     }
     return matrix;
+}
+
+struct fire_pop_hook_state {
+    float strength;
+};
+
+struct l2_hook_state {
+    float gamma;
+    float saturation;
+};
+
+static struct pl_hook_res fire_pop_output_hook(void *priv,
+                                                const struct pl_hook_params *params)
+{
+    struct fire_pop_hook_state *state = priv;
+    pl_shader sh = params->sh;
+    static const char body[] =
+        "float y = dot(color.rgb, vec3(0.2126, 0.7152, 0.0722));\n"
+        "float t = clamp((y - 0.45) / 0.40, 0.0, 1.0);\n"
+        "float envelope_t = t * t * (3.0 - 2.0 * t);\n"
+        "float sine = sin(3.141592653589793 * envelope_t);\n"
+        "float envelope = sine * sine;\n"
+        "float cr = color.r - y;\n"
+        "float cb = color.b - y;\n"
+        "if (y > 0.45 && cr > 0.08 && cb < -0.01) {\n"
+        "    cr *= 1.0 + 0.12 * envelope * fire_strength;\n"
+        "    cb *= 1.0 + 0.08 * envelope * fire_strength;\n"
+        "    color.r = clamp(y + cr, 0.0, 1.0);\n"
+        "    color.b = clamp(y + cb, 0.0, 1.0);\n"
+        "    color.g = clamp(y - 0.2126 / 0.7152 * cr - "
+        "0.0722 / 0.7152 * cb, 0.0, 1.0);\n"
+        "}\n";
+    struct pl_shader_var var = {
+        .var = pl_var_float("fire_strength"),
+        .data = &state->strength,
+        .dynamic = true,
+    };
+    if (!pl_shader_custom(sh, &(struct pl_custom_shader) {
+        .description = "GPU fire-pop output hook",
+        .body = body,
+        .input = PL_SHADER_SIG_COLOR,
+        .output = PL_SHADER_SIG_COLOR,
+        .variables = &var,
+        .num_variables = 1,
+        .output_w = pl_rect_w(params->dst_rect),
+        .output_h = pl_rect_h(params->dst_rect),
+    })) {
+        return (struct pl_hook_res) { .failed = true };
+    }
+    return (struct pl_hook_res) {
+        .output = PL_HOOK_SIG_COLOR,
+        .sh = sh,
+        .repr = params->repr,
+        .color = params->color,
+        .components = params->components,
+        .rect = params->rect,
+    };
+}
+
+static struct pl_hook_res l2_output_hook(void *priv,
+                                          const struct pl_hook_params *params)
+{
+    struct l2_hook_state *state = priv;
+    pl_shader sh = params->sh;
+    static const char body[] =
+        "float y = dot(color.rgb, vec3(0.2126, 0.7152, 0.0722));\n"
+        "float cb = (color.b - y) * l2_saturation;\n"
+        "float cr = (color.r - y) * l2_saturation;\n"
+        "if (l2_gamma != 1.0 && y > 0.001 && y < 0.999) {\n"
+        "    float t = 2.0 * y - 1.0;\n"
+        "    y = 0.5 * (sign(t) * pow(abs(t), l2_gamma) + 1.0);\n"
+        "}\n"
+        "color.r = clamp(y + cr, 0.0, 1.0);\n"
+        "color.g = clamp(y - 0.2126 / 0.7152 * cr - 0.0722 / 0.7152 * cb, 0.0, 1.0);\n"
+        "color.b = clamp(y + cb, 0.0, 1.0);\n";
+    struct pl_shader_var vars[] = {
+        { .var = pl_var_float("l2_gamma"), .data = &state->gamma, .dynamic = true },
+        { .var = pl_var_float("l2_saturation"), .data = &state->saturation, .dynamic = true },
+    };
+    if (!pl_shader_custom(sh, &(struct pl_custom_shader) {
+        .description = "GPU L2 gamma and saturation trim",
+        .body = body,
+        .input = PL_SHADER_SIG_COLOR,
+        .output = PL_SHADER_SIG_COLOR,
+        .variables = vars,
+        .num_variables = 2,
+        .output_w = pl_rect_w(params->dst_rect),
+        .output_h = pl_rect_h(params->dst_rect),
+    })) {
+        return (struct pl_hook_res) { .failed = true };
+    }
+    return (struct pl_hook_res) {
+        .output = PL_HOOK_SIG_COLOR,
+        .sh = sh,
+        .repr = params->repr,
+        .color = params->color,
+        .components = params->components,
+        .rect = params->rect,
+    };
 }
 
 /* -------------------------------------------------------------------------
@@ -181,43 +290,36 @@ static float predict_knee_point_from_stats(float maxscl, float avg_pq,
  * Performance on D3D11: ~1.2M workgroups at 640×360, 16×16 threads → ~5ms
  */
 static const char *bilateral_filter_glsl =
-    "#version 330\n"
-    "#extension GL_ARB_compute_shader : require\n"
-    "#extension GL_ARB_shader_image_access : require\n"
+    "#version 450\n"
     "\n"
     "layout (local_size_x = 16, local_size_y = 16, local_size_z = 1) in;\n"
     "\n"
-    "uniform sampler2D u_input;\n"
-    "uniform float u_radius;\n"
-    "uniform float u_sigma_s;\n"
-    "uniform float u_sigma_r;\n"
-    "uniform float u_boost;\n"
-    "uniform float u_size_x;\n"
-    "uniform float u_size_y;\n"
+    "layout (binding = 0) uniform sampler2D u_input;\n"
     "\n"
     "layout (r32f, binding = 0) uniform image2D u_output;\n"
     "\n"
     "void main()\n"
     "{\n"
     "    vec2 pos = vec2(gl_GlobalInvocationID.xy);\n"
-    "    if (pos.x >= u_size_x || pos.y >= u_size_y) return;\n"
+    "    vec2 size = vec2(textureSize(u_input, 0));\n"
+    "    if (pos.x >= size.x || pos.y >= size.y) return;\n"
     "    ivec2 ipos = ivec2(pos);\n"
     "\n"
-    "    float center = texture(u_input, pos / vec2(u_size_x, u_size_y)).x;\n"
+    "    float center = texture(u_input, pos / size).x;\n"
     "\n"
-    "    float r = u_radius;\n"
-    "    float inv2ss = -1.0 / (2.0 * u_sigma_s * u_sigma_s);\n"
-    "    float inv2sr = -1.0 / (2.0 * u_sigma_r * u_sigma_r);\n"
+    "    const float r = 4.0;\n"
+    "    const float inv2ss = -1.0 / (2.0 * 3.0 * 3.0);\n"
+    "    const float inv2sr = -1.0 / (2.0 * 15.0 * 15.0);\n"
     "    float w_sum = 0.0;\n"
     "    float y_sum = 0.0;\n"
     "\n"
     "    for (float fy = -r; fy <= r; fy++) {\n"
     "        for (float fx = -r; fx <= r; fx++) {\n"
     "            ivec2 np = ipos + ivec2(int(fx), int(fy));\n"
-    "            if (np.x < 0 || np.x >= int(u_size_x) ||\n"
-    "                np.y < 0 || np.y >= int(u_size_y)) continue;\n"
+    "            if (np.x < 0 || np.x >= int(size.x) ||\n"
+    "                np.y < 0 || np.y >= int(size.y)) continue;\n"
     "\n"
-    "            float ny = texture(u_input, vec2(np) / vec2(u_size_x, u_size_y)).x;\n"
+    "            float ny = texture(u_input, vec2(np) / size).x;\n"
     "            float dx = fx, dy = fy;\n"
     "            float sw = exp((dx*dx + dy*dy) * inv2ss);\n"
     "            float yd = ny - center;\n"
@@ -231,39 +333,41 @@ static const char *bilateral_filter_glsl =
     "\n"
     "    float blurred = (w_sum > 0.0) ? (y_sum / w_sum) : center;\n"
     "    float detail = center - blurred;\n"
-    "    float boosted = center + detail * u_boost;\n"
+    "    float boosted = center + detail * 0.8;\n"
     "    imageStore(u_output, ipos, vec4(boosted, 0.0, 0.0, 1.0));\n"
     "}\n";
 
 /* --- GPU CR: pass variable & descriptor definitions --- */
-#define NUM_CR_VARS 6
+#define NUM_CR_VARS 0
 #define NUM_CR_DESCS 2
-#define NUM_CR_UPDATES 6
 
 static struct pl_var cr_vars[NUM_CR_VARS];
 static struct pl_desc cr_descs[NUM_CR_DESCS];
 
+
 /* Initialize cr_vars and cr_descs (called once at startup) */
 static void init_cr_vars(void)
 {
-    cr_vars[0] = pl_var_float("u_radius");
-    cr_vars[1] = pl_var_float("u_sigma_s");
-    cr_vars[2] = pl_var_float("u_sigma_r");
-    cr_vars[3] = pl_var_float("u_boost");
-    cr_vars[4] = pl_var_float("u_size_x");
-    cr_vars[5] = pl_var_float("u_size_y");
 
     cr_descs[0] = (struct pl_desc){
         .name   = "u_input",
         .type   = PL_DESC_SAMPLED_TEX,
+        .binding = 0,
         .access = PL_DESC_ACCESS_READONLY,
     };
     cr_descs[1] = (struct pl_desc){
         .name   = "u_output",
         .type   = PL_DESC_STORAGE_IMG,
+        .binding = 1,
         .access = PL_DESC_ACCESS_WRITEONLY,
     };
 }
+
+enum dv_control_mode {
+    DV_CONTROL_OFF,
+    DV_CONTROL_AUTO,
+    DV_CONTROL_MANUAL,
+};
 
 typedef struct {
     const char *input;
@@ -294,18 +398,25 @@ typedef struct {
     float       l2_sat_gain;    /* 2048=neutral, >2048=more saturation. -1=disabled */
     /* HDR contrast recovery mode: auto-predicts gamma from scene stats, applies L2 trim */
     int         contrast_recovery; /* 1=enable auto contrast recovery */
+    enum dv_control_mode gamma_mode;
     float       contrast_gamma;   /* manual override for gamma in contrast-recovery mode */
     float       contrast_sat;     /* manual override for saturation in contrast-recovery mode */
     /* Specular highlight roll-off (piecewise L2 trim) — deferred to XGBoost model */
     float       highlight_knee;   /* reserved: 0.0-1.0, default: auto from scene stats */
     /* Libplacebo HDR contrast recovery (high-frequency detail injection) */
     float       cr_strength;      /* 0.0-0.5, default: auto from predicted gamma */
+    enum dv_control_mode cr_mode;
     float       cr_smoothness;    /* >1.0, default: 2.5 (tighter halos on fine textures) */
     /* Luma-Weighted Warm Chroma Reshaping (fire pop) — boosts orange/red density
      * for high-luma warm pixels (explosions, fire, incandescent sources).
      * Three phases: specular desaturation (core white-hot), mid-flame body
      * saturation injection, anti-pink hue constraint. */
     float       fire_pop_strength;/* 0.0-2.0, default 1.0 (scales chroma boost scalars) */
+    enum dv_control_mode fire_pop_mode;
+    int         server;
+    int         playback_server;
+    bool        write_output;
+    const char *model_path;
 } Args;
 
 static void usage(const char *argv0)
@@ -338,10 +449,18 @@ static void usage(const char *argv0)
         "          [--cr-smoothness <1.0-5.0>]  default: 2.5 (tighter than libplacebo 3.5 default)\n"
         "  Luma-Weighted Warm Chroma Reshaping (fire pop):\n"
         "          [--fire-pop-strength <0-2.0>]    0=off, 1.0=default, scales boost\n"
+        "          [--model <xgb_model.plxgb>]     load native ML model at startup\n"
+        "          [--no-output]                  render on GPU without diagnostic readback\n"
         "  Manual L2 trim (overrides contrast-recovery):\n"
         "          [--l2-power <val>]           2048=neutral, <2048=more contrast\n"
         "          [--l2-sat-gain <val>]        2048=neutral, >2048=more saturation\n"
-        "Output: raw RGB8 to stdout\n", argv0);
+        "Output: raw RGB8 to stdout\n"
+        "Server mode: %s --server < requests.jsonl > responses.bin\n"
+        "Playback server: %s --playback-server < requests.jsonl > responses.bin\n"
+        "  request:  {\"input\":\"file.mkv\",\"pts\":12.3,\"width\":1920,\"height\":1080,\"l1_max\":1.0,\"l1_avg\":0.2}\n"
+        "  response: DVR1/u32 version,width,height,count, then two mode/length records and RGB8 payloads\n"
+        "  playback response: DVRP/u32 version,width,height,pts_ms,payload_len, then RGB8 payload\n",
+        argv0, argv0, argv0);
 }
 
 static bool parse_args(int argc, char **argv, Args *a)
@@ -362,15 +481,23 @@ static bool parse_args(int argc, char **argv, Args *a)
     a->l2_power    = -1.f;
     a->l2_sat_gain = -1.f;
     a->contrast_recovery = 0;
+    a->gamma_mode = DV_CONTROL_AUTO;
     a->contrast_gamma  = 0.f;  /* 0 = auto-predict */
     a->contrast_sat    = 1.f;  /* 1.0 = neutral */
     a->highlight_knee  = -1.f;  /* -1 = auto-predict from scene stats */
     a->cr_strength     = -1.f;  /* -1 = auto-scale from gamma */
+    a->cr_mode         = DV_CONTROL_AUTO;
     a->cr_smoothness   = -1.f;  /* -1 = use 2.5 default */
     a->fire_pop_strength = 0.f;  /* 0 = disabled (not enabled unless explicitly set) */
+    a->fire_pop_mode = DV_CONTROL_OFF;
+    a->write_output = true;
 
     for (int i = 1; i < argc; i++) {
-        if      (!strcmp(argv[i], "--input")            && i+1 < argc) { a->input           = argv[++i]; }
+        if      (!strcmp(argv[i], "--server")) { a->server = 1; }
+        else if (!strcmp(argv[i], "--playback-server")) { a->playback_server = 1; }
+        else if (!strcmp(argv[i], "--no-output")) { a->write_output = false; }
+        else if (!strcmp(argv[i], "--model") && i + 1 < argc) { a->model_path = argv[++i]; }
+        else if (!strcmp(argv[i], "--input")            && i+1 < argc) { a->input           = argv[++i]; }
         else if (!strcmp(argv[i], "--pts")              && i+1 < argc) { a->pts             = atof(argv[++i]); }
         else if (!strcmp(argv[i], "--mode")             && i+1 < argc) { a->mode            = argv[++i]; }
         else if (!strcmp(argv[i], "--lut")              && i+1 < argc) { a->lut_file        = argv[++i]; }
@@ -393,15 +520,17 @@ static bool parse_args(int argc, char **argv, Args *a)
         else if (!strcmp(argv[i], "--l2-power")           && i+1 < argc) { a->l2_power    = atof(argv[++i]); }
         else if (!strcmp(argv[i], "--l2-sat-gain")        && i+1 < argc) { a->l2_sat_gain = atof(argv[++i]); }
         else if (!strcmp(argv[i], "--contrast-recovery")  && i+1 < argc) { a->contrast_recovery = atoi(argv[++i]); }
-        else if (!strcmp(argv[i], "--contrast-gamma")     && i+1 < argc) { a->contrast_gamma = atof(argv[++i]); }
+        else if (!strcmp(argv[i], "--contrast-gamma")     && i+1 < argc) { a->contrast_gamma = atof(argv[++i]); a->gamma_mode = DV_CONTROL_MANUAL; }
         else if (!strcmp(argv[i], "--contrast-sat")       && i+1 < argc) { a->contrast_sat = atof(argv[++i]); }
-        else if (!strcmp(argv[i], "--cr-strength")        && i+1 < argc) { a->cr_strength  = atof(argv[++i]); }
+        else if (!strcmp(argv[i], "--cr-strength")        && i+1 < argc) { a->cr_strength  = atof(argv[++i]); a->cr_mode = DV_CONTROL_MANUAL; }
         else if (!strcmp(argv[i], "--cr-smoothness")      && i+1 < argc) { a->cr_smoothness= atof(argv[++i]); }
         else if (!strcmp(argv[i], "--highlight-knee")     && i+1 < argc) { a->highlight_knee = atof(argv[++i]); }
-        else if (!strcmp(argv[i], "--fire-pop-strength")  && i+1 < argc) { a->fire_pop_strength = atof(argv[++i]); }
+        else if (!strcmp(argv[i], "--fire-pop-strength")  && i+1 < argc) { a->fire_pop_strength = atof(argv[++i]); a->fire_pop_mode = DV_CONTROL_MANUAL; }
         else if (!strcmp(argv[i], "--contrast-recovery")) { a->contrast_recovery = 1; }
         else { fprintf(stderr, "Unknown argument: %s\n", argv[i]); return false; }
     }
+    if (a->server || a->playback_server)
+        return true;
     if (!a->input || !a->mode || a->pts < 0) {
         fprintf(stderr, "Missing required arguments.\n");
         return false;
@@ -615,44 +744,226 @@ fail:
     return NULL;
 }
 
-/* -------------------------------------------------------------------------
- * Main
- * ---------------------------------------------------------------------- */
-int main(int argc, char **argv)
+typedef struct {
+    AVFormatContext *format;
+    AVCodecContext *codec;
+    AVStream *stream;
+    int stream_index;
+    AVPacket *packet;
+    AVFrame *frame;
+    AVFrame *last_frame;
+    int64_t last_decoded_pts;
+    double last_pts;
+    bool have_last;
+    char input[2048];
+    pl_gpu gpu;
+} NativeDecoder;
+
+static void native_decoder_close(NativeDecoder *decoder)
 {
-    /* Binary mode on stdout — prevent Windows \n→\r\n translation of pixel data */
-#ifdef _WIN32
-    _setmode(_fileno(stdout), _O_BINARY);
-#endif
+    if (!decoder) return;
+    av_frame_free(&decoder->last_frame);
+    av_frame_free(&decoder->frame);
+    av_packet_free(&decoder->packet);
+    avcodec_free_context(&decoder->codec);
+    avformat_close_input(&decoder->format);
+    memset(decoder, 0, sizeof(*decoder));
+}
 
-    /* Ensure ffmpeg logs to stderr, not stdout */
-    av_log_set_level(AV_LOG_WARNING);
+static bool native_decoder_open(NativeDecoder *decoder, const char *path,
+                                pl_gpu gpu)
+{
+    const AVCodec *codec;
+    const AVCodecHWConfig *hwcfg = NULL;
 
-    Args a = {0};
-    if (!parse_args(argc, argv, &a)) { usage(argv[0]); return 1; }
+    native_decoder_close(decoder);
+    decoder->gpu = gpu;
+    fprintf(stderr, "Server decoder open: %s\n", path);
+    if (avformat_open_input(&decoder->format, path, NULL, NULL) < 0 ||
+        avformat_find_stream_info(decoder->format, NULL) < 0) {
+        fprintf(stderr, "Server decoder: cannot open input %s\n", path);
+        native_decoder_close(decoder);
+        return false;
+    }
 
-    /* --- libplacebo log (stderr) --- */
-    pl_log log = pl_log_create(PL_API_VER, pl_log_params(
-        .log_cb    = pl_log_simple,
-        .log_priv  = stderr,
-        .log_level = PL_LOG_WARN,
-    ));
+    decoder->stream_index = av_find_best_stream(decoder->format,
+                                                 AVMEDIA_TYPE_VIDEO, -1, -1,
+                                                 NULL, 0);
+    if (decoder->stream_index < 0) {
+        fprintf(stderr, "Server decoder: no video stream in %s\n", path);
+        native_decoder_close(decoder);
+        return false;
+    }
+    decoder->stream = decoder->format->streams[decoder->stream_index];
+    codec = avcodec_find_decoder(decoder->stream->codecpar->codec_id);
+    if (!codec || !(decoder->codec = avcodec_alloc_context3(codec)) ||
+        avcodec_parameters_to_context(decoder->codec,
+                                      decoder->stream->codecpar) < 0) {
+        fprintf(stderr, "Server decoder: cannot initialize codec\n");
+        native_decoder_close(decoder);
+        return false;
+    }
 
-    /* --- D3D11 GPU context (hardware, WARP software fallback) --- */
-    pl_d3d11 d3d11 = pl_d3d11_create(log, pl_d3d11_params(
-        .allow_software = true,
-    ));
-    if (!d3d11) { fprintf(stderr, "Failed to create D3D11 context\n"); return 1; }
-    pl_gpu gpu = d3d11->gpu;
+    for (int i = 0; (hwcfg = avcodec_get_hw_config(codec, i)); i++) {
+        if (!pl_test_pixfmt(gpu, hwcfg->pix_fmt))
+            continue;
+        if (!(hwcfg->methods & AV_CODEC_HW_CONFIG_METHOD_HW_DEVICE_CTX))
+            continue;
+        if (av_hwdevice_ctx_create(&decoder->codec->hw_device_ctx,
+                                   hwcfg->device_type, NULL, NULL, 0) < 0) {
+            fprintf(stderr, "Server decoder: HW device creation failed, trying next format\n");
+            continue;
+        }
+        decoder->codec->extra_hw_frames = 4;
+        fprintf(stderr, "Server decoder: hardware format %s\n",
+                av_get_pix_fmt_name(hwcfg->pix_fmt));
+        break;
+    }
+    if (!hwcfg || !decoder->codec->hw_device_ctx)
+        fprintf(stderr, "Server decoder: software decoding\n");
 
-    /* --- Initialize GPU CR variable/descriptor tables --- */
-    init_cr_vars();
+    decoder->codec->get_buffer2 = pl_get_buffer2;
+    decoder->codec->opaque = &decoder->gpu;
+    decoder->codec->export_side_data |= AV_CODEC_EXPORT_DATA_PRFT;
+    if (avcodec_open2(decoder->codec, codec, NULL) < 0) {
+        fprintf(stderr, "Server decoder: cannot open codec\n");
+        native_decoder_close(decoder);
+        return false;
+    }
+    decoder->packet = av_packet_alloc();
+    decoder->frame = av_frame_alloc();
+    if (!decoder->packet || !decoder->frame) {
+        fprintf(stderr, "Server decoder: cannot allocate packet/frame\n");
+        native_decoder_close(decoder);
+        return false;
+    }
+    strncpy(decoder->input, path, sizeof(decoder->input) - 1);
+    decoder->input[sizeof(decoder->input) - 1] = '\0';
+    return true;
+}
 
-    /* --- Renderer --- */
-    pl_renderer renderer = pl_renderer_create(log, gpu);
+static AVFrame *native_decoder_decode(NativeDecoder *decoder, double target_pts)
+{
+    bool sequential = decoder->have_last && target_pts >= decoder->last_pts;
+    if (decoder->have_last && fabs(target_pts - decoder->last_pts) < 0.000001) {
+        fprintf(stderr, "Server decoder: reuse cached frame at %.6f\n", target_pts);
+        return av_frame_clone(decoder->last_frame);
+    }
 
-    /* --- Decode frame --- */
-    AVFrame *avf = decode_frame_at(a.input, a.pts, a.width, a.height);
+    if (!sequential) {
+        int64_t seek_ts = (int64_t)(target_pts * AV_TIME_BASE);
+        fprintf(stderr, "Server decoder: seek/reset to %.6f\n", target_pts);
+        if (av_seek_frame(decoder->format, -1, seek_ts, AVSEEK_FLAG_BACKWARD) < 0)
+            return NULL;
+        avcodec_flush_buffers(decoder->codec);
+        decoder->have_last = false;
+    } else {
+        fprintf(stderr, "Server decoder: sequential decode to %.6f\n", target_pts);
+    }
+
+    for (int attempts = 0; attempts < 512; attempts++) {
+        int ret = av_read_frame(decoder->format, decoder->packet);
+        if (ret < 0) break;
+        if (decoder->packet->stream_index != decoder->stream_index) {
+            av_packet_unref(decoder->packet);
+            continue;
+        }
+        ret = avcodec_send_packet(decoder->codec, decoder->packet);
+        av_packet_unref(decoder->packet);
+        if (ret < 0) continue;
+        while ((ret = avcodec_receive_frame(decoder->codec, decoder->frame)) == 0) {
+            int64_t pts = decoder->frame->best_effort_timestamp;
+            if (pts == AV_NOPTS_VALUE) pts = decoder->frame->pts;
+            if (pts == AV_NOPTS_VALUE) {
+                av_frame_unref(decoder->frame);
+                continue;
+            }
+            double frame_pts = pts * av_q2d(decoder->stream->time_base);
+            if (frame_pts + 0.05 >= target_pts) {
+                av_frame_free(&decoder->last_frame);
+                decoder->last_frame = av_frame_clone(decoder->frame);
+                if (!decoder->last_frame) return NULL;
+                decoder->last_pts = frame_pts;
+                decoder->last_decoded_pts = pts;
+                decoder->have_last = true;
+                AVFrame *result = av_frame_clone(decoder->frame);
+                av_frame_unref(decoder->frame);
+                return result;
+            }
+            av_frame_unref(decoder->frame);
+        }
+    }
+    fprintf(stderr, "Server decoder: no frame at or after %.6f\n", target_pts);
+    return NULL;
+}
+
+/* -------------------------------------------------------------------------
+ * Reusable single-request renderer. GPU and renderer ownership belongs to the
+ * caller so server mode can retain the expensive native context.
+ * ---------------------------------------------------------------------- */
+static bool build_gamma_model_features(pl_gpu gpu, const struct pl_frame *image,
+                                       const Args *args, float features[88])
+{
+    if (!pl_extract_ml_features(gpu, image, pl_ml_feature_params(
+            .target_nits = args->out_nits), features))
+        return false;
+
+    struct pl_tone_map_params spline = {
+        .function = &pl_tone_map_spline,
+        .constants = { PL_TONE_MAP_CONSTANTS },
+        .input_scaling = PL_HDR_PQ,
+        .output_scaling = PL_HDR_PQ,
+        .lut_size = 256,
+        .input_max = fmaxf(args->l1_max_pq, features[0]),
+        .input_avg = args->l1_avg_pq > 0.0f ? args->l1_avg_pq : features[1],
+        .output_max = 0.5444f,
+    };
+    float spline_lut[256];
+    pl_tone_map_params_infer(&spline);
+    pl_tone_map_generate(spline_lut, &spline);
+    const int knot_indices[8] = { 0, 36, 73, 109, 146, 182, 219, 255 };
+    for (int index = 0; index < 8; index++)
+        features[77 + index] = spline_lut[knot_indices[index]];
+    features[85] = args->top_bar_norm;
+    features[86] = args->bot_bar_norm;
+    features[87] = 0.5444f / fmaxf(features[0], 1e-6f);
+    return true;
+}
+
+enum dv_frame_info_flags {
+    DV_FRAME_INFO_AUTO = 1 << 0,
+    DV_FRAME_INFO_MODEL = 1 << 1,
+    DV_FRAME_INFO_MANUAL = 1 << 2,
+    DV_FRAME_INFO_FALLBACK = 1 << 3,
+    DV_FRAME_INFO_GAMMA_OFF = 1 << 4,
+    DV_FRAME_INFO_CR_AUTO = 1 << 5,
+    DV_FRAME_INFO_CR_MANUAL = 1 << 6,
+    DV_FRAME_INFO_CR_OFF = 1 << 7,
+    DV_FRAME_INFO_FIRE_MANUAL = 1 << 8,
+    DV_FRAME_INFO_FIRE_OFF = 1 << 9,
+    DV_FRAME_INFO_FIRE_FALLBACK = 1 << 10,
+};
+
+struct dv_frame_info {
+    uint32_t flags;
+    float gamma;
+    float l1_max_pq;
+    float l1_avg_pq;
+    float cr_strength;
+    float l2_power;
+    float fire_pop_strength;
+};
+
+static int render_frame_with_decoder(Args a, pl_gpu gpu, pl_renderer renderer,
+                                     pl_ml_context ml_context,
+                                     NativeDecoder *decoder, AVFrame *provided,
+                                     const struct pl_frame *mapped,
+                                     struct dv_frame_info *frame_info)
+{
+    if (frame_info)
+        memset(frame_info, 0, sizeof(*frame_info));
+    AVFrame *avf = provided ? provided : (decoder ? native_decoder_decode(decoder, a.pts) :
+                           decode_frame_at(a.input, a.pts, a.width, a.height));
     if (!avf) { fprintf(stderr, "Failed to decode frame\n"); return 1; }
 
     /* --- Map AVFrame → pl_frame ---
@@ -663,17 +974,25 @@ int main(int argc, char **argv)
     struct pl_frame image = {0};
     pl_tex tex[4] = {0};
 
-    if (!pl_frame_recreate_from_avframe(gpu, &image, tex, avf)) {
+    if (mapped) {
+        image = *mapped;
+    } else if (!pl_frame_recreate_from_avframe(gpu, &image, tex, avf)) {
         fprintf(stderr, "pl_frame_recreate_from_avframe failed\n");
         return 1;
     }
 
-    bool ok = pl_map_avframe_ex(gpu, &image, pl_avframe_params(
-        .frame    = avf,
-        .tex      = tex,
-        .map_dovi = true,   /* always — need the RPU colour matrix */
-    ));
-    if (!ok) { fprintf(stderr, "pl_map_avframe_ex failed\n"); return 1; }
+    bool ok = true;
+    if (!mapped) {
+        ok = pl_map_avframe_ex(gpu, &image, pl_avframe_params(
+            .frame    = avf,
+            .tex      = tex,
+            .map_dovi = true,   /* always — need the RPU colour matrix */
+        ));
+        if (!ok) { fprintf(stderr, "pl_map_avframe_ex failed\n"); return 1; }
+    }
+
+    if (a.fire_pop_mode != DV_CONTROL_MANUAL)
+        a.fire_pop_strength = 0.0f;
 
     /* For spline/ml: keep the DV colour matrix but replace the RPU reshaping
      * curves with identity. Allocate a mutable copy of pl_dovi_metadata,
@@ -706,15 +1025,17 @@ int main(int argc, char **argv)
      * Rendering to float16 instead of uint8 preserves the full precision of
      * libplacebo's tone-mapping — the subsequent float32 pipeline processes
      * pristine gradients, not 8-bit quantization steps. */
-    pl_fmt out_fmt = pl_find_fmt(gpu, PL_FMT_FLOAT, 4, 16, 16,
-                                 PL_FMT_CAP_RENDERABLE | PL_FMT_CAP_HOST_READABLE
-                                 | PL_FMT_CAP_STORABLE);
+    enum pl_fmt_caps output_caps = PL_FMT_CAP_RENDERABLE | PL_FMT_CAP_STORABLE;
+    if (a.write_output)
+        output_caps |= PL_FMT_CAP_HOST_READABLE;
+    pl_fmt out_fmt = pl_find_fmt(gpu, PL_FMT_FLOAT, 4, 16, 16, output_caps);
     if (!out_fmt) {
         /* Fallback: use rgba8 if float16 render target unavailable */
         fprintf(stderr, "  [WARN] float16 render target unavailable, falling back to rgba8\n");
         out_fmt = pl_find_named_fmt(gpu, "rgba8");
         if (!out_fmt) out_fmt = pl_find_fmt(gpu, PL_FMT_UNORM, 4, 8, 8,
-                                            PL_FMT_CAP_RENDERABLE | PL_FMT_CAP_HOST_READABLE);
+                            PL_FMT_CAP_RENDERABLE |
+                            (a.write_output ? PL_FMT_CAP_HOST_READABLE : 0));
     }
     if (!out_fmt) { fprintf(stderr, "No suitable output format\n"); return 1; }
 
@@ -735,7 +1056,7 @@ int main(int argc, char **argv)
         .h            = a.height,
         .format       = out_fmt,
         .renderable   = true,
-        .host_readable= true,
+        .host_readable= a.write_output,
         .storable     = !!(out_fmt->caps & PL_FMT_CAP_STORABLE),
     ));
     if (!out_tex) { fprintf(stderr, "Failed creating output texture\n"); return 1; }
@@ -765,6 +1086,27 @@ int main(int argc, char **argv)
     struct pl_color_map_params cmap = *(&pl_color_map_default_params);
     struct pl_render_params rparams = pl_render_default_params;
     rparams.color_map_params = &cmap;
+    struct fire_pop_hook_state fire_hook_state = {
+        .strength = a.fire_pop_strength,
+    };
+    struct l2_hook_state l2_hook_state = { .gamma = 1.0f, .saturation = 1.0f };
+    struct pl_hook fire_hook = {
+        .stages = PL_HOOK_OUTPUT,
+        .input = PL_HOOK_SIG_COLOR,
+        .priv = &fire_hook_state,
+        .hook = fire_pop_output_hook,
+        .signature = 0x4456504649524550ull,
+    };
+    struct pl_hook l2_hook = {
+        .stages = PL_HOOK_OUTPUT,
+        .input = PL_HOOK_SIG_COLOR,
+        .priv = &l2_hook_state,
+        .hook = l2_output_hook,
+        .signature = 0x44564C325452494Dull,
+    };
+    const struct pl_hook *hooks[2];
+    bool gpu_fire_pop = a.fire_pop_strength > 0.0f;
+    bool gpu_l2 = false;
 
     /* Apply user-supplied spline constants — negative sentinel means keep default */
 #define APPLY_IF_SET(field, arg) if ((arg) >= 0.0f) cmap.tone_constants.field = (arg)
@@ -887,13 +1229,33 @@ int main(int argc, char **argv)
                 image.color.hdr.max_pq_y);
             a.l1_max_pq = image.color.hdr.max_pq_y;
         }
+        if (a.l1_avg_pq <= 0.0f) {
+            fprintf(stderr,
+                "Warning: --l1-avg not set for contrast-recovery — using average=%.4f\n",
+                image.color.hdr.avg_pq_y);
+            a.l1_avg_pq = image.color.hdr.avg_pq_y;
+        }
 
-        /* Predict gamma from scene statistics (heuristic matching XGBoost model) */
+        /* Predict gamma from the complete canonical feature vector. */
         float content_ratio = a.l1_max_pq / (a.out_nits > 0.01f ? a.out_nits / 10000.0f : 0.02f);
         float predicted_gamma = predict_gamma_from_brightness(content_ratio, a.l1_avg_pq);
+        bool native_model_used = false;
+        if (ml_context && a.gamma_mode == DV_CONTROL_AUTO) {
+            float features[88];
+            struct pl_ml_prediction prediction;
+            if (build_gamma_model_features(gpu, &image, &a, features) &&
+                pl_ml_context_predict(ml_context, features, 88, &prediction)) {
+                predicted_gamma = prediction.gamma;
+                native_model_used = true;
+                fprintf(stderr, "Native ML gamma: %.3f (88 features)\n", predicted_gamma);
+            } else {
+                fprintf(stderr, "Native ML gamma unavailable; using heuristic fallback\n");
+            }
+        }
 
         /* Use predicted gamma unless manually overridden */
-        float gamma = (a.contrast_gamma > 0.0f) ? a.contrast_gamma : predicted_gamma;
+        float gamma = a.gamma_mode == DV_CONTROL_MANUAL ? a.contrast_gamma :
+                  a.gamma_mode == DV_CONTROL_OFF ? 1.0f : predicted_gamma;
         float power = 2048.0f / gamma;
         float sat = a.contrast_sat > 0.0f ? a.contrast_sat * 2048.0f : 2048.0f;
 
@@ -916,7 +1278,10 @@ int main(int argc, char **argv)
         /* HDR contrast recovery (high-frequency detail injection):
          * Auto-scales based on predicted gamma — punchy scenes get more
          * micro-contrast injection, flat scenes back off to avoid noise. */
-        if (a.cr_strength >= 0.0f) {
+        if (a.cr_mode == DV_CONTROL_OFF) {
+            cmap.contrast_recovery = 0.0f;
+            fprintf(stderr, "  CR strength: off\n");
+        } else if (a.cr_mode == DV_CONTROL_MANUAL) {
             cmap.contrast_recovery = a.cr_strength;
             fprintf(stderr, "  CR strength: %.3f (explicit)\n", a.cr_strength);
         } else {
@@ -938,11 +1303,57 @@ int main(int argc, char **argv)
             cmap.contrast_smoothness = 2.5f;
             fprintf(stderr, "  CR smoothness: %.1f (default)\n", cmap.contrast_smoothness);
         }
+        if (frame_info) {
+            frame_info->flags = a.gamma_mode == DV_CONTROL_MANUAL ? DV_FRAME_INFO_MANUAL :
+                a.gamma_mode == DV_CONTROL_OFF ? DV_FRAME_INFO_GAMMA_OFF :
+                DV_FRAME_INFO_AUTO | (native_model_used ? DV_FRAME_INFO_MODEL : DV_FRAME_INFO_FALLBACK);
+            frame_info->flags |= a.cr_mode == DV_CONTROL_MANUAL ? DV_FRAME_INFO_CR_MANUAL :
+                a.cr_mode == DV_CONTROL_OFF ? DV_FRAME_INFO_CR_OFF : DV_FRAME_INFO_CR_AUTO;
+            frame_info->flags |= a.fire_pop_mode == DV_CONTROL_MANUAL ? DV_FRAME_INFO_FIRE_MANUAL :
+                a.fire_pop_mode == DV_CONTROL_AUTO ? DV_FRAME_INFO_FIRE_FALLBACK : DV_FRAME_INFO_FIRE_OFF;
+            frame_info->gamma = gamma;
+            frame_info->l1_max_pq = a.l1_max_pq;
+            frame_info->l1_avg_pq = a.l1_avg_pq;
+            frame_info->cr_strength = cmap.contrast_recovery;
+            frame_info->l2_power = power;
+            frame_info->fire_pop_strength = a.fire_pop_strength;
+        }
+    }
+
+    if (a.l2_power > 0.0f || a.l2_sat_gain > 0.0f) {
+        l2_hook_state.gamma = a.l2_power > 0.0f ? 2048.0f / a.l2_power : 1.0f;
+        l2_hook_state.saturation = a.l2_sat_gain > 0.0f ?
+            a.l2_sat_gain / 2048.0f : 1.0f;
+        gpu_l2 = l2_hook_state.gamma != 1.0f || l2_hook_state.saturation != 1.0f;
+    }
+    int num_hooks = 0;
+    if (gpu_fire_pop)
+        hooks[num_hooks++] = &fire_hook;
+    if (gpu_l2)
+        hooks[num_hooks++] = &l2_hook;
+    if (num_hooks) {
+        rparams.hooks = hooks;
+        rparams.num_hooks = num_hooks;
+        fprintf(stderr, "GPU output hooks: fire-pop=%s L2=%s\n",
+                gpu_fire_pop ? "on" : "off", gpu_l2 ? "on" : "off");
     }
 
     /* --- Render --- */
     ok = pl_render_image(renderer, &image, &target, &rparams);
-    if (!ok) fprintf(stderr, "Warning: pl_render_image failed\n");
+    if (!ok) {
+        fprintf(stderr, "pl_render_image failed\n");
+        return 1;
+    }
+
+    if (!a.write_output) {
+        fprintf(stderr, "GPU-only render complete: no diagnostic texture readback\n");
+        if (!mapped) {
+            pl_unmap_avframe(gpu, &image);
+            av_frame_free(&avf);
+        }
+        pl_tex_destroy(gpu, &out_tex);
+        return 0;
+    }
 
     /* --- Download result --- */
     /* We need a uint8_t *pixels buffer for the unified output path (fwrite to
@@ -1021,9 +1432,9 @@ int main(int argc, char **argv)
      * are visible even when not inside the conditional. */
     float *work = NULL;
     int did_processing = 0;
+    const bool use_legacy_cr_overlay = false;
 
-    if (a.l2_power > 0.0f || a.l2_sat_gain > 0.0f ||
-        a.fire_pop_strength > 0.0f) {
+    if (cmap.contrast_recovery > 0.0f) {
         fprintf(stderr,
             "  [ALLOC]  float32 work buffer (%d×%d, %.1f KB)\n",
             a.width, a.height,
@@ -1081,7 +1492,7 @@ int main(int argc, char **argv)
          * Edge-preserving Gaussian blur preserves edges while amplifying
          * mid-frequency detail -- the "theater pop" effect.
          * Adapted from mpv KrigBilateral.glsl by Shiandow (LGPL v3). */
-        if (a.contrast_recovery && a.cr_strength > 0.0f &&
+        if (use_legacy_cr_overlay && a.contrast_recovery && a.cr_strength > 0.0f &&
             !strcmp(a.mode, "contrast-recovery")) {
             float boost = a.cr_strength * 2.0f;
             float sigma_s = 3.0f;
@@ -1155,23 +1566,10 @@ int main(int argc, char **argv)
                                             { .object = cr_out_tex },
                                         };
 
-                                        /* 7. Push runtime uniforms */
-                                        float radi = (float)radius;
-                                        struct pl_var_update updates[] = {
-                                            { .index = 0, .data = &radi },
-                                            { .index = 1, .data = &sigma_s },
-                                            { .index = 2, .data = &sigma_r },
-                                            { .index = 3, .data = &boost },
-                                            { .index = 4, .data = &a.width },
-                                            { .index = 5, .data = &a.height },
-                                        };
-
                                         /* 8. Execute pass */
                                         pl_pass_run(gpu,
                                             pl_pass_run_params(
                                                 .pass            = pass,
-                                                .var_updates     = updates,
-                                                .num_var_updates = NUM_CR_UPDATES,
                                                 .desc_bindings   = bindings,
                                             ));
 
@@ -1248,7 +1646,7 @@ int main(int argc, char **argv)
             }
         }
 
-        if (a.fire_pop_strength > 0.0f && work) {
+        if (a.fire_pop_strength > 0.0f && work && !gpu_fire_pop) {
             /* Pass 1: compute scene maximum luma */
             float scene_max = 0.001f;
             for (int i = 0; i < a.width * a.height; i++) {
@@ -1331,6 +1729,7 @@ int main(int argc, char **argv)
 
         /* --- L2 gamma trim + saturation in float precision --- */
         if (work) {
+            if (!gpu_l2) {
             for (int i = 0; i < a.width * a.height; i++) {
                 float r = work[i*3+0];
                 float g = work[i*3+1];
@@ -1353,6 +1752,7 @@ int main(int argc, char **argv)
                 work[i*3+0] = r < 0 ? 0 : r > 1 ? 1 : r;
                 work[i*3+1] = g < 0 ? 0 : g > 1 ? 1 : g;
                 work[i*3+2] = b < 0 ? 0 : b > 1 ? 1 : b;
+            }
             }
 
             /* Letterbox bar tracking */
@@ -1521,10 +1921,437 @@ int main(int argc, char **argv)
     free(pixels16);
     /* work may still be non-NULL if L2 trim freed it (it sets work=NULL) */
     if (work) free(work);
-    pl_unmap_avframe(gpu, &image);
-    av_frame_free(&avf);
+    if (!mapped) {
+        pl_unmap_avframe(gpu, &image);
+        av_frame_free(&avf);
+    }
     pl_tex_destroy(gpu, &out_tex);
+    return 0;
+}
+
+typedef struct {
+    char input[2048];
+    double pts;
+    int width;
+    int height;
+    float l1_max_pq;
+    float l1_avg_pq;
+    float out_nits;
+    float contrast_gamma;
+    float cr_strength;
+    float fire_pop_strength;
+    enum dv_control_mode gamma_mode;
+    enum dv_control_mode cr_mode;
+    enum dv_control_mode fire_pop_mode;
+} ServerRequest;
+
+static bool server_json_number(const char *line, const char *key, double *value)
+{
+    char needle[64];
+    snprintf(needle, sizeof(needle), "\"%s\"", key);
+    const char *start = strstr(line, needle);
+    if (!start) return false;
+    start = strchr(start, ':');
+    if (!start) return false;
+    char *end = NULL;
+    *value = strtod(start + 1, &end);
+    return end != start + 1;
+}
+
+static enum dv_control_mode server_control_mode(const char *line, const char *key,
+                                                enum dv_control_mode fallback)
+{
+    char needle[64];
+    snprintf(needle, sizeof(needle), "\"%s\"", key);
+    const char *value = strstr(line, needle);
+    if (!value || !(value = strchr(value, ':')) || !(value = strchr(value, '"')))
+        return fallback;
+    value++;
+    if (!strncmp(value, "off\"", 4)) return DV_CONTROL_OFF;
+    if (!strncmp(value, "auto\"", 5)) return DV_CONTROL_AUTO;
+    if (!strncmp(value, "manual\"", 7)) return DV_CONTROL_MANUAL;
+    return fallback;
+}
+
+static bool parse_server_request(const char *line, ServerRequest *request)
+{
+    memset(request, 0, sizeof(*request));
+    request->width = 1920;
+    request->height = 1080;
+    request->l1_max_pq = 0.0f;
+    request->l1_avg_pq = 0.0f;
+    request->out_nits = 203.0f;
+    request->contrast_gamma = 0.0f;
+    request->cr_strength = -1.0f;
+    request->fire_pop_strength = 0.0f;
+    request->gamma_mode = DV_CONTROL_AUTO;
+    request->cr_mode = DV_CONTROL_AUTO;
+    request->fire_pop_mode = DV_CONTROL_OFF;
+
+    const char *key = strstr(line, "\"input\"");
+    if (!key) key = strstr(line, "\"mkv_path\"");
+    if (!key) return false;
+    const char *value = strchr(key, ':');
+    if (!value || !(value = strchr(value, '"'))) return false;
+    value++;
+    const char *end = strchr(value, '"');
+    if (!end || end == value) return false;
+    size_t length = (size_t)(end - value);
+    if (length >= sizeof(request->input)) return false;
+    memcpy(request->input, value, length);
+    request->input[length] = '\0';
+
+    double number;
+    if (!server_json_number(line, "pts", &number) || number < 0.0)
+        return false;
+    request->pts = number;
+    if (server_json_number(line, "width", &number)) request->width = (int)number;
+    if (server_json_number(line, "height", &number)) request->height = (int)number;
+    if (server_json_number(line, "l1_max", &number)) request->l1_max_pq = (float)number;
+    if (server_json_number(line, "l1_avg", &number)) request->l1_avg_pq = (float)number;
+    if (server_json_number(line, "out_nits", &number)) request->out_nits = (float)number;
+    if (server_json_number(line, "contrast_gamma", &number)) request->contrast_gamma = (float)number;
+    if (server_json_number(line, "cr_strength", &number)) request->cr_strength = (float)number;
+    if (server_json_number(line, "fire_pop_strength", &number))
+        request->fire_pop_strength = (float)number;
+    request->gamma_mode = server_control_mode(line, "gamma_mode", request->gamma_mode);
+    request->cr_mode = server_control_mode(line, "cr_mode", request->cr_mode);
+    request->fire_pop_mode = server_control_mode(line, "fire_pop_mode", request->fire_pop_mode);
+    return request->width > 0 && request->height > 0;
+}
+
+static bool write_u32_le(uint32_t value)
+{
+    uint8_t bytes[4] = {
+        (uint8_t)value, (uint8_t)(value >> 8),
+        (uint8_t)(value >> 16), (uint8_t)(value >> 24),
+    };
+    return fwrite(bytes, 1, sizeof(bytes), stdout) == sizeof(bytes);
+}
+
+static bool write_f32_le(float value)
+{
+    uint32_t bits;
+    memcpy(&bits, &value, sizeof(bits));
+    return write_u32_le(bits);
+}
+
+static bool write_server_header(const ServerRequest *request)
+{
+    static const uint8_t magic[] = { 'D', 'V', 'R', '2' };
+    return fwrite(magic, 1, sizeof(magic), stdout) == sizeof(magic) &&
+           write_u32_le(2) && write_u32_le((uint32_t)request->width) &&
+           write_u32_le((uint32_t)request->height) && write_u32_le(3);
+}
+
+static bool write_server_frame_info(const struct dv_frame_info *info)
+{
+    return write_u32_le(3) && write_u32_le(28) &&
+           write_u32_le(info->flags) && write_f32_le(info->gamma) &&
+           write_f32_le(info->l1_max_pq) && write_f32_le(info->l1_avg_pq) &&
+           write_f32_le(info->cr_strength) && write_f32_le(info->l2_power) &&
+           write_f32_le(info->fire_pop_strength);
+}
+
+static bool write_server_record(uint32_t mode, const ServerRequest *request,
+                                pl_gpu gpu, pl_renderer renderer,
+                                pl_ml_context ml_context,
+                                NativeDecoder *decoder,
+                                struct dv_frame_info *frame_info)
+{
+    uint64_t payload_size = (uint64_t)request->width * request->height * 3;
+    if (payload_size > UINT32_MAX || !write_u32_le(mode) ||
+        !write_u32_le((uint32_t)payload_size))
+        return false;
+
+    Args args = {0};
+    args.input = request->input;
+    args.pts = request->pts;
+    args.width = request->width;
+    args.height = request->height;
+    args.write_output = true;
+    args.out_nits = request->out_nits;
+    args.l1_max_pq = request->l1_max_pq;
+    args.l1_avg_pq = request->l1_avg_pq;
+    args.spline_contrast = -1.0f;
+    args.knee_adaptation = args.knee_minimum = args.knee_maximum = -1.0f;
+    args.knee_default = args.slope_tuning = args.slope_offset = -1.0f;
+    args.perceptual_strength = -1.0f;
+    args.gamut_expansion = -1;
+    args.l2_power = args.l2_sat_gain = -1.0f;
+    args.contrast_gamma = request->contrast_gamma;
+    args.gamma_mode = request->gamma_mode;
+    args.contrast_sat = 1.0f;
+    args.highlight_knee = args.cr_smoothness = -1.0f;
+    args.cr_strength = request->cr_strength;
+    args.cr_mode = request->cr_mode;
+    args.fire_pop_strength = request->fire_pop_strength;
+    args.fire_pop_mode = request->fire_pop_mode;
+    args.mode = mode == 1 ? "spline" : "contrast-recovery";
+    args.contrast_recovery = mode == 2;
+
+    return render_frame_with_decoder(args, gpu, renderer, ml_context, decoder,
+                                     NULL, NULL, frame_info) == 0;
+}
+
+typedef struct {
+    pl_queue queue;
+    double first_pts;
+    double last_pts;
+    bool have_pts;
+} PlaybackState;
+
+static bool playback_map_frame(pl_gpu gpu, pl_tex *tex,
+                               const struct pl_source_frame *src,
+                               struct pl_frame *out_frame)
+{
+    int64_t start = av_gettime_relative();
+    AVFrame *frame = src->frame_data;
+    bool ok = pl_map_avframe_ex(gpu, out_frame, pl_avframe_params(
+        .frame = frame, .tex = tex, .map_dovi = true));
+    av_frame_free(&frame);
+    fprintf(stderr, "Playback timing: map=%.3f ms\n",
+            (av_gettime_relative() - start) / 1000.0);
+    return ok;
+}
+
+static void playback_unmap_frame(pl_gpu gpu, struct pl_frame *frame,
+                                  const struct pl_source_frame *src)
+{
+    (void)src;
+    pl_unmap_avframe(gpu, frame);
+}
+
+static void playback_discard_frame(const struct pl_source_frame *src)
+{
+    AVFrame *frame = src->frame_data;
+    av_frame_free(&frame);
+}
+
+static bool write_playback_response(const ServerRequest *request, double pts,
+                                    pl_gpu gpu, pl_renderer renderer,
+                                    pl_ml_context ml_context,
+                                    NativeDecoder *decoder,
+                                    PlaybackState *playback)
+{
+    int64_t decode_start = av_gettime_relative();
+    AVFrame *frame = native_decoder_decode(decoder, request->pts);
+    double decode_ms = (av_gettime_relative() - decode_start) / 1000.0;
+    if (!frame)
+        return false;
+
+    double frame_duration = 1.0 / 24.0;
+    if (decoder->stream->avg_frame_rate.num && decoder->stream->avg_frame_rate.den)
+        frame_duration = av_q2d(av_inv_q(decoder->stream->avg_frame_rate));
+
+    if (!playback->have_pts || pts < playback->last_pts) {
+        pl_queue_reset(playback->queue);
+        playback->first_pts = pts;
+        playback->have_pts = true;
+        fprintf(stderr, "Playback queue: reset at %.6f\n", pts);
+    }
+
+    double queue_pts = pts - playback->first_pts;
+    AVFrame *queued_frame = av_frame_clone(frame);
+    if (!queued_frame) {
+        av_frame_free(&frame);
+        return false;
+    }
+    pl_queue_push(playback->queue, &(struct pl_source_frame) {
+        .pts = queue_pts,
+        .frame_data = queued_frame,
+        .map = playback_map_frame,
+        .unmap = playback_unmap_frame,
+        .discard = playback_discard_frame,
+    });
+
+    /* pl_queue needs a lookahead frame, as in plplay's decoder thread. */
+    AVFrame *lookahead = native_decoder_decode(decoder, request->pts + frame_duration);
+    if (lookahead) {
+        AVFrame *queued_lookahead = av_frame_clone(lookahead);
+        av_frame_free(&lookahead);
+        if (!queued_lookahead)
+            return false;
+        pl_queue_push(playback->queue, &(struct pl_source_frame) {
+            .pts = queue_pts + frame_duration,
+            .duration = frame_duration,
+            .frame_data = queued_lookahead,
+            .map = playback_map_frame,
+            .unmap = playback_unmap_frame,
+            .discard = playback_discard_frame,
+        });
+    }
+
+    int64_t queue_start = av_gettime_relative();
+    struct pl_frame_mix mix;
+    enum pl_queue_status status = pl_queue_update(playback->queue, &mix,
+        pl_queue_params(.pts = queue_pts, .radius = 0.0f, .timeout = 0));
+    double queue_ms = (av_gettime_relative() - queue_start) / 1000.0;
+    if (status != PL_QUEUE_OK || !mix.num_frames) {
+        fprintf(stderr, "Playback queue: update failed (%d)\n", status);
+        av_frame_free(&frame);
+        return false;
+    }
+    playback->last_pts = pts;
+
+    uint64_t payload_size = (uint64_t)request->width * request->height * 3;
+    static const uint8_t magic[] = { 'D', 'V', 'R', 'P' };
+    if (payload_size > UINT32_MAX ||
+        fwrite(magic, 1, sizeof(magic), stdout) != sizeof(magic) ||
+        !write_u32_le(1) || !write_u32_le((uint32_t)request->width) ||
+        !write_u32_le((uint32_t)request->height) ||
+        !write_u32_le((uint32_t)llround(pts * 1000.0)) ||
+        !write_u32_le((uint32_t)payload_size)) {
+        av_frame_free(&frame);
+        return false;
+    }
+
+    Args args = {0};
+    args.input = request->input;
+    args.pts = request->pts;
+    args.width = request->width;
+    args.height = request->height;
+    args.write_output = true;
+    args.out_nits = request->out_nits;
+    args.l1_max_pq = request->l1_max_pq;
+    args.l1_avg_pq = request->l1_avg_pq;
+    args.contrast_gamma = request->contrast_gamma;
+    args.contrast_sat = 1.0f;
+    args.cr_strength = request->cr_strength;
+    args.fire_pop_strength = request->fire_pop_strength;
+    args.mode = "spline";
+    int64_t render_start = av_gettime_relative();
+    int result = render_frame_with_decoder(args, gpu, renderer, ml_context,
+                                           NULL, NULL,
+                                           mix.frames[0], NULL);
+    av_frame_free(&frame);
+    double render_ms = (av_gettime_relative() - render_start) / 1000.0;
+    fprintf(stderr, "Playback timing: decode=%.3f ms queue=%.3f ms render=%.3f ms\n",
+            decode_ms, queue_ms, render_ms);
+    return result == 0;
+}
+
+/* -------------------------------------------------------------------------
+ * Main
+ * ---------------------------------------------------------------------- */
+int main(int argc, char **argv)
+{
+#ifdef _WIN32
+    _setmode(_fileno(stdout), _O_BINARY);
+#endif
+    av_log_set_level(AV_LOG_WARNING);
+
+    Args args = {0};
+    if (!parse_args(argc, argv, &args)) { usage(argv[0]); return 1; }
+
+    pl_log log = pl_log_create(PL_API_VER, pl_log_params(
+        .log_cb = pl_log_simple, .log_priv = stderr, .log_level = PL_LOG_WARN));
+    pl_d3d11 d3d11 = pl_d3d11_create(log, pl_d3d11_params(.allow_software = true));
+    if (!d3d11) { fprintf(stderr, "Failed to create D3D11 context\n"); return 1; }
+    pl_gpu gpu = d3d11->gpu;
+    init_cr_vars();
+    pl_renderer renderer = pl_renderer_create(log, gpu);
+    if (!renderer) { fprintf(stderr, "Failed to create renderer\n"); return 1; }
+    pl_ml_context ml_context = NULL;
+    if (args.model_path) {
+        ml_context = pl_ml_context_create(pl_ml_context_params(
+            .log = log, .model_path = args.model_path));
+        if (!ml_context) {
+            fprintf(stderr, "Failed to initialize native ML model: %s\n",
+                    args.model_path);
+            pl_renderer_destroy(&renderer);
+            pl_d3d11_destroy(&d3d11);
+            pl_log_destroy(&log);
+            return 1;
+        }
+        fprintf(stderr, "Native ML model initialized: %s\n", args.model_path);
+    }
+
+    if (!args.server && args.playback_server) {
+        fprintf(stderr, "DV renderer playback server ready: DVRP responses on stdout\n");
+        NativeDecoder decoder = {0};
+        PlaybackState playback = { .queue = pl_queue_create(gpu) };
+        char line[4096];
+        if (!playback.queue) {
+            fprintf(stderr, "Playback server: failed creating frame queue\n");
+            pl_renderer_destroy(&renderer);
+            pl_ml_context_destroy(&ml_context);
+            pl_d3d11_destroy(&d3d11);
+            pl_log_destroy(&log);
+            return 1;
+        }
+        while (fgets(line, sizeof(line), stdin)) {
+            ServerRequest request;
+            if (!parse_server_request(line, &request)) {
+                fprintf(stderr, "Playback server: invalid request\n");
+                continue;
+            }
+            if (strcmp(decoder.input, request.input) != 0) {
+                pl_queue_reset(playback.queue);
+                playback.have_pts = false;
+                if (!native_decoder_open(&decoder, request.input, gpu)) {
+                    fprintf(stderr, "Playback server: decoder open failed\n");
+                    break;
+                }
+            }
+            if (!write_playback_response(&request, request.pts, gpu,
+                                         renderer, ml_context, &decoder, &playback)) {
+                fprintf(stderr, "Playback server: request failed\n");
+                break;
+            }
+            fflush(stdout);
+        }
+        pl_queue_destroy(&playback.queue);
+        native_decoder_close(&decoder);
+        pl_renderer_destroy(&renderer);
+        pl_ml_context_destroy(&ml_context);
+        pl_d3d11_destroy(&d3d11);
+        pl_log_destroy(&log);
+        return 0;
+    }
+
+    if (!args.server) {
+        int result = render_frame_with_decoder(args, gpu, renderer, ml_context,
+                               NULL, NULL, NULL, NULL);
+        pl_renderer_destroy(&renderer);
+        pl_ml_context_destroy(&ml_context);
+        pl_d3d11_destroy(&d3d11);
+        pl_log_destroy(&log);
+        return result;
+    }
+
+    fprintf(stderr, "DV renderer server ready: DVR2 responses on stdout\n");
+    NativeDecoder decoder = {0};
+    char line[4096];
+    while (fgets(line, sizeof(line), stdin)) {
+        ServerRequest request;
+        if (!parse_server_request(line, &request)) {
+            fprintf(stderr, "Server: invalid request\n");
+            continue;
+        }
+        if (strcmp(decoder.input, request.input) != 0) {
+            if (!native_decoder_open(&decoder, request.input, gpu)) {
+                fprintf(stderr, "Server: decoder open failed\n");
+                break;
+            }
+        } else {
+            fprintf(stderr, "Server decoder reuse: %s\n", request.input);
+        }
+        struct dv_frame_info frame_info = {0};
+        if (!write_server_header(&request) ||
+            !write_server_record(1, &request, gpu, renderer, ml_context, &decoder, NULL) ||
+            !write_server_record(2, &request, gpu, renderer, ml_context, &decoder,
+                                 &frame_info) ||
+            !write_server_frame_info(&frame_info)) {
+            fprintf(stderr, "Server: request failed\n");
+            break;
+        }
+        fflush(stdout);
+    }
+
+    native_decoder_close(&decoder);
     pl_renderer_destroy(&renderer);
+    pl_ml_context_destroy(&ml_context);
     pl_d3d11_destroy(&d3d11);
     pl_log_destroy(&log);
     return 0;

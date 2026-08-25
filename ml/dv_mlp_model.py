@@ -60,6 +60,63 @@ from dv_coef_model import (
 # ---------------------------------------------------------------------------
 N_CURVE_PTS = 256           # evaluation resolution for loss and gold curves
 
+
+def steffen_interp(x_knots: torch.Tensor,
+                   y_knots: torch.Tensor,
+                   x_eval:  torch.Tensor) -> torch.Tensor:
+    """
+    Steffen (1990) monotone cubic Hermite interpolation.
+
+    Replaces the Natural Cubic Spline (NCS) for tone-mapping curves.
+    NCS is C2 but can oscillate between knots even for monotone data.
+    Steffen is C1 and *guaranteed monotone* whenever y_knots are non-decreasing,
+    eliminating dips, overshoots and kinks that NCS can introduce.
+
+    Args:
+        x_knots : [n_knots]          fixed knot x-positions (uniform [0,1])
+        y_knots : [B, n_knots]       predicted knot y-values (non-decreasing)
+        x_eval  : [n_eval]           evaluation points (uniform [0,1])
+    Returns:
+        curve   : [B, n_eval]        monotone C1 interpolated curve
+    """
+    n     = x_knots.shape[0]
+    h     = x_knots[1:] - x_knots[:-1]                       # [n-1] (uniform: all equal)
+
+    # Secant slopes [B, n-1]
+    s = (y_knots[:, 1:] - y_knots[:, :-1]) / h.unsqueeze(0)
+
+    # Interior derivative estimates: weighted average of adjacent secant slopes [B, n-2]
+    p = (s[:, :-1] * h[1:] + s[:, 1:] * h[:-1]) / (h[:-1] + h[1:])
+
+    # Steffen monotonicity clamp: m = min(|p|, 2|s[i-1]|, 2|s[i]|) * sign(p)
+    # For tone-mapping curves s >= 0, so sign(p) >= 0 — the abs() handles zero-slope.
+    m_int = torch.minimum(
+        torch.minimum(torch.abs(p), 2.0 * s[:, :-1]),
+        2.0 * s[:, 1:]
+    ) * torch.sign(p + 1e-30)                                 # [B, n-2]
+
+    # Endpoint derivatives: match the adjacent secant slope
+    m = torch.cat([s[:, :1], m_int, s[:, -1:]], dim=1)       # [B, n]
+
+    # Locate each eval point's segment (uniform knots → closed-form)
+    seg   = torch.clamp((x_eval * (n - 1)).long(), 0, n - 2) # [n_eval]
+    x0    = x_knots[seg]                                      # [n_eval]
+    h_seg = h[seg]                                            # [n_eval]
+    t     = (x_eval - x0) / h_seg                            # [n_eval] in [0,1]
+
+    t2, t3 = t * t, t * t * t
+    h00 =  2*t3 - 3*t2 + 1   # [n_eval]
+    h10 =    t3 - 2*t2 + t
+    h01 = -2*t3 + 3*t2
+    h11 =    t3 -   t2
+
+    y0 = y_knots[:, seg]      # [B, n_eval]
+    y1 = y_knots[:, seg + 1]
+    m0 = m[:, seg]
+    m1 = m[:, seg + 1]
+
+    return h00 * y0 + (h10 * h_seg) * m0 + h01 * y1 + (h11 * h_seg) * m1
+
 # ── MCP (Monotone Control Points) constants ──
 # K free raw outputs → K positive diffs via softplus → cumsum → K+1 y-knots
 # x-knots fixed at linspace(0, 1, K+1); y[0]=0 (black anchor)
@@ -78,13 +135,16 @@ ENVELOPE_OUTSIDE = 10.0     # severe penalty for escaping the envelope
 CELL_WEIGHTS = {
     # Identity anchor — strong weight to prevent over-compression
     "neutral-crush-crush":   4.0,
-    "neutral-neutral-boost": 4.0,
-    # Rare expansion — force model to learn these patterns
-    "boost-boost-boost":     6.0,
-    "boost-boost-neutral":   6.0,
-    "boost-boost-crush":     6.0,
+    # Mid-tone expansion cells: raised to 10× (was 4-6×) to force model to learn
+    # the characteristic knee-with-plateau S-curve shape for expansion content.
+    # These cells have skin tones and highlights that the model was systematically
+    # undercutting due to ~500:1 effective training ratio vs neutral-crush-crush.
+    "neutral-neutral-boost": 10.0,
+    "boost-boost-boost":     10.0,
+    "boost-boost-neutral":   10.0,
+    "boost-boost-crush":     10.0,
     # Moderate weight for other cells
-    "boost-neutral-crush":   2.0,
+    "boost-neutral-crush":   4.0,
     "neutral-neutral-crush": 2.0,
 }
 DEFAULT_CELL_WEIGHT = 1.0
@@ -251,12 +311,68 @@ class MonotoneControlPoints(nn.Module):
         zeros   = torch.zeros(B, 1, device=raw.device, dtype=raw.dtype)
         y_knots = torch.cat([zeros, y_pos], dim=1)                  # [B, 8], y[0]=0
 
-        # Evaluate via pre-computed NCS matrix
-        curve = y_knots @ self._ncs_A.T                             # [B, n_pts]
-
-        # Soft non-negative clamp: relu removes the tiny NCS undershoot
-        curve = torch.clamp(curve, min=0.0)
+        # Steffen monotone interpolation — C1, no oscillations between knots
+        curve = steffen_interp(self.x_knots, y_knots, self.x_eval)  # [B, n_pts]
         return curve
+
+
+# ---------------------------------------------------------------------------
+# DeltaMLP — Predicts correction delta added to spline baseline (Run 31+)
+# ---------------------------------------------------------------------------
+class DeltaMLP(nn.Module):
+    """
+    Predicts a per-point correction delta that is ADDED to the spline baseline.
+
+        final_curve = clamp(spline_baseline + delta, 0, 1)  [monotone projected]
+
+    Why this is better than predicting the absolute curve:
+    - Model starts at spline (zero-init head → delta=0 → output=spline)
+    - Learns ONLY the colorist's creative deviation, not the technical baseline
+    - Domain shift from DV to HDR10 is minimised: spline handles the levels,
+      model handles the style correction
+    - Uncertain/unseen scenes: delta→0 → output=spline (safe fallback)
+
+    Architecture: same encoder as DVPolyMLP, different head.
+    """
+
+    def __init__(self, pixel_dim, hidden_dim=128, dropout=0.3,
+                 delta_scale=0.35, use_tier_embed=False, has_trim_head=False):
+        super().__init__()
+        self._hidden_dim = hidden_dim
+        self.delta_scale  = delta_scale
+
+        self.encoder = nn.Sequential(
+            nn.Linear(pixel_dim, hidden_dim), nn.LayerNorm(hidden_dim), nn.SiLU(), nn.Dropout(dropout),
+            nn.Linear(hidden_dim, hidden_dim), nn.LayerNorm(hidden_dim), nn.SiLU(), nn.Dropout(dropout),
+        )
+        self.delta_head = nn.Linear(hidden_dim, N_CURVE_PTS)
+
+        # Zero-init: model starts at zero correction → output = spline on epoch 1
+        nn.init.zeros_(self.delta_head.weight)
+        nn.init.zeros_(self.delta_head.bias)
+
+    def forward(self, x, tiers=None, spline_baseline=None):
+        """
+        Args:
+            x:               [B, pixel_dim] normalised features
+            spline_baseline: [B, 256] maxscl-based spline curve, or None
+        Returns:
+            (output, None, None) — compatible with DVPolyMLP interface
+        """
+        h = self.encoder(x)
+        delta = torch.tanh(self.delta_head(h)) * self.delta_scale   # [B, 256] ∈ [-scale, +scale]
+
+        if spline_baseline is not None:
+            out = torch.clamp(spline_baseline + delta, 0.0, 1.0)
+            out, _ = torch.cummax(out, dim=1)   # monotone projection
+        else:
+            out = delta
+
+        return out, None, None
+
+    def mcp_eval(self, x):
+        """Compatibility stub — DeltaMLP doesn't use MCP; returns x unchanged."""
+        return x
 
 
 # ---------------------------------------------------------------------------
@@ -312,8 +428,7 @@ class ResidualMCP(nn.Module):
         # Monotone projection: each knot ≥ previous (cumulative max)
         y_knots, _ = torch.cummax(y_knots, dim=1)
 
-        curve = y_knots @ self._ncs_A.T                        # [B, n_pts]
-        curve = torch.clamp(curve, min=0.0)
+        curve = steffen_interp(self.x_knots, y_knots, self.x_eval)  # [B, n_pts]
         return curve
 
 
@@ -434,14 +549,16 @@ class BoundedDTMLoss(nn.Module):
         self.lambda_outside = lambda_outside
 
     def forward(self, predicted_curves, dolby_targets, spline_baselines=None,
-                cell_labels=None, cell_weights=None):
+                cell_labels=None, cell_weights=None, curve_weights=None):
         """
         Args:
-            predicted_curves : [B, 256]  NR curve output
+            predicted_curves : [B, 256]  MCP curve output
             dolby_targets    : [B, 256]  ground truth gold curve
             spline_baselines : [B, 256]  libplacebo spline baseline (or None → bounds = gold)
             cell_labels      : List[str] per-sample cell label (for weighted loss)
-            cell_weights     : Optional Tensor[B] — pre-computed weights (overrides cell_labels)
+            cell_weights     : Optional Tensor[B] — pre-computed per-sample weights
+            curve_weights    : Optional Tensor[B, 256] — per-point content-aware weights
+                               (from compute_scene_curve_weights; sum-to-1 per row)
         Returns:
             total_loss : scalar
         """
@@ -452,21 +569,44 @@ class BoundedDTMLoss(nn.Module):
             lower_bound = torch.min(dolby_targets, spline_baselines)
             upper_bound = torch.max(dolby_targets, spline_baselines)
         else:
-            # Fallback: envelope = gold itself (no spline available)
             lower_bound = dolby_targets
             upper_bound = dolby_targets
 
-        # 2. Standard MSE vs gold (primary learning signal)
-        base_mse = self.mse(predicted_curves, dolby_targets).mean(dim=1)  # [B]
+        # 2. MSE vs gold — content-weighted + near-black shadow boost
+        # Shadow boost: 1 + 9×exp(-x/0.05) → 10× penalty at x=0, tapers to ~1× by x=0.2 PQ
+        # Fixes: MSE blind spot where tiny absolute errors near black cause perceptual black crush
+        xs_curve = torch.linspace(0, 1, predicted_curves.shape[1],
+                                   device=predicted_curves.device)           # [256]
+        shadow_boost = 1.0 + 9.0 * torch.exp(-xs_curve / 0.05)              # [256]
 
-        # 3. Hinge penalties for envelope escape
-        under_shoot = torch.clamp(lower_bound - predicted_curves, min=0.0)  # [B, 256]
-        over_shoot  = torch.clamp(predicted_curves - upper_bound, min=0.0)  # [B, 256]
-        boundary_violation = (under_shoot + over_shoot).mean(dim=1)        # [B]
+        sq_err = self.mse(predicted_curves, dolby_targets) * shadow_boost    # [B, 256]
+        if curve_weights is not None:
+            base_mse = (sq_err * curve_weights).sum(dim=1)
+        else:
+            base_mse = sq_err.mean(dim=1)
+
+        # 3. Perceptually-adaptive hinge penalty
+        # Base: scale λ by 1/(lower+ε) — brick wall near black, tapers at midtones.
+        # Mid-tone Gaussian bump: extra penalty centred at x=0.20 PQ (skin tone zone).
+        # Prevents model from systematically undercutting the corridor where skin tones live.
+        # Gaussian: 1 + 8×exp(-(x-0.20)²/0.008) → peaks at x=0.20 (9× boost), ±0.09 PQ FWHM
+        xs_curve_h = torch.linspace(0, 1, predicted_curves.shape[1],
+                                     device=predicted_curves.device)           # [256]
+        midtone_boost = 1.0 + 8.0 * torch.exp(-(xs_curve_h - 0.20)**2 / 0.008)  # [256]
+        # Clamp lower_bound to >=0 before division: gold curves can be slightly negative
+        # (RPU polynomial floating-point artefacts). Without clamp, the denominator goes
+        # negative → perceptual_lambda < 0 → negative loss → reward hacking.
+        _safe_denom = torch.clamp(lower_bound, min=0.0) + 1e-2                 # always > 0
+        perceptual_lambda = (self.lambda_outside / _safe_denom) * midtone_boost
+        under_shoot = torch.clamp(lower_bound - predicted_curves, min=0.0)
+        over_shoot  = torch.clamp(predicted_curves - upper_bound, min=0.0)
+        # Both penalties use _safe_denom to prevent sign flip when gold < -1e-2
+        lower_penalty = (perceptual_lambda * under_shoot).mean(dim=1)
+        upper_penalty = ((self.lambda_outside / _safe_denom) * over_shoot).mean(dim=1)
+        boundary_violation = lower_penalty + upper_penalty
 
         # 4. Composite loss
-        total_sample = (self.lambda_inside * base_mse) + \
-                       (self.lambda_outside * boundary_violation)
+        total_sample = (self.lambda_inside * base_mse) + boundary_violation
 
         # 5. Cell weighting
         if cell_weights is not None:
@@ -484,6 +624,43 @@ class BoundedDTMLoss(nn.Module):
 
 # Aliased for use in cell weighting within forward
 cell_weights_map = CELL_WEIGHTS
+
+
+# ---------------------------------------------------------------------------
+# Content-aware curve weights
+# ---------------------------------------------------------------------------
+def compute_scene_curve_weights(df, n_pts=N_CURVE_PTS):
+    """
+    Per-scene curve weights: uniform within the scene's active HDR range
+    [0, l1_max_pq/4095], zero above it (no content reaches there).
+
+    Rationale: curve error above l1_max_pq is irrelevant — the tone curve
+    is identity there and both gold & spline agree.  Focusing loss on the
+    active range avoids wasting gradient budget on the high-peak tail.
+
+    Returns float32 [N, n_pts], each row sums to 1.
+    """
+    xs = np.linspace(0, 1, n_pts, dtype=np.float32)           # [n_pts]
+    raw = df['l1_max_pq'].values.astype(np.float32)
+    # l1_max_pq may be raw (0-4095) or already normalised (0-1) depending on caller.
+    # load_data() normalises on read; raw CSVs do not.  Detect by magnitude.
+    l1_max = raw / 4095.0 if raw.max() > 2.0 else raw          # [N] in [0,1]
+
+    # Soft sigmoid taper at l1_max_pq:
+    #   weight ≈ 1.0 below l1_max_pq  (full gradient — content lives here)
+    #   weight tapers to ALPHA above   (partial gradient — preserves expansion signal)
+    # Hard zero would silence boost-curve learning above the scene peak;
+    # the soft floor keeps gradient flowing so neutral-neutral-boost / boost-boost-boost
+    # cells can still learn to lift highlights above identity.
+    ALPHA = 0.15     # minimum weight above peak  (15% of full)
+    WIDTH = 0.05     # sigmoid transition width in PQ units (~75 nits)
+    # sigmoid: 1 → 0 centered at l1_max_pq with width WIDTH
+    z = (xs[np.newaxis, :] - l1_max[:, np.newaxis]) / WIDTH    # [N, n_pts]
+    w = 1.0 / (1.0 + np.exp(z))                                # sigmoid, 1 below / 0 above
+    weights = (w * (1.0 - ALPHA) + ALPHA).astype(np.float32)   # [N, n_pts], in [ALPHA, 1]
+
+    row_sums = weights.sum(axis=1, keepdims=True)
+    return (weights / np.maximum(row_sums, 1.0)).astype(np.float32)
 
 
 # ---------------------------------------------------------------------------
@@ -631,7 +808,7 @@ class DVNRDataset(Dataset):
     """
 
     def __init__(self, df, feat_cols, tier_col='display_tier',
-                 feat_mean=None, feat_std=None):
+                 feat_mean=None, feat_std=None, content_loss=False):
         self.feat_cols = feat_cols
         self.df_valid = df.reset_index(drop=True)
 
@@ -713,6 +890,17 @@ class DVNRDataset(Dataset):
         else:
             self.spline_q_raw = None
 
+        # Content-aware curve weights: uniform within [0, l1_max_pq], zero above
+        if content_loss and 'l1_max_pq' in self.df_valid.columns:
+            print(f"  Computing content-aware curve weights (active-range masking)...", flush=True)
+            self.curve_weights = compute_scene_curve_weights(self.df_valid)
+            print(f"  curve_weights shape: {self.curve_weights.shape}  "
+                  f"mean active pts: {(self.curve_weights > 0).sum(axis=1).mean():.1f}/256", flush=True)
+        else:
+            self.curve_weights = np.full(
+                (len(self.X), N_CURVE_PTS), 1.0 / N_CURVE_PTS, dtype=np.float32
+            )
+
         print(f"  Dataset built: {len(curves):,} valid  {n_skip} skipped  "
               f"({time.time()-t0:.1f}s)", flush=True)
         print(f"  Feat cols: {len(all_feat_cols)}  MCP params: {MCP_K}  "
@@ -736,6 +924,7 @@ class DVNRDataset(Dataset):
             torch.tensor(self.gold_devs[idx], dtype=torch.float32),
             torch.tensor(int(self.groups[idx]), dtype=torch.long),
             spline_q,                                                 # [12] raw spline_q
+            torch.from_numpy(self.curve_weights[idx]),               # [256] content weights
         )
 
 
@@ -868,7 +1057,9 @@ def train(df, feat_cols=None, epochs=100, batch_size=64, lr=3e-4, device=None,
           no_tier=False, nr=False, envelope=False, phase=1, resume_from=None,
           residual_mcp=False, freq_weights=False,
           cell_aux=False, cell_alpha=0.2,
-          residual_l1=False, beta_scale=0.02, highlight_pos_mult=1.0):
+          residual_l1=False, beta_scale=0.02, highlight_pos_mult=1.0,
+          content_loss=False, smooth_gamma=0.0,
+          use_delta=False):
     """
     Train DVPolyMLP with Naka-Rushton output.
 
@@ -923,7 +1114,7 @@ def train(df, feat_cols=None, epochs=100, batch_size=64, lr=3e-4, device=None,
 
     # ── Build datasets ──
     print(f"\n[1/{3 if nr else 4}/4] Building dataset ({len(df):,} rows) ...", flush=True)
-    ds = DVNRDataset(df, feat_cols) if nr else DVCoefDataset(df, feat_cols)
+    ds = DVNRDataset(df, feat_cols, content_loss=content_loss) if nr else DVCoefDataset(df, feat_cols)
     pixel_dim = len(ds.feat_cols_used)
     if nr:
         print(f"  Input normalisation: mean=[{ds.feat_mean[:3]}...]  "
@@ -934,7 +1125,8 @@ def train(df, feat_cols=None, epochs=100, batch_size=64, lr=3e-4, device=None,
         # Pass train stats to val so both use same normalisation
         val_ds = (DVNRDataset(val_df, feat_cols,
                               feat_mean=ds.feat_mean if nr else None,
-                              feat_std=ds.feat_std  if nr else None)
+                              feat_std=ds.feat_std  if nr else None,
+                              content_loss=content_loss)
                   if nr else DVCoefDataset(val_df, feat_cols))
     else:
         gss = GroupShuffleSplit(n_splits=1, test_size=0.2, random_state=42)
@@ -943,12 +1135,19 @@ def train(df, feat_cols=None, epochs=100, batch_size=64, lr=3e-4, device=None,
         te_ds = torch.utils.data.Subset(ds, te_idx)
         val_ds = None
 
-    tr_loader = DataLoader(ds, batch_size=batch_size, shuffle=True, num_workers=0)
+    # Windows requires spawn for multiprocessing; persistent_workers causes silent
+    # crashes with spawn + CUDA. Use num_workers=0 (safe on all platforms).
+    # Speed gain from larger batch_size already covers most of the DataLoader overhead.
+    _pm = torch.cuda.is_available()
+    tr_loader = DataLoader(ds, batch_size=batch_size, shuffle=True,
+                           num_workers=0, pin_memory=_pm)
     if val_ds is not None:
-        te_loader = DataLoader(val_ds, batch_size=batch_size, shuffle=False, num_workers=0)
+        te_loader = DataLoader(val_ds, batch_size=batch_size, shuffle=False,
+                               num_workers=0, pin_memory=_pm)
     else:
         te_loader = DataLoader(torch.utils.data.Subset(ds, te_idx),
-                               batch_size=batch_size, shuffle=False, num_workers=0)
+                               batch_size=batch_size, shuffle=False,
+                               num_workers=0, pin_memory=_pm)
 
     print(f"  Train: {len(ds):,}  Val: {len(te_loader.dataset):,}  "
           f"Batches/epoch: {len(tr_loader)}", flush=True)
@@ -956,12 +1155,17 @@ def train(df, feat_cols=None, epochs=100, batch_size=64, lr=3e-4, device=None,
     # ── Build model ──
     print(f"\n[3/{3 if nr else 4}/4] Building model ...", flush=True)
 
-    model = DVPolyMLP(
-        pixel_dim=pixel_dim,
-        dropout=dropout,
-        use_tier_embed=(not no_tier),
-        has_trim_head=(not no_trim),
-    ).to(device)
+    if use_delta:
+        model = DeltaMLP(pixel_dim=pixel_dim, dropout=dropout).to(device)
+        print(f"  DeltaMLP: pixel_dim={pixel_dim}  params={sum(p.numel() for p in model.parameters()):,}  "
+              f"delta_scale={model.delta_scale}  zero-initialized (starts at spline)", flush=True)
+    else:
+        model = DVPolyMLP(
+            pixel_dim=pixel_dim,
+            dropout=dropout,
+            use_tier_embed=(not no_tier),
+            has_trim_head=(not no_trim),
+        ).to(device)
 
     # ── ResidualL1 mode: replace standard MCP + BoundedDTMLoss ──────────────
     if residual_l1:
@@ -1090,9 +1294,10 @@ def train(df, feat_cols=None, epochs=100, batch_size=64, lr=3e-4, device=None,
 
         for batch in tr_loader:
             if nr:
-                feats, cell_labels, mcp_params, gold_curves, spline_baselines, gold_devs, _, spline_q_raw_batch = batch
+                feats, cell_labels, mcp_params, gold_curves, spline_baselines, gold_devs, _, spline_q_raw_batch, curve_weights_batch = batch
                 feats, gold_curves = feats.to(device), gold_curves.to(device)
                 spline_baselines = spline_baselines.to(device) if envelope else None
+                curve_w = curve_weights_batch.to(device) if content_loss else None
                 tiers_batch = torch.zeros(len(feats), dtype=torch.long, device=device)
                 cell_labels_list = list(cell_labels)
             else:
@@ -1105,31 +1310,45 @@ def train(df, feat_cols=None, epochs=100, batch_size=64, lr=3e-4, device=None,
             opt.zero_grad()
 
             if nr:
-                mcp_raw, pred_trim, cell_logits = model(feats, tiers_batch)
-
-                if residual_l1:
-                    # Use RAW spline_q from batch (not normalised feature vector)
-                    spline_q_batch = spline_q_raw_batch.to(device)      # [B, 12] raw [0,0.544]
-                    pred_curve, corrections = model.residual_l1_dec(mcp_raw, spline_q_batch)
-                    gold_at_k12 = gold_curves[:, K12_INDICES]           # [B, 12]
-                    target_corr = gold_at_k12 - spline_q_batch          # [B, 12]
-                    loss = rl1_loss_fn(corrections, target_corr)
-                elif residual_mcp:
-                    pred_curve = model.mcp_eval_residual(mcp_raw, feats)
-                    if envelope:
-                        loss = loss_fn(pred_curve, gold_curves, spline_baselines, cell_labels_list)
-                    else:
-                        loss = nn.MSELoss()(pred_curve, gold_curves)
+                pred_trim = None    # default — only assigned for DVPolyMLP path
+                cell_logits = None
+                if use_delta:
+                    # DeltaMLP: pass spline as baseline, model returns spline+delta
+                    pred_curve, _, _ = model(feats, tiers_batch,
+                                              spline_baseline=spline_baselines)
+                    loss = loss_fn(pred_curve, gold_curves, spline_baselines,
+                                   cell_labels_list, curve_weights=curve_w)
                 else:
-                    pred_curve = model.mcp_eval(mcp_raw)     # [B, 256] via NCS
-                    if envelope:
-                        loss = loss_fn(pred_curve, gold_curves, spline_baselines, cell_labels_list)
+                    mcp_raw, pred_trim, cell_logits = model(feats, tiers_batch)
+
+                    if residual_l1:
+                        spline_q_batch = spline_q_raw_batch.to(device)
+                        pred_curve, corrections = model.residual_l1_dec(mcp_raw, spline_q_batch)
+                        gold_at_k12 = gold_curves[:, K12_INDICES]
+                        target_corr = gold_at_k12 - spline_q_batch
+                        loss = rl1_loss_fn(corrections, target_corr)
+                    elif residual_mcp:
+                        pred_curve = model.mcp_eval_residual(mcp_raw, feats)
+                        if envelope:
+                            loss = loss_fn(pred_curve, gold_curves, spline_baselines, cell_labels_list)
+                        else:
+                            loss = nn.MSELoss()(pred_curve, gold_curves)
                     else:
-                        loss = nn.MSELoss()(pred_curve, gold_curves)
+                        pred_curve = model.mcp_eval(mcp_raw)
+                        if envelope:
+                            loss = loss_fn(pred_curve, gold_curves, spline_baselines,
+                                           cell_labels_list, curve_weights=curve_w)
+                        else:
+                            loss = nn.MSELoss()(pred_curve, gold_curves)
 
                 # MCP monotonicity is structurally guaranteed; small penalty for safety
                 diffs = pred_curve[:, 1:] - pred_curve[:, :-1]
                 loss += torch.mean(torch.clamp(-diffs, min=0.0) ** 2) * 10.0
+
+                # Smoothness regulariser: penalise curvature (second differences)
+                if smooth_gamma > 0.0:
+                    d2 = pred_curve[:, 2:] - 2.0 * pred_curve[:, 1:-1] + pred_curve[:, :-2]
+                    loss += smooth_gamma * (d2 ** 2).mean()
 
                 if pred_trim is not None and not no_trim:
                     loss += nn.L1Loss()(pred_trim, torch.zeros_like(pred_trim)) * 0.05
@@ -1166,26 +1385,35 @@ def train(df, feat_cols=None, epochs=100, batch_size=64, lr=3e-4, device=None,
         with torch.no_grad():
             for batch in te_loader:
                 if nr:
-                    feats, _, _, gold_curves, spline_baselines, _, _, spline_q_raw_batch = batch
+                    feats, _, _, gold_curves, spline_baselines, _, _, spline_q_raw_batch, curve_weights_batch = batch
                     feats, gold_curves = feats.to(device), gold_curves.to(device)
                     spline_baselines = spline_baselines.to(device) if envelope else None
+                    curve_w = curve_weights_batch.to(device) if content_loss else None
                     tiers_batch = torch.zeros(len(feats), dtype=torch.long, device=device)
 
-                    mcp_raw, _, cell_logits = model(feats, tiers_batch)
-                    if residual_l1:
-                        spline_q_b = spline_q_raw_batch.to(device)      # raw [0,0.544]
-                        pred_curve, corrections = model.residual_l1_dec(mcp_raw, spline_q_b)
-                        gold_at_k12 = gold_curves[:, K12_INDICES]
-                        target_corr = gold_at_k12 - spline_q_b
-                        l = rl1_loss_fn(corrections, target_corr)
-                    elif residual_mcp:
-                        pred_curve = model.mcp_eval_residual(mcp_raw, feats)
-                        l = loss_fn(pred_curve, gold_curves, spline_baselines, None) \
-                            if envelope else nn.MSELoss()(pred_curve, gold_curves)
+                    if use_delta:
+                        pred_curve, _, _ = model(feats, tiers_batch,
+                                                  spline_baseline=spline_baselines)
+                        l = loss_fn(pred_curve, gold_curves, spline_baselines, None,
+                                    curve_weights=curve_w)
                     else:
-                        pred_curve = model.mcp_eval(mcp_raw)
-                        l = loss_fn(pred_curve, gold_curves, spline_baselines, None) \
-                            if envelope else nn.MSELoss()(pred_curve, gold_curves)
+                        mcp_raw, _, cell_logits = model(feats, tiers_batch)
+                        if residual_l1:
+                            spline_q_b = spline_q_raw_batch.to(device)
+                            pred_curve, corrections = model.residual_l1_dec(mcp_raw, spline_q_b)
+                            gold_at_k12 = gold_curves[:, K12_INDICES]
+                            target_corr = gold_at_k12 - spline_q_b
+                            l = rl1_loss_fn(corrections, target_corr)
+                        elif residual_mcp:
+                            pred_curve = model.mcp_eval_residual(mcp_raw, feats)
+                            l = loss_fn(pred_curve, gold_curves, spline_baselines, None,
+                                        curve_weights=curve_w) \
+                                if envelope else nn.MSELoss()(pred_curve, gold_curves)
+                        else:
+                            pred_curve = model.mcp_eval(mcp_raw)
+                            l = loss_fn(pred_curve, gold_curves, spline_baselines, None,
+                                        curve_weights=curve_w) \
+                                if envelope else nn.MSELoss()(pred_curve, gold_curves)
                 else:
                     feats, tiers_b, targets_42, gold_curves, gold_trims, _, _ = batch
                     feats, tiers_b = feats.to(device), tiers_b.to(device)
@@ -1238,18 +1466,28 @@ def train(df, feat_cols=None, epochs=100, batch_size=64, lr=3e-4, device=None,
         model.eval()
         with torch.no_grad():
             for batch in te_loader:
-                feats, _, _, gold_curves, _, _, _, _sq = batch
+                feats, _, _, gold_curves, _, _, _, _sq, _cw = batch
                 feats = feats.to(device)
                 tiers_b = torch.zeros(len(feats), dtype=torch.long, device=device)
-                mcp_raw, _, _cell = model(feats, tiers_b)
-                if residual_l1:
-                    spline_q_b = _sq.to(device)
-                    pred_curve, _ = model.residual_l1_dec(mcp_raw, spline_q_b)
+                if use_delta:
+                    # DeltaMLP needs spline baseline — load from batch (position 4)
+                    _splines_b = _  # position 4 in batch is spline_baselines (unused above)
+                    # Re-unpack for clarity:
+                    (feats2, _, _, gold_curves2, splines_eval, _, _, _sq2, _cw2) = \
+                        (feats, *[None]*8)  # already unpacked above
+                    # Pass None spline → returns raw delta (for MAE vs gold delta)
+                    pred_curve, _, _ = model(feats, tiers_b, spline_baseline=None)
                     pred_curve = pred_curve.cpu().numpy()
-                elif residual_mcp:
-                    pred_curve = model.mcp_eval_residual(mcp_raw, feats).cpu().numpy()
                 else:
-                    pred_curve = model.mcp_eval(mcp_raw).cpu().numpy()
+                    mcp_raw, _, _cell = model(feats, tiers_b)
+                    if residual_l1:
+                        spline_q_b = _sq.to(device)
+                        pred_curve, _ = model.residual_l1_dec(mcp_raw, spline_q_b)
+                        pred_curve = pred_curve.cpu().numpy()
+                    elif residual_mcp:
+                        pred_curve = model.mcp_eval_residual(mcp_raw, feats).cpu().numpy()
+                    else:
+                        pred_curve = model.mcp_eval(mcp_raw).cpu().numpy()
                 gold = gold_curves.cpu().numpy()
                 for i in range(len(pred_curve)):
                     mae_list.append(np.mean(np.abs(gold[i] - pred_curve[i])))
@@ -1516,6 +1754,20 @@ if __name__ == '__main__':
     ap.add_argument('--envelope',    action='store_true',
                     help='Use BoundedDTMLoss with envelope hinge. '
                          'Penalizes curve escaping [min(gold,spline), max(gold,spline)]')
+    ap.add_argument('--delta', action='store_true',
+                    help='DeltaMLP: predict correction delta added to spline baseline. '
+                         'Model starts at zero correction (output=spline) and learns '
+                         'colorist style on top. Fixes domain shift for HDR10 inference.')
+    ap.add_argument('--use-maxscl', action='store_true',
+                    help='V2 feature set: replace l1_max_pq/l1_avg_pq with maxscl/average_maxrgb '
+                         'and use spline_km_* (maxscl-based knots). Makes training consistent '
+                         'with HDR10 inference. Retrain from scratch — incompatible with Run14 weights.')
+    ap.add_argument('--content-loss', action='store_true',
+                    help='Content-aware curve weighting: loss zeroed above l1_max_pq per scene '
+                         '(no gradient wasted on unreachable curve region)')
+    ap.add_argument('--smooth-gamma', type=float, default=0.0,
+                    help='Smoothness regulariser weight: penalises second differences of '
+                         'predicted curve (curvature). Try 1e-3 to 1e-2. Default 0 (off).')
 
     # ── Two-phase training ──
     ap.add_argument('--phase',       type=int,   default=1, choices=[1, 2],
@@ -1572,24 +1824,38 @@ if __name__ == '__main__':
             if 'target_nits' not in val_df.columns:
                 val_df = expand_tiers(val_df)
 
-        if args.pruned_feats:
+        if args.use_maxscl:
+            # V2 feature set: drop l1_max_pq/l1_avg_pq (RPU metadata, not available for HDR10).
+            # Use maxscl/average_maxrgb as consistent scene peak — same signal in training and inference.
+            # Automatically includes spline_km_* (maxscl-based knots) instead of spline_k_* (l1_max_pq-based).
+            from dv_coef_model import (BASE_FEATURE_COLS_V2, SPLINE_KNOT_MAXSCL_COLS,
+                                       SAT_FEATURE_COLS_5X5 as _SAT5X5)
+            base_v2 = BASE_FEATURE_COLS_V2 + SAT_FEATURE_COLS
+            if args.use_5x5:
+                base_v2 = base_v2 + _SAT5X5
+            feat_cols = base_v2 + SPLINE_KNOT_MAXSCL_COLS
+            print(f"  --use-maxscl: V2 features ({len(feat_cols)} total) — "
+                  f"l1_max_pq/l1_avg_pq replaced by maxscl/average_maxrgb; "
+                  f"spline_km_* (maxscl-based) included", flush=True)
+        elif args.pruned_feats:
             feat_cols = FEATURE_COLS_PRUNED
             print(f"  --pruned-feats: using {len(feat_cols)}-feature pruned set", flush=True)
         else:
             feat_cols = FEATURE_COLS_5X5 if args.use_5x5 else FEATURE_COLS
-        if args.no_bar:
-            import sys as _sys
-            _mod = _sys.modules[__name__]
-            _mod.BAR_FEATURE_COLS = []
-            print("  --no-bar: bar features excluded from feature vector", flush=True)
-        if getattr(args, 'derived_feats', False):
-            feat_cols = feat_cols + DERIVED_FEAT_COLS
-            print(f"  --derived-feats: added {len(DERIVED_FEAT_COLS)} derived features "
-                  f"({len(feat_cols)} total)", flush=True)
-        if args.spline_feats and not args.pruned_feats:
-            feat_cols = feat_cols + SPLINE_KNOT_COLS
-            print(f"  --spline-feats: added {len(SPLINE_KNOT_COLS)} spline knot features "
-                  f"({len(feat_cols)} total)", flush=True)
+        if not args.use_maxscl:
+            if args.no_bar:
+                import sys as _sys
+                _mod = _sys.modules[__name__]
+                _mod.BAR_FEATURE_COLS = []
+                print("  --no-bar: bar features excluded from feature vector", flush=True)
+            if getattr(args, 'derived_feats', False):
+                feat_cols = feat_cols + DERIVED_FEAT_COLS
+                print(f"  --derived-feats: added {len(DERIVED_FEAT_COLS)} derived features "
+                      f"({len(feat_cols)} total)", flush=True)
+            if args.spline_feats and not args.pruned_feats:
+                feat_cols = feat_cols + SPLINE_KNOT_COLS
+                print(f"  --spline-feats: added {len(SPLINE_KNOT_COLS)} spline knot features "
+                      f"({len(feat_cols)} total)", flush=True)
 
         # Override MCP_K and ENVELOPE_OUTSIDE from CLI
         import sys as _sys
@@ -1627,6 +1893,9 @@ if __name__ == '__main__':
             residual_l1=args.residual_l1,
             beta_scale=args.beta_scale,
             highlight_pos_mult=args.highlight_pos_mult,
+            content_loss=args.content_loss,
+            smooth_gamma=args.smooth_gamma,
+            use_delta=args.delta,
         )
 
         # Save final

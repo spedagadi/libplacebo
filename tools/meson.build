@@ -53,3 +53,10 @@ libplacebo_baseline_eval = executable('libplacebo_baseline_eval',
     install: false,
 )
 message('libplacebo baseline evaluator will be built: libplacebo_baseline_eval')
+
+pl_ml_model_eval = executable('pl_ml_model_eval',
+    'pl_ml_model_eval.c',
+    dependencies: [libplacebo],
+    install: false,
+)
+message('Native ML model evaluator will be built: pl_ml_model_eval')

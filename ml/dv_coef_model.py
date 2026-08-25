@@ -85,6 +85,16 @@ BASE_FEATURE_COLS = (
     ['l1_max_pq', 'l1_avg_pq']
 )
 
+# V2 feature set: drop l1_max_pq/l1_avg_pq (RPU metadata, unavailable for HDR10).
+# Use maxscl and average_maxrgb which are already present and consistent between
+# DV training (GPU histogram extraction) and HDR10 inference (daemon extraction).
+# Train/infer with: --use-maxscl  (uses BASE_FEATURE_COLS_V2 + SPLINE_KNOT_MAXSCL_COLS)
+BASE_FEATURE_COLS_V2 = (
+    ['maxscl', 'average_maxrgb', 'fraction_bright_pixels'] +
+    [f'distrib_val_{i}' for i in range(3, 9)]
+    # l1_max_pq and l1_avg_pq intentionally excluded — not available at HDR10 inference
+)
+
 # 5 derived SAT features — compact spatial representation.
 # Captures the same spatial structure as all 18 raw zones but with fewer parameters,
 # making it suitable for smaller datasets (~1-3k scenes).
@@ -120,9 +130,10 @@ FEATURE_COLS_5X5 = BASE_FEATURE_COLS + SAT_FEATURE_COLS + SAT_FEATURE_COLS_5X5
 # Spline knot features: libplacebo spline sampled at 8 MCP x-knot positions
 # linspace(0,1,8) → indices [0,36,73,109,146,182,219,255] in 256-pt spline
 # Added by tools/stage2_add_spline_knots.py; use with --spline-feats
-SPLINE_KNOT_COLS   = [f"spline_k{i}" for i in range(8)]   # K=8 positions (existing)
-SPLINE_KNOT12_COLS = [f"spline_q{i}" for i in range(12)]  # K=12 positions (Run 20)
-K12_INDICES        = [round(k * 255 / 11) for k in range(12)]  # [0,23,46..255]
+SPLINE_KNOT_COLS        = [f"spline_k{i}"  for i in range(8)]   # K=8 positions, from l1_max_pq baseline
+SPLINE_KNOT_MAXSCL_COLS = [f"spline_km_{i}" for i in range(8)]  # K=8 positions, from maxscl baseline (V2)
+SPLINE_KNOT12_COLS      = [f"spline_q{i}"  for i in range(12)]  # K=12 positions (Run 20)
+K12_INDICES             = [round(k * 255 / 11) for k in range(12)]  # [0,23,46..255]
 
 # Pruned feature set derived from permutation importance analysis (Run 14):
 #   sat_5x5_mean: +11.5%   spline_k1..k4: +0.4-0.8%   sat_3x3_mean: +1.0%

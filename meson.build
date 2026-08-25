@@ -490,8 +490,9 @@ endif
 
 build_deps = [ libm, threads ]
 
-subdir('tools')
+subdir('tools/glsl_preproc')
 subdir('src')
+subdir('tools')
 
 if get_option('demos')
   subdir('demos')

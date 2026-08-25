@@ -21,6 +21,22 @@ Training with Python/numpy and inference with libplacebo GPU created risk of sil
 
 **Solution**: Single source of truth - both training and inference use identical libplacebo C code.
 
+### Native gamma inference
+
+The trained gamma model can be exported for native C inference:
+
+```bash
+python ml/export_gamma_model_native.py \
+  --input F:/DTMModelData/xgb_gamma_model.pkl \
+  --model-output xgb_gamma_model.plxgb \
+  --manifest-output xgb_gamma_model.manifest.json
+```
+
+The `.plxgb` artifact contains the 500-tree XGBoost regressor and the
+manifest records the ordered 88-feature contract. Native inference is exposed
+by `pl_ml_model_create()` and `pl_ml_model_predict()` in libplacebo. The
+`pl_ml_model_eval` tool accepts an 88-float feature vector for parity testing.
+
 ### New Files (Start Here)
 
 | Document | Purpose |
