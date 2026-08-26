@@ -67,7 +67,7 @@ PL_API bool pl_ml_render_evaluate(pl_gpu gpu, const struct pl_frame *frame,
 // chroma tuner settings. `hooks` must contain room for four entries and remain
 // alive for the render using the result.
 PL_API int pl_ml_render_get_hooks(struct pl_ml_render_result *result,
-                                  struct pl_hook *hooks);
+                                  struct pl_hook hooks[]);
 
 PL_API_END
 

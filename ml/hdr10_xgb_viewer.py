@@ -39,9 +39,12 @@ W, H      = 1280, 720
 
 
 class PersistentRenderer:
-    """Persistent dv_render process used for both diagnostic render modes."""
+    """Persistent dv_render process for a single render mode."""
 
-    def __init__(self):
+    def __init__(self, mode="spline", iir_alpha=0.10, iir_scene_cut=0.15):
+        self.mode = mode
+        self.iir_alpha = iir_alpha
+        self.iir_scene_cut = iir_scene_cut
         self.process = None
         self.lock = threading.Lock()
         self.stderr_file = None
@@ -50,10 +53,16 @@ class PersistentRenderer:
         self.stderr_file = DV_SERVER_LOG.open("ab")
         env = os.environ.copy()
         env["PATH"] = (r"C:\Code\libplacebo\build_persistent\src;"
+                r"C:\Code\libplacebo\build_persistent\tools;"
                 r"C:\msys64\ucrt64\bin;C:\msys64\usr\bin;"
                 + env.get("PATH", ""))
+        cmd = [DV_RENDER, "--server", "--mode", self.mode]
+        if self.mode != "spline":
+            cmd += ["--model", str(NATIVE_MODEL_PATH),
+                    "--iir-alpha", str(self.iir_alpha),
+                    "--iir-scene-cut", str(self.iir_scene_cut)]
         self.process = subprocess.Popen(
-            [DV_RENDER, "--server", "--model", str(NATIVE_MODEL_PATH)],
+            cmd,
             stdin=subprocess.PIPE, stdout=subprocess.PIPE,
             stderr=self.stderr_file, env=env, bufsize=0,
         )
@@ -67,25 +76,7 @@ class PersistentRenderer:
             self.stderr_file.close()
             self.stderr_file = None
 
-    def render_pair(self, video, pts, nits, gamma_mode, gamma, cr_mode,
-                    cr_strength, fire_pop_mode, fire_pop, radiance_mode,
-                    radiance_knee, radiance_strength,
-                    chroma_mode="off", chroma_neutral=1.20, chroma_fire=1.35,
-                    chroma_knee=0.55, chroma_skin=0.95):
-        request = json.dumps({
-            "input": str(video), "pts": float(pts), "width": W, "height": H,
-            "out_nits": float(nits),
-            "gamma_mode": gamma_mode, "contrast_gamma": float(gamma),
-            "cr_mode": cr_mode, "cr_strength": float(cr_strength),
-            "fire_pop_mode": fire_pop_mode, "fire_pop_strength": float(fire_pop),
-            "radiance_mode": radiance_mode, "radiance_knee": float(radiance_knee),
-            "radiance_strength": float(radiance_strength),
-            "chroma_mode": chroma_mode,
-            "chroma_neutral_boost": float(chroma_neutral),
-            "chroma_fire_boost": float(chroma_fire),
-            "chroma_knee": float(chroma_knee),
-            "chroma_skin_protect": float(chroma_skin),
-        }).encode("utf-8") + b"\n"
+    def _send_request(self, request):
         with self.lock:
             for attempt in range(2):
                 try:
@@ -97,9 +88,9 @@ class PersistentRenderer:
                     if header[:4] != b"DVR2":
                         raise RuntimeError("invalid dv_render server header")
                     version, width, height, count = struct.unpack("<4I", header[4:])
-                    if version != 2 or width != W or height != H or count != 3:
+                    if version != 2 or width != W or height != H or count != 2:
                         raise RuntimeError(f"unexpected DVR2 response: {version}, {width}x{height}, {count}")
-                    frames = {}
+                    img = None
                     frame_info = None
                     for _ in range(count):
                         mode, length = struct.unpack("<2I", self._read_exact(8))
@@ -114,14 +105,14 @@ class PersistentRenderer:
                                  "radiance_knee", "radiance_strength",
                                  "chroma_neutral_boost", "chroma_fire_boost",
                                  "chroma_knee", "chroma_skin_protect"), values))
-                            continue
-                        expected = W * H * 3
-                        if length != expected:
-                            raise RuntimeError(f"unexpected frame payload size: {length}")
-                        frames[mode] = np.frombuffer(payload, dtype=np.uint8).reshape(H, W, 3).copy()
-                    if 1 not in frames or 2 not in frames or frame_info is None:
+                        else:
+                            expected = W * H * 3
+                            if length != expected:
+                                raise RuntimeError(f"unexpected frame payload size: {length}")
+                            img = np.frombuffer(payload, dtype=np.uint8).reshape(H, W, 3).copy()
+                    if img is None or frame_info is None:
                         raise RuntimeError("incomplete DVR2 response")
-                    return frames[1], frames[2], frame_info
+                    return img, frame_info
                 except (BrokenPipeError, EOFError, OSError, RuntimeError):
                     self._stop()
                     if attempt:
@@ -138,7 +129,8 @@ class PersistentRenderer:
         return bytes(data)
 
 
-_PERSISTENT_RENDERER = PersistentRenderer()
+_RENDERER_SPLINE = PersistentRenderer(mode="spline")
+_RENDERER_CR     = PersistentRenderer(mode="contrast-recovery")
 
 # ── Core functions ────────────────────────────────────────────────────────────
 def render_persistent_pair(video, pts, nits, gamma_mode, gamma, cr_mode,
@@ -146,12 +138,33 @@ def render_persistent_pair(video, pts, nits, gamma_mode, gamma, cr_mode,
                             radiance_knee, radiance_strength,
                             chroma_mode="off", chroma_neutral=1.20, chroma_fire=1.35,
                             chroma_knee=0.55, chroma_skin=0.95):
-    """Render both diagnostic views through one persistent native process."""
-    return _PERSISTENT_RENDERER.render_pair(
-        video, pts, nits, gamma_mode, gamma, cr_mode, cr_strength,
-        fire_pop_mode, fire_pop, radiance_mode, radiance_knee, radiance_strength,
-        chroma_mode, chroma_neutral, chroma_fire, chroma_knee, chroma_skin
-    )
+    """Render spline and CR using two separate processes (no shared renderer state)."""
+    spline_request = json.dumps({
+        "input": str(video), "pts": float(pts), "width": W, "height": H,
+        "out_nits": float(nits),
+    }).encode("utf-8") + b"\n"
+
+    cr_request = json.dumps({
+        "input": str(video), "pts": float(pts), "width": W, "height": H,
+        "out_nits": float(nits),
+        "gamma_mode": gamma_mode, "contrast_gamma": float(gamma),
+        "cr_mode": cr_mode, "cr_strength": float(cr_strength),
+        "fire_pop_mode": fire_pop_mode, "fire_pop_strength": float(fire_pop),
+        "radiance_mode": radiance_mode, "radiance_knee": float(radiance_knee),
+        "radiance_strength": float(radiance_strength),
+        "chroma_mode": chroma_mode,
+        "chroma_neutral_boost": float(chroma_neutral),
+        "chroma_fire_boost": float(chroma_fire),
+        "chroma_knee": float(chroma_knee),
+        "chroma_skin_protect": float(chroma_skin),
+    }).encode("utf-8") + b"\n"
+
+    img_spl, fi_spl = _RENDERER_SPLINE._send_request(spline_request)
+    img_cr,  fi_cr  = _RENDERER_CR._send_request(cr_request)
+    # Use CR frame_info (has gamma/CR/chroma values); merge l1 from spline
+    fi_cr["l1_max_pq"] = fi_spl["l1_max_pq"]
+    fi_cr["l1_avg_pq"] = fi_spl["l1_avg_pq"]
+    return img_spl, img_cr, fi_cr
 
 def render_frame(video, pts, nits, maxscl, avg, mode="spline",
                  contrast_gamma=0.0, cr_strength=0.0, fire_pop_strength=0.0):

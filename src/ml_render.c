@@ -86,6 +86,13 @@ static struct pl_hook_res chroma_tuner_hook(void *priv, const struct pl_hook_par
         "}\n"
         "float chroma_scalar = mix(luma_boost, 1.0, clamp(skin_weight * u_chroma_skin_protect, 0.0, 1.0));\n"
         "chroma_scalar = clamp(chroma_scalar, 1.0, 1.50);\n"
+        "// Safe taper: prevent green channel from going negative on saturated highlights\n"
+        "// (e.g. pure-red fire pixels where green reconstruction would clip to black)\n"
+        "float g_denom = (0.2126 / 0.7152) * r_res + (0.0722 / 0.7152) * b_res;\n"
+        "if (g_denom > 0.0) {\n"
+        "    float max_safe = y / g_denom;\n"
+        "    if (max_safe < chroma_scalar) chroma_scalar = max(1.0, max_safe);\n"
+        "}\n"
         "color.r = clamp(y + r_res * chroma_scalar, 0.0, 1.0);\n"
         "color.g = clamp(y - (0.2126 / 0.7152) * r_res * chroma_scalar - (0.0722 / 0.7152) * b_res * chroma_scalar, 0.0, 1.0);\n"
         "color.b = clamp(y + b_res * chroma_scalar, 0.0, 1.0);\n";
@@ -172,8 +179,15 @@ bool pl_ml_render_evaluate(pl_gpu gpu, const struct pl_frame *frame,
     if (params->cr_mode == PL_ML_CONTROL_MANUAL) {
         result->cr_strength = params->cr_strength;
     } else if (params->cr_mode == PL_ML_CONTROL_AUTO) {
-        result->cr_strength = fmaxf(0.1f, fminf(0.5f,
+        float base_cr = fmaxf(0.1f, fminf(0.5f,
             0.25f + (1.2f - result->gamma) * 0.15f));
+        // Taper CR for very bright/high-contrast scenes (fires, explosions).
+        // At l1_max > 0.7 the bilateral filter has extreme gradients that crush
+        // bright edges. Scale back up to 50% reduction at l1_max=1.0.
+        float l1max = result->l1_max_pq > 0.0f ? result->l1_max_pq :
+                      (params->l1_max_pq > 0.0f ? params->l1_max_pq : 0.5f);
+        float brightness_taper = 1.0f - fmaxf(0.0f, (l1max - 0.7f) / 0.3f) * 0.5f;
+        result->cr_strength = base_cr * brightness_taper;
     }
 
     struct pl_ml_radiance_params radiance = params->radiance;

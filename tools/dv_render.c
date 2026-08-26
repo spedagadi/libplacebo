@@ -427,6 +427,13 @@ typedef struct {
     int         playback_server;
     bool        write_output;
     const char *model_path;
+    /* Temporal IIR smoothing for ML parameters (gamma, CR, radiance).
+     * iir_alpha: per-frame blend weight toward new value (0=frozen, 1=instant).
+     *   0.10 ≈ 10-frame lag @24fps (default)
+     * iir_scene_cut: l1_max_pq step threshold that triggers IIR reset.
+     *   0.15 ≈ moderate scene cut sensitivity (default) */
+    float       iir_alpha;
+    float       iir_scene_cut;
 } Args;
 
 static void usage(const char *argv0)
@@ -503,6 +510,8 @@ static bool parse_args(int argc, char **argv, Args *a)
     a->radiance_knee = 0.60f;
     a->radiance_strength = 0.30f;
     a->radiance_mode = DV_CONTROL_OFF;
+    a->iir_alpha      = 0.10f;   /* 10-frame lag @24fps */
+    a->iir_scene_cut  = 0.15f;   /* reset IIR when l1_max jumps >0.15 */
     a->write_output = true;
 
     for (int i = 1; i < argc; i++) {
@@ -542,6 +551,8 @@ static bool parse_args(int argc, char **argv, Args *a)
         else if (!strcmp(argv[i], "--radiance-knee")      && i+1 < argc) { a->radiance_knee = atof(argv[++i]); a->radiance_mode = DV_CONTROL_MANUAL; }
         else if (!strcmp(argv[i], "--radiance-strength")  && i+1 < argc) { a->radiance_strength = atof(argv[++i]); a->radiance_mode = DV_CONTROL_MANUAL; }
         else if (!strcmp(argv[i], "--contrast-recovery")) { a->contrast_recovery = 1; }
+        else if (!strcmp(argv[i], "--iir-alpha")          && i+1 < argc) { a->iir_alpha     = atof(argv[++i]); }
+        else if (!strcmp(argv[i], "--iir-scene-cut")      && i+1 < argc) { a->iir_scene_cut = atof(argv[++i]); }
         else { fprintf(stderr, "Unknown argument: %s\n", argv[i]); return false; }
     }
     if (a->server || a->playback_server)
@@ -1254,9 +1265,16 @@ static int render_frame_with_decoder(Args a, pl_gpu gpu, pl_renderer renderer,
                 a.gamma_mode == DV_CONTROL_OFF ? 1.0f : predicted_gamma;
             ml_result.l2_power = 2048.0f / ml_result.gamma;
             ml_result.l2_saturation = 2048.0f;
-            ml_result.cr_strength = a.cr_mode == DV_CONTROL_MANUAL ? a.cr_strength :
-                a.cr_mode == DV_CONTROL_OFF ? 0.0f : fmaxf(0.1f, fminf(0.5f,
+            if (a.cr_mode == DV_CONTROL_MANUAL) {
+                ml_result.cr_strength = a.cr_strength;
+            } else if (a.cr_mode == DV_CONTROL_OFF) {
+                ml_result.cr_strength = 0.0f;
+            } else {
+                float base_cr = fmaxf(0.1f, fminf(0.5f,
                     0.25f + (1.2f - ml_result.gamma) * 0.15f));
+                float brightness_taper = 1.0f - fmaxf(0.0f, (a.l1_max_pq - 0.7f) / 0.3f) * 0.5f;
+                ml_result.cr_strength = base_cr * brightness_taper;
+            }
             pl_ml_radiance_configure(&ml_result.radiance, pl_ml_radiance_params(
                 .mode = (enum pl_ml_control_mode)a.radiance_mode,
                 .average_luma = a.l1_avg_pq,
@@ -1314,15 +1332,17 @@ static int render_frame_with_decoder(Args a, pl_gpu gpu, pl_renderer renderer,
                     cmap.contrast_recovery, gamma);
         }
 
-        /* Contrast recovery smoothness (blur kernel radius for high/low split).
-         * 2.5 = tighter halos on fine textures. 3.5 = libplacebo default.
-         * Users can increase for broader boost or decrease for sharper edges. */
-        if (a.cr_smoothness >= 0.0f) {
-            cmap.contrast_smoothness = a.cr_smoothness;
-            fprintf(stderr, "  CR smoothness: %.1f (explicit)\n", a.cr_smoothness);
-        } else {
-            cmap.contrast_smoothness = 2.5f;
-            fprintf(stderr, "  CR smoothness: %.1f (default)\n", cmap.contrast_smoothness);
+        /* Only override contrast_smoothness when CR is actually active.
+         * Leaving it at the libplacebo default (3.5) when CR=off ensures
+         * the CR-off path produces identical output to pure spline mode. */
+        if (cmap.contrast_recovery > 0.0f) {
+            if (a.cr_smoothness >= 0.0f) {
+                cmap.contrast_smoothness = a.cr_smoothness;
+                fprintf(stderr, "  CR smoothness: %.1f (explicit)\n", a.cr_smoothness);
+            } else {
+                cmap.contrast_smoothness = 2.5f;
+                fprintf(stderr, "  CR smoothness: %.1f (default)\n", cmap.contrast_smoothness);
+            }
         }
         if (frame_info) {
             frame_info->flags = a.gamma_mode == DV_CONTROL_MANUAL ? DV_FRAME_INFO_MANUAL :
@@ -2100,6 +2120,15 @@ static bool write_server_header(const ServerRequest *request)
            write_u32_le((uint32_t)request->height) && write_u32_le(3);
 }
 
+static bool write_server_header_single(const ServerRequest *request)
+{
+    /* Single-mode header: count=2 (one image + frame_info) */
+    static const uint8_t magic[] = { 'D', 'V', 'R', '2' };
+    return fwrite(magic, 1, sizeof(magic), stdout) == sizeof(magic) &&
+           write_u32_le(2) && write_u32_le((uint32_t)request->width) &&
+           write_u32_le((uint32_t)request->height) && write_u32_le(2);
+}
+
 static bool write_server_frame_info(const struct dv_frame_info *info)
 {
     return write_u32_le(3) && write_u32_le(52) &&
@@ -2390,6 +2419,21 @@ int main(int argc, char **argv)
     fprintf(stderr, "DV renderer server ready: DVR2 responses on stdout\n");
     NativeDecoder decoder = {0};
     char line[4096];
+
+    /* IIR smoothing state for ML-derived parameters.
+     * Prevents per-frame flicker in gamma, CR strength, and radiance.
+     * alpha=0.10 gives ~10-frame (0.4s at 24fps) smoothing lag.
+     * Scene cuts detected via l1_max_pq step > 0.15 → instant reset. */
+    struct {
+        bool initialized;
+        float l1_max_pq;   /* previous frame — for scene cut detection */
+        float l1_avg_pq;
+        float gamma;
+        float cr_strength;
+        float radiance_strength;
+        float radiance_knee;
+    } iir = {0};
+
     while (fgets(line, sizeof(line), stdin)) {
         ServerRequest request;
         if (!parse_server_request(line, &request)) {
@@ -2405,13 +2449,86 @@ int main(int argc, char **argv)
             fprintf(stderr, "Server decoder reuse: %s\n", request.input);
         }
         struct dv_frame_info frame_info = {0};
-        if (!write_server_header(&request) ||
-            !write_server_record(1, &request, gpu, renderer, ml_context, &decoder, NULL) ||
-            !write_server_record(2, &request, gpu, renderer, ml_context, &decoder,
-                                 &frame_info) ||
-            !write_server_frame_info(&frame_info)) {
+        bool is_spline_only = !strcmp(args.mode, "spline") ||
+                              !strcmp(args.mode, "st2094-10") ||
+                              !strcmp(args.mode, "st2094-40") ||
+                              !strcmp(args.mode, "bt2390");
+
+        /* IIR temporal smoothing for CR mode only.
+         * Apply smoothed values from previous frame as manual overrides so
+         * parameters don't jump abruptly between frames. */
+        if (!is_spline_only && iir.initialized) {
+            /* Scene cut detection: large l1_max step → instant reset */
+            /* Use previous IIR values when request doesn't supply l1 stats */
+            float l1max_new = request.l1_max_pq > 0.01f ?
+                              request.l1_max_pq : iir.l1_max_pq;
+            float l1avg_new = request.l1_avg_pq > 0.0f ?
+                              request.l1_avg_pq : iir.l1_avg_pq;
+            bool scene_cut = fabsf(l1max_new - iir.l1_max_pq) > args.iir_scene_cut ||
+                             fabsf(l1avg_new - iir.l1_avg_pq) > args.iir_scene_cut * 0.67f;
+            if (scene_cut) {
+                fprintf(stderr, "IIR: scene cut (l1max %.3f→%.3f), resetting\n",
+                        iir.l1_max_pq, l1max_new);
+                iir.initialized = false;  /* Force full reset on next frame */
+            } else {
+                /* Feed smoothed values from previous frame as manual overrides.
+                 * The IIR accumulator is updated AFTER render using actual output. */
+                if (request.gamma_mode == DV_CONTROL_AUTO) {
+                    request.gamma_mode = DV_CONTROL_MANUAL;
+                    request.contrast_gamma = iir.gamma;
+                }
+                if (request.cr_mode == DV_CONTROL_AUTO) {
+                    request.cr_mode = DV_CONTROL_MANUAL;
+                    request.cr_strength = iir.cr_strength;
+                }
+                if (request.radiance_mode == DV_CONTROL_AUTO) {
+                    request.radiance_mode = DV_CONTROL_MANUAL;
+                    request.radiance_strength = iir.radiance_strength;
+                    request.radiance_knee = iir.radiance_knee;
+                }
+                fprintf(stderr, "IIR: gamma=%.4f cr=%.4f rad=%.4f\n",
+                        iir.gamma, iir.cr_strength, iir.radiance_strength);
+            }
+        }
+
+        bool ok_req;
+        if (is_spline_only) {
+            /* Spline-only server: send mode=1 image + frame_info (count=2) */
+            ok_req = write_server_header_single(&request) &&
+                     write_server_record(1, &request, gpu, renderer, ml_context,
+                                         &decoder, &frame_info) &&
+                     write_server_frame_info(&frame_info);
+        } else {
+            /* CR server: send mode=2 image + frame_info (count=2) */
+            ok_req = write_server_header_single(&request) &&
+                     write_server_record(2, &request, gpu, renderer, ml_context,
+                                         &decoder, &frame_info) &&
+                     write_server_frame_info(&frame_info);
+        }
+        if (!ok_req) {
             fprintf(stderr, "Server: request failed\n");
             break;
+        }
+
+        /* Update IIR state with this frame's actual rendered values */
+        if (!is_spline_only && frame_info.gamma > 0.0f) {
+            const float A = args.iir_alpha;
+            if (!iir.initialized) {
+                iir.gamma             = frame_info.gamma;
+                iir.cr_strength       = frame_info.cr_strength;
+                iir.radiance_strength = frame_info.radiance_strength;
+                iir.radiance_knee     = frame_info.radiance_knee;
+                iir.l1_max_pq         = frame_info.l1_max_pq > 0.01f ? frame_info.l1_max_pq : iir.l1_max_pq;
+                iir.l1_avg_pq         = frame_info.l1_avg_pq > 0.0f  ? frame_info.l1_avg_pq : iir.l1_avg_pq;
+                iir.initialized       = true;
+            } else {
+                iir.gamma             = A * frame_info.gamma             + (1.0f - A) * iir.gamma;
+                iir.cr_strength       = A * frame_info.cr_strength       + (1.0f - A) * iir.cr_strength;
+                iir.radiance_strength = A * frame_info.radiance_strength + (1.0f - A) * iir.radiance_strength;
+                iir.radiance_knee     = A * frame_info.radiance_knee     + (1.0f - A) * iir.radiance_knee;
+                iir.l1_max_pq         = frame_info.l1_max_pq > 0.01f ? frame_info.l1_max_pq : iir.l1_max_pq;
+                iir.l1_avg_pq         = frame_info.l1_avg_pq > 0.0f  ? frame_info.l1_avg_pq : iir.l1_avg_pq;
+            }
         }
         fflush(stdout);
     }
