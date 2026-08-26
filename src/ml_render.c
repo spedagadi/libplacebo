@@ -117,7 +117,8 @@ static bool build_model_features(pl_gpu gpu, const struct pl_frame *frame,
                                  float features[88])
 {
     if (!pl_extract_ml_features(gpu, frame, pl_ml_feature_params(
-            .target_nits = params->target_nits), features))
+            .target_nits   = params->target_nits,
+            .cache         = params->feature_cache), features))
         return false;
 
     struct pl_tone_map_params spline = {

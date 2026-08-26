@@ -11,6 +11,7 @@
 #define LIBPLACEBO_ML_RENDER_H_
 
 #include <libplacebo/gpu.h>
+#include <libplacebo/ml_features.h>
 #include <libplacebo/ml_model.h>
 #include <libplacebo/ml_radiance.h>
 #include <libplacebo/renderer.h>
@@ -36,6 +37,10 @@ struct pl_ml_render_params {
     float l1_avg_pq;
     float top_bar_norm;
     float bottom_bar_norm;
+    // Optional: persistent GPU cache for feature extraction.
+    // Pass a pl_ml_feature_cache created once per session to avoid
+    // per-frame luma texture and renderer allocation.
+    pl_ml_feature_cache feature_cache;
 };
 
 #define pl_ml_render_params(...) (&(struct pl_ml_render_params) { __VA_ARGS__ })

@@ -43,6 +43,15 @@ PL_API_BEGIN
 
 #define PL_ML_FEATURE_DIM 78
 
+// Persistent GPU resource cache for feature extraction.
+// Create once per session, pass to pl_ml_feature_params.cache every frame.
+// Eliminates per-frame renderer and texture allocation overhead.
+typedef struct pl_ml_feature_cache_t *pl_ml_feature_cache;
+
+PL_API pl_ml_feature_cache pl_ml_feature_cache_create(pl_gpu gpu,
+                                                       int width, int height);
+PL_API void pl_ml_feature_cache_destroy(pl_ml_feature_cache *cache);
+
 struct pl_ml_feature_params {
     // Target display brightness in nits (e.g., 100, 600, 1000, 4000)
     // This becomes feature[77] and enables multi-display learning
@@ -62,6 +71,10 @@ struct pl_ml_feature_params {
     // If non-NULL, writes downsample_width * downsample_height float32 values
     // Normalized to [0, 1] range (row-major, height × width)
     const char *debug_luma_path;
+
+    // Optional persistent GPU cache. When provided, luma texture and renderer
+    // are reused across frames — eliminates per-frame GPU allocation overhead.
+    pl_ml_feature_cache cache;
 };
 
 #define PL_ML_FEATURE_DEFAULTS \

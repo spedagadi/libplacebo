@@ -31,6 +31,153 @@
 #include <libplacebo/shaders/sampling.h>
 #include <libplacebo/utils/libav.h>
 
+// ── Persistent feature extraction cache ─────────────────────────────────────
+
+// Forward declarations for shader source strings (defined below)
+static const char zone_stats_shader[];
+static const char histogram_shader[];
+static const char histogram_reduce_shader[];
+
+// Minimal render params for luma downscale — bilinear only, no tone mapping,
+// no dithering, no debanding. We only need raw luma statistics, not display quality.
+static const struct pl_render_params pl_ml_luma_params = {
+    .downscaler         = &pl_filter_bilinear,
+    .skip_anti_aliasing = true,
+};
+
+struct pl_ml_feature_cache_t {
+    pl_gpu      gpu;
+    int         width, height;
+    // Downscale resources (created once)
+    pl_tex      luma_tex;    // 256×144 r16 render target
+    pl_renderer renderer;    // minimal bilinear renderer
+
+    // Zone stats compute resources (created once, reused every frame)
+    pl_tex      stats_tex;   // 8×5 rgba32f zone output
+    pl_pass     zone_pass;   // zone_stats_shader compute pass
+
+    // Histogram compute resources (created once, reused every frame)
+    pl_buf      hist_buf;    // 65536 uint32 histogram (zeroed via GPU each frame)
+    pl_pass     hist_pass;   // histogram_shader compute pass
+    pl_buf      result_buf;  // 9 float histogram reduce output
+    pl_pass     reduce_pass; // histogram_reduce_shader compute pass
+};
+
+pl_ml_feature_cache pl_ml_feature_cache_create(pl_gpu gpu, int width, int height)
+{
+    if (!gpu || width <= 0 || height <= 0)
+        return NULL;
+
+    struct pl_ml_feature_cache_t *c = pl_alloc_ptr(NULL, c);
+    if (!c) return NULL;
+    *c = (struct pl_ml_feature_cache_t) { .gpu = gpu,
+                                          .width = width, .height = height };
+
+    // Luma texture
+    pl_fmt luma_fmt = pl_find_named_fmt(gpu, "r16");
+    if (!luma_fmt)
+        luma_fmt = pl_find_fmt(gpu, PL_FMT_UNORM, 1, 16, 16,
+                               PL_FMT_CAP_RENDERABLE | PL_FMT_CAP_SAMPLEABLE |
+                               PL_FMT_CAP_HOST_READABLE);
+    if (!luma_fmt) goto err;
+
+    c->luma_tex = pl_tex_create(gpu, pl_tex_params(
+        .w = width, .h = height, .format = luma_fmt,
+        .sampleable = true, .renderable = true, .host_readable = true));
+    if (!c->luma_tex) goto err;
+
+    // Minimal renderer (bilinear downscale only)
+    c->renderer = pl_renderer_create(gpu->log, gpu);
+    if (!c->renderer) goto err;
+
+    // Zone stats texture (8×5 rgba32f)
+    pl_fmt stats_fmt = pl_find_fmt(gpu, PL_FMT_FLOAT, 4, 32, 32,
+                                   PL_FMT_CAP_STORABLE | PL_FMT_CAP_HOST_READABLE);
+    if (stats_fmt) {
+        c->stats_tex = pl_tex_create(gpu, pl_tex_params(
+            .w = 8, .h = 5, .format = stats_fmt,
+            .storable = true, .host_readable = true));
+    }
+
+    // Histogram buffer (65536 × uint32, zeroed via GPU)
+    // Use host_writable=true so we can zero it via pl_buf_write
+    c->hist_buf = pl_buf_create(gpu, pl_buf_params(
+        .size = 65536 * sizeof(uint32_t),
+        .storable = true, .host_readable = true, .host_writable = true));
+
+    // Histogram reduce result buffer (9 floats)
+    c->result_buf = pl_buf_create(gpu, pl_buf_params(
+        .size = 9 * sizeof(float),
+        .storable = true, .host_readable = true));
+
+    // Pre-create compute passes (shaders compiled/cached at first call,
+    // reused every frame — no recompilation overhead)
+    {
+        struct pl_desc zone_descs[] = {
+            { .name = "luma",  .type = PL_DESC_SAMPLED_TEX, .binding = 0,
+              .access = PL_DESC_ACCESS_READONLY },
+            { .name = "stats", .type = PL_DESC_STORAGE_IMG, .binding = 1,
+              .access = PL_DESC_ACCESS_WRITEONLY },
+        };
+        if (c->stats_tex)
+            c->zone_pass = pl_pass_create(gpu, pl_pass_params(
+                .type = PL_PASS_COMPUTE,
+                .descriptors = zone_descs, .num_descriptors = 2,
+                .glsl_shader = zone_stats_shader));
+    }
+    {
+        struct pl_desc hist_descs[] = {
+            { .name = "luma",      .type = PL_DESC_SAMPLED_TEX, .binding = 0,
+              .access = PL_DESC_ACCESS_READONLY },
+            { .name = "histogram", .type = PL_DESC_BUF_STORAGE, .binding = 1,
+              .access = PL_DESC_ACCESS_READWRITE },
+        };
+        if (c->hist_buf)
+            c->hist_pass = pl_pass_create(gpu, pl_pass_params(
+                .type = PL_PASS_COMPUTE,
+                .descriptors = hist_descs, .num_descriptors = 2,
+                .glsl_shader = histogram_shader));
+    }
+    {
+        struct pl_desc reduce_descs[] = {
+            { .name = "histogram", .type = PL_DESC_BUF_STORAGE, .binding = 0,
+              .access = PL_DESC_ACCESS_READONLY },
+            { .name = "result",    .type = PL_DESC_BUF_STORAGE, .binding = 1,
+              .access = PL_DESC_ACCESS_WRITEONLY },
+        };
+        if (c->result_buf)
+            c->reduce_pass = pl_pass_create(gpu, pl_pass_params(
+                .type = PL_PASS_COMPUTE,
+                .descriptors = reduce_descs, .num_descriptors = 2,
+                .glsl_shader = histogram_reduce_shader));
+    }
+
+    PL_INFO(gpu, "[ML] Feature cache created (%dx%d) with compute passes", width, height);
+    return c;
+
+err:
+    pl_ml_feature_cache_destroy(&c);
+    return NULL;
+}
+
+void pl_ml_feature_cache_destroy(pl_ml_feature_cache *cache)
+{
+    if (!cache || !*cache) return;
+    struct pl_ml_feature_cache_t *c = *cache;
+    if (c->reduce_pass) pl_pass_destroy(c->gpu, &c->reduce_pass);
+    if (c->hist_pass)   pl_pass_destroy(c->gpu, &c->hist_pass);
+    if (c->zone_pass)   pl_pass_destroy(c->gpu, &c->zone_pass);
+    if (c->result_buf)  pl_buf_destroy(c->gpu, &c->result_buf);
+    if (c->hist_buf)    pl_buf_destroy(c->gpu, &c->hist_buf);
+    if (c->stats_tex)   pl_tex_destroy(c->gpu, &c->stats_tex);
+    if (c->renderer)    pl_renderer_destroy(&c->renderer);
+    if (c->luma_tex)    pl_tex_destroy(c->gpu, &c->luma_tex);
+    pl_free(c);
+    *cache = NULL;
+}
+
+// ── Percentile sort helper ───────────────────────────────────────────────────
+
 // Comparison function for percentile sorting
 static int cmp_float(const void *a, const void *b) {
     float fa = *(const float*)a;
@@ -62,32 +209,40 @@ static const char zone_stats_shader[] =
     "}\n";
 
 static bool extract_zone_stats_gpu(pl_gpu gpu, pl_tex luma_tex,
-                                   float zone_stats[8][5][3])
+                                   float zone_stats[8][5][3],
+                                   struct pl_ml_feature_cache_t *fc)
 {
-    pl_fmt stats_fmt = pl_find_fmt(gpu, PL_FMT_FLOAT, 4, 32, 32,
-                                   PL_FMT_CAP_STORABLE | PL_FMT_CAP_HOST_READABLE);
-    if (!stats_fmt) return false;
-    pl_tex stats_tex = pl_tex_create(gpu, pl_tex_params(
-        .w = 8, .h = 5, .format = stats_fmt,
-        .storable = true, .host_readable = true));
-    if (!stats_tex) return false;
+    pl_tex  stats_tex  = fc ? fc->stats_tex  : NULL;
+    pl_pass zone_pass  = fc ? fc->zone_pass  : NULL;
+    bool    owns       = false;
 
-    struct pl_desc descs[] = {
-        { .name = "luma", .type = PL_DESC_SAMPLED_TEX, .binding = 0,
-          .access = PL_DESC_ACCESS_READONLY },
-        { .name = "stats", .type = PL_DESC_STORAGE_IMG, .binding = 1,
-          .access = PL_DESC_ACCESS_WRITEONLY },
-    };
-    pl_pass pass = pl_pass_create(gpu, pl_pass_params(
-        .type = PL_PASS_COMPUTE, .descriptors = descs, .num_descriptors = 2,
-        .glsl_shader = zone_stats_shader));
-    if (!pass) { pl_tex_destroy(gpu, &stats_tex); return false; }
+    if (!stats_tex || !zone_pass) {
+        owns = true;
+        pl_fmt stats_fmt = pl_find_fmt(gpu, PL_FMT_FLOAT, 4, 32, 32,
+                                       PL_FMT_CAP_STORABLE | PL_FMT_CAP_HOST_READABLE);
+        if (!stats_fmt) return false;
+        stats_tex = pl_tex_create(gpu, pl_tex_params(
+            .w = 8, .h = 5, .format = stats_fmt,
+            .storable = true, .host_readable = true));
+        if (!stats_tex) return false;
+
+        struct pl_desc descs[] = {
+            { .name = "luma",  .type = PL_DESC_SAMPLED_TEX, .binding = 0,
+              .access = PL_DESC_ACCESS_READONLY },
+            { .name = "stats", .type = PL_DESC_STORAGE_IMG, .binding = 1,
+              .access = PL_DESC_ACCESS_WRITEONLY },
+        };
+        zone_pass = pl_pass_create(gpu, pl_pass_params(
+            .type = PL_PASS_COMPUTE, .descriptors = descs, .num_descriptors = 2,
+            .glsl_shader = zone_stats_shader));
+        if (!zone_pass) { pl_tex_destroy(gpu, &stats_tex); return false; }
+    }
 
     struct pl_desc_binding bindings[] = {
         { .object = luma_tex }, { .object = stats_tex },
     };
     pl_pass_run(gpu, pl_pass_run_params(
-        .pass = pass, .desc_bindings = bindings,
+        .pass = zone_pass, .desc_bindings = bindings,
         .compute_groups = { 8, 5, 1 }));
 
     float raw[8 * 5 * 4] = {0};
@@ -103,8 +258,10 @@ static bool extract_zone_stats_gpu(pl_gpu gpu, pl_tex luma_tex,
             zone_stats[x][y][2] = raw[dst + 2];
         }
     }
-    pl_pass_destroy(gpu, &pass);
-    pl_tex_destroy(gpu, &stats_tex);
+    if (owns) {
+        pl_pass_destroy(gpu, &zone_pass);
+        pl_tex_destroy(gpu, &stats_tex);
+    }
     return ok;
 }
 
@@ -122,45 +279,61 @@ static const char histogram_shader[] =
     "    atomicAdd(bins[bin], 1u);\n"
     "}\n";
 
-static bool reduce_histogram_gpu(pl_gpu gpu, pl_buf hist_buf, float values[9]);
+static bool reduce_histogram_gpu(pl_gpu gpu, pl_buf hist_buf, float values[9],
+                                 struct pl_ml_feature_cache_t *fc);
 
 static bool extract_histogram_gpu(pl_gpu gpu, pl_tex luma_tex,
-                                  uint32_t histogram[65536], float reduced[9])
+                                  uint32_t histogram[65536], float reduced[9],
+                                  struct pl_ml_feature_cache_t *fc)
 {
     const size_t size = 65536 * sizeof(uint32_t);
-    uint32_t *zeroes = pl_calloc(NULL, 65536, sizeof(uint32_t));
-    if (!zeroes) return false;
-    pl_buf hist_buf = pl_buf_create(gpu, pl_buf_params(
-        .size = size, .storable = true, .host_readable = true,
-        .initial_data = zeroes));
-    pl_free(zeroes);
-    if (!hist_buf) return false;
+    pl_buf  hist_buf   = fc ? fc->hist_buf   : NULL;
+    pl_pass hist_pass  = fc ? fc->hist_pass  : NULL;
+    bool    owns       = false;
 
-    struct pl_desc descs[] = {
-        { .name = "luma", .type = PL_DESC_SAMPLED_TEX, .binding = 0,
-          .access = PL_DESC_ACCESS_READONLY },
-        { .name = "histogram", .type = PL_DESC_BUF_STORAGE, .binding = 1,
-          .access = PL_DESC_ACCESS_READWRITE },
-    };
-    pl_pass pass = pl_pass_create(gpu, pl_pass_params(
-        .type = PL_PASS_COMPUTE, .descriptors = descs, .num_descriptors = 2,
-        .glsl_shader = histogram_shader));
-    if (!pass) { pl_buf_destroy(gpu, &hist_buf); return false; }
+    if (!hist_buf || !hist_pass) {
+        owns = true;
+        uint32_t *zeroes = pl_calloc(NULL, 65536, sizeof(uint32_t));
+        if (!zeroes) return false;
+        hist_buf = pl_buf_create(gpu, pl_buf_params(
+            .size = size, .storable = true, .host_readable = true,
+            .initial_data = zeroes));
+        pl_free(zeroes);
+        if (!hist_buf) return false;
+
+        struct pl_desc descs[] = {
+            { .name = "luma",      .type = PL_DESC_SAMPLED_TEX, .binding = 0,
+              .access = PL_DESC_ACCESS_READONLY },
+            { .name = "histogram", .type = PL_DESC_BUF_STORAGE, .binding = 1,
+              .access = PL_DESC_ACCESS_READWRITE },
+        };
+        hist_pass = pl_pass_create(gpu, pl_pass_params(
+            .type = PL_PASS_COMPUTE, .descriptors = descs, .num_descriptors = 2,
+            .glsl_shader = histogram_shader));
+        if (!hist_pass) { pl_buf_destroy(gpu, &hist_buf); return false; }
+    } else {
+        // Zero the cached histogram buffer via GPU host write (avoids GPU stall)
+        uint32_t zeroes[65536] = {0};
+        pl_buf_write(gpu, hist_buf, 0, zeroes, size);
+    }
 
     struct pl_desc_binding bindings[] = {
         { .object = luma_tex }, { .object = hist_buf },
     };
     pl_pass_run(gpu, pl_pass_run_params(
-        .pass = pass, .desc_bindings = bindings,
+        .pass = hist_pass, .desc_bindings = bindings,
         .compute_groups = { 16, 9, 1 }));
+
     bool ok;
     if (reduced) {
-        ok = reduce_histogram_gpu(gpu, hist_buf, reduced);
+        ok = reduce_histogram_gpu(gpu, hist_buf, reduced, fc);
     } else {
         ok = pl_buf_read(gpu, hist_buf, 0, histogram, size);
     }
-    pl_pass_destroy(gpu, &pass);
-    pl_buf_destroy(gpu, &hist_buf);
+    if (owns) {
+        pl_pass_destroy(gpu, &hist_pass);
+        pl_buf_destroy(gpu, &hist_buf);
+    }
     return ok;
 }
 
@@ -211,40 +384,51 @@ static const char histogram_reduce_shader[] =
     "    }\n"
     "}\n";
 
-static bool reduce_histogram_gpu(pl_gpu gpu, pl_buf hist_buf, float values[9])
+static bool reduce_histogram_gpu(pl_gpu gpu, pl_buf hist_buf, float values[9],
+                                 struct pl_ml_feature_cache_t *fc)
 {
-    pl_buf result_buf = pl_buf_create(gpu, pl_buf_params(
-        .size = 9 * sizeof(float), .storable = true, .host_readable = true));
-    if (!result_buf) return false;
-    struct pl_desc descs[] = {
-        { .name = "histogram", .type = PL_DESC_BUF_STORAGE, .binding = 0,
-          .access = PL_DESC_ACCESS_READONLY },
-        { .name = "result", .type = PL_DESC_BUF_STORAGE, .binding = 1,
-          .access = PL_DESC_ACCESS_WRITEONLY },
-    };
-    pl_pass pass = pl_pass_create(gpu, pl_pass_params(
-        .type = PL_PASS_COMPUTE, .descriptors = descs, .num_descriptors = 2,
-        .glsl_shader = histogram_reduce_shader));
-    if (!pass) { pl_buf_destroy(gpu, &result_buf); return false; }
+    pl_buf  result_buf   = fc ? fc->result_buf  : NULL;
+    pl_pass reduce_pass  = fc ? fc->reduce_pass : NULL;
+    bool    owns         = false;
+
+    if (!result_buf || !reduce_pass) {
+        owns = true;
+        result_buf = pl_buf_create(gpu, pl_buf_params(
+            .size = 9 * sizeof(float), .storable = true, .host_readable = true));
+        if (!result_buf) return false;
+        struct pl_desc descs[] = {
+            { .name = "histogram", .type = PL_DESC_BUF_STORAGE, .binding = 0,
+              .access = PL_DESC_ACCESS_READONLY },
+            { .name = "result",    .type = PL_DESC_BUF_STORAGE, .binding = 1,
+              .access = PL_DESC_ACCESS_WRITEONLY },
+        };
+        reduce_pass = pl_pass_create(gpu, pl_pass_params(
+            .type = PL_PASS_COMPUTE, .descriptors = descs, .num_descriptors = 2,
+            .glsl_shader = histogram_reduce_shader));
+        if (!reduce_pass) { pl_buf_destroy(gpu, &result_buf); return false; }
+    }
     struct pl_desc_binding bindings[] = {
         { .object = hist_buf }, { .object = result_buf },
     };
     pl_pass_run(gpu, pl_pass_run_params(
-        .pass = pass, .desc_bindings = bindings,
+        .pass = reduce_pass, .desc_bindings = bindings,
         .compute_groups = { 1, 1, 1 }));
     bool ok = pl_buf_read(gpu, result_buf, 0, values, 9 * sizeof(float));
-    pl_pass_destroy(gpu, &pass);
-    pl_buf_destroy(gpu, &result_buf);
+    if (owns) {
+        pl_pass_destroy(gpu, &reduce_pass);
+        pl_buf_destroy(gpu, &result_buf);
+    }
     return ok;
 }
 
 static bool extract_features_gpu(pl_gpu gpu, pl_tex luma_tex,
-                                 float features[PL_ML_FEATURE_DIM])
+                                 float features[PL_ML_FEATURE_DIM],
+                                 struct pl_ml_feature_cache_t *fc)
 {
     float reduced[9] = {0};
     float zones[8][5][3] = {0};
-    if (!extract_histogram_gpu(gpu, luma_tex, NULL, reduced) ||
-        !extract_zone_stats_gpu(gpu, luma_tex, zones))
+    if (!extract_histogram_gpu(gpu, luma_tex, NULL, reduced, fc) ||
+        !extract_zone_stats_gpu(gpu, luma_tex, zones, fc))
         return false;
 
     for (int i = 0; i < 9; i++) features[i] = reduced[i];
@@ -311,7 +495,7 @@ static bool extract_features_cpu(pl_gpu gpu, pl_tex luma_tex,
 
     uint32_t histogram[65536] = {0};
     bool gpu_histogram = !params->force_cpu_fallback &&
-                         extract_histogram_gpu(gpu, luma_tex, histogram, NULL);
+                         extract_histogram_gpu(gpu, luma_tex, histogram, NULL, NULL);
     PL_WARN(gpu, "[ML] GPU histogram: %s", gpu_histogram ? "enabled" : "fallback");
 
     // Debug: Save luma for validation if requested
@@ -407,7 +591,7 @@ static bool extract_features_cpu(pl_gpu gpu, pl_tex luma_tex,
             features[4], features[6], features[8]);
 
     float zone_stats[8][5][3] = {0};
-    bool gpu_zones = extract_zone_stats_gpu(gpu, luma_tex, zone_stats);
+    bool gpu_zones = extract_zone_stats_gpu(gpu, luma_tex, zone_stats, NULL);
     PL_WARN(gpu, "[ML] GPU zone statistics: %s", gpu_zones ? "enabled" : "fallback");
 
     // Build Summed Area Table for spatial features (fallback/reference)
@@ -528,45 +712,62 @@ bool pl_extract_ml_features(pl_gpu gpu,
     features[77] = params->target_nits;
     PL_INFO(gpu, "[ML] Target nits set: %.2f", params->target_nits);
 
-    // TODO 2: Create downscaled luma texture
-    PL_INFO(gpu, "[ML] Looking for r16 format...");
-    pl_fmt luma_fmt = pl_find_named_fmt(gpu, "r16");
-    if (!luma_fmt) {
-        PL_INFO(gpu, "[ML] r16 not found, trying generic 16-bit format...");
-        // Fallback: find any single-component 16-bit format
-                luma_fmt = pl_find_fmt(gpu, PL_FMT_UNORM, 1, 16, 16,
-                                                             PL_FMT_CAP_RENDERABLE | PL_FMT_CAP_SAMPLEABLE
-                                                         | PL_FMT_CAP_HOST_READABLE);
+    int w = params->downsample_width;
+    int h = params->downsample_height;
+    struct pl_ml_feature_cache_t *fc = params->cache;
+
+    // Resolve luma texture and renderer — use cache if provided, else allocate
+    pl_tex luma_tex = NULL;
+    pl_renderer renderer = NULL;
+    bool owns_resources = false;
+
+    if (fc && fc->luma_tex && fc->renderer &&
+        fc->width == w && fc->height == h) {
+        luma_tex = fc->luma_tex;
+        renderer = fc->renderer;
+        PL_TRACE(gpu, "[ML] Using cached luma tex + renderer");
+    } else {
+        owns_resources = true;
+        PL_INFO(gpu, "[ML] Looking for r16 format...");
+        pl_fmt luma_fmt = pl_find_named_fmt(gpu, "r16");
+        if (!luma_fmt)
+            luma_fmt = pl_find_fmt(gpu, PL_FMT_UNORM, 1, 16, 16,
+                                   PL_FMT_CAP_RENDERABLE | PL_FMT_CAP_SAMPLEABLE |
+                                   PL_FMT_CAP_HOST_READABLE);
+        if (!luma_fmt) {
+            PL_ERR(gpu, "No suitable luma format found");
+            return false;
+        }
+        PL_INFO(gpu, "[ML] Creating luma texture (%dx%d)...", w, h);
+        luma_tex = pl_tex_create(gpu, pl_tex_params(
+            .w = w, .h = h, .format = luma_fmt,
+            .sampleable = true, .renderable = true, .host_readable = true));
+        if (!luma_tex) {
+            PL_ERR(gpu, "Failed to create luma texture (%dx%d)", w, h);
+            return false;
+        }
+        PL_INFO(gpu, "[ML] Creating renderer...");
+        renderer = pl_renderer_create(gpu->log, gpu);
+        if (!renderer) {
+            PL_ERR(gpu, "Failed to create renderer");
+            pl_tex_destroy(gpu, &luma_tex);
+            return false;
+        }
     }
-    if (!luma_fmt) {
-        PL_ERR(gpu, "No suitable luma format found (need 16-bit single-component)");
+
+    // Check frame validity
+    if (!frame || frame->num_planes == 0 || !frame->planes[0].texture) {
+        PL_ERR(gpu, "[ML] Invalid frame: num_planes=%d", frame ? frame->num_planes : 0);
+        if (owns_resources) { pl_renderer_destroy(&renderer); pl_tex_destroy(gpu, &luma_tex); }
         return false;
     }
-    PL_INFO(gpu, "[ML] Luma format found: %s", luma_fmt->name);
 
-    PL_INFO(gpu, "[ML] Creating luma texture (%dx%d)...", params->downsample_width, params->downsample_height);
-    pl_tex luma_tex = pl_tex_create(gpu, pl_tex_params(
-        .w = params->downsample_width,
-        .h = params->downsample_height,
-        .format = luma_fmt,
-        .sampleable = true,
-        .renderable = true,
-        .host_readable = true,
-    ));
-
-    if (!luma_tex) {
-        PL_ERR(gpu, "Failed to create luma texture (%dx%d)",
-               params->downsample_width, params->downsample_height);
-        return false;
-    }
-    PL_INFO(gpu, "[ML] Luma texture created successfully");
-
-    // Create target frame (luma-only)
+    // Build target frame (luma-only, inheriting source colorspace)
     PL_INFO(gpu, "[ML] Setting up target frame (luma-only)...");
     struct pl_frame target = {
         .num_planes = 1,
-        .repr = pl_color_repr_hdtv,  // BT.2020 matrix
-        .color = frame->color,         // Inherit colorspace from source
+        .repr = pl_color_repr_hdtv,
+        .color = frame->color,
     };
     target.planes[0].texture = luma_tex;
     target.planes[0].components = 1;
@@ -574,51 +775,34 @@ bool pl_extract_ml_features(pl_gpu gpu,
     target.planes[0].component_mapping[1] = -1;
     target.planes[0].component_mapping[2] = -1;
     target.planes[0].component_mapping[3] = -1;
-    PL_INFO(gpu, "[ML] Target frame configured");
-
-    // Render downscaled luma
-    PL_INFO(gpu, "[ML] Creating renderer...");
-    pl_renderer renderer = pl_renderer_create(gpu->log, gpu);
-    if (!renderer) {
-        PL_ERR(gpu, "Failed to create renderer");
-        pl_tex_destroy(gpu, &luma_tex);
-        return false;
-    }
-    PL_INFO(gpu, "[ML] Renderer created successfully");
-
-    // Check frame validity before rendering
-    if (!frame || frame->num_planes == 0 || !frame->planes[0].texture) {
-        PL_ERR(gpu, "[ML] Invalid frame: num_planes=%d", frame ? frame->num_planes : 0);
-        pl_renderer_destroy(&renderer);
-        pl_tex_destroy(gpu, &luma_tex);
-        return false;
-    }
 
     PL_INFO(gpu, "[ML] Rendering downscaled luma (input: %dx%d -> output: %dx%d)...",
             frame->planes[0].texture->params.w, frame->planes[0].texture->params.h,
-            params->downsample_width, params->downsample_height);
-    bool ok = pl_render_image(renderer, frame, &target, &pl_render_default_params);
-    pl_renderer_destroy(&renderer);
+            w, h);
+    // Use minimal params for luma downscale — bilinear only, no tone mapping
+    bool ok = pl_render_image(renderer, frame, &target, &pl_ml_luma_params);
+
+    if (owns_resources) pl_renderer_destroy(&renderer);
 
     if (!ok) {
         PL_ERR(gpu, "pl_render_image failed");
-        pl_tex_destroy(gpu, &luma_tex);
+        if (owns_resources) pl_tex_destroy(gpu, &luma_tex);
         return false;
     }
     PL_INFO(gpu, "[ML] Luma rendering complete");
 
     if (!params->force_cpu_fallback && !params->debug_luma_path &&
-        extract_features_gpu(gpu, luma_tex, features)) {
+        extract_features_gpu(gpu, luma_tex, features, fc)) {
         PL_INFO(gpu, "[ML] GPU feature extraction complete (no luma readback)");
-        pl_tex_destroy(gpu, &luma_tex);
+        if (owns_resources) pl_tex_destroy(gpu, &luma_tex);
         return true;
     }
 
-    // Extract features from luma texture (CPU fallback)
+    // CPU fallback
     PL_INFO(gpu, "[ML] Starting CPU feature extraction...");
     ok = extract_features_cpu(gpu, luma_tex, params, features);
 
-    pl_tex_destroy(gpu, &luma_tex);
+    if (owns_resources) pl_tex_destroy(gpu, &luma_tex);
 
     if (ok) {
         PL_INFO(gpu, "[ML] === Feature extraction COMPLETE (success) ===");
