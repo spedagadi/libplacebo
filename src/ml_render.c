@@ -5,6 +5,28 @@
 #include <libplacebo/tone_mapping.h>
 #include <libplacebo/shaders/colorspace.h>
 
+// ── SDR → true-PQ helpers (ST.2084 constants; not exported by public headers) ──
+#define SDR_VIRTUAL_PEAK_PQ 0.7518f   // 1000-nit virtual P5 ceiling
+#define SDR_FEATURE0_FLOOR  0.62f     // feature-87 compression-floor on SDR
+
+static inline float sdr_pq_to_nits(float pq)
+{
+    if (pq <= 0.0f) return 0.0f;
+    float p = powf(pq, 1.0f / 78.84375f);   // m2 = 2523/32
+    float num = fmaxf(p - 0.8359375f, 0.0f); // c1 = 3424/4096
+    float den = fmaxf(18.8515625f - 18.6875f * p, 1e-6f); // c2, c3
+    return powf(num / den, 1.0f / 0.1593017578125f) * 10000.0f; // m1
+}
+
+static inline float sdr_nits_to_pq(float nits)
+{
+    if (nits <= 0.0f) return 0.0f;
+    float n = fminf(fmaxf(nits / 10000.0f, 1e-6f), 1.0f);
+    float m = powf(n, 0.1593017578125f);
+    return powf((0.8359375f + 18.8515625f * m) / (1.0f + 18.6875f * m),
+                78.84375f);
+}
+
 static struct pl_hook_res l2_hook(void *priv, const struct pl_hook_params *params)
 {
     struct pl_ml_render_result *result = priv;
@@ -343,17 +365,34 @@ static bool build_model_features(const struct pl_ml_render_params *params,
         return false;
 
     // Append 10 spline-knot features (features[78–87]) built from the current
-    // libplacebo tone-map spline — same as before, CPU-only.
+    // libplacebo tone-map spline — same generator the model was trained on.
     struct pl_tone_map_params spline = {
         .function = &pl_tone_map_spline,
         .constants = { PL_TONE_MAP_CONSTANTS },
         .input_scaling = PL_HDR_PQ,
         .output_scaling = PL_HDR_PQ,
         .lut_size = 256,
-        .input_max = fmaxf(params->l1_max_pq, features[0]),
-        .input_avg = params->l1_avg_pq > 0.0f ? params->l1_avg_pq : features[1],
         .output_max = 0.5444f,
     };
+    if (params->is_sdr) {
+        // SDR: feed the spline a *virtual DV-mastered* input so the knots
+        // (77–84) encode the curve a Dolby L2 master would write for this
+        // frame, while staying in the trained LUT-sample (output-PQ) units.
+        // Base stats are already true PQ-of-nits from the shader fix.
+        // APL sigmoid gain centered on ~18-nit SDR mid-gray; virtual ceiling
+        // fixed at 1000 nits (0.7518 PQ) per the SDR design.
+        float nits_max = sdr_pq_to_nits(features[0]);
+        float nits_avg = sdr_pq_to_nits(features[1]);
+        float sigma = 1.0f / (1.0f + expf(-0.15f * (nits_avg - 18.0f)));
+        float g_avg = 1.0f + 1.50f * (1.0f - sigma);
+        spline.input_avg = sdr_nits_to_pq(nits_avg * g_avg);
+        spline.input_max = fminf(sdr_nits_to_pq(nits_max * 2.5f),
+                                 SDR_VIRTUAL_PEAK_PQ);
+        spline.input_max = fmaxf(spline.input_max, spline.input_avg + 1e-3f);
+    } else {
+        spline.input_max = fmaxf(params->l1_max_pq, features[0]);
+        spline.input_avg = params->l1_avg_pq > 0.0f ? params->l1_avg_pq : features[1];
+    }
     float spline_lut[256];
     const int knot_indices[8] = { 0, 36, 73, 109, 146, 182, 219, 255 };
     pl_tone_map_params_infer(&spline);
@@ -364,7 +403,12 @@ static bool build_model_features(const struct pl_ml_render_params *params,
         features[77 + index] = spline_lut[knot_indices[index]];
     features[85] = params->top_bar_norm;
     features[86] = params->bottom_bar_norm;
-    features[87] = 0.5444f / fmaxf(features[0], 1e-6f);
+    // Feature 87 (compression_strength): on SDR, floor features[0] at 0.62 so
+    // 0.5444/0.51 ≈ 1.07 never reaches the model (caps at 0.878, inside the
+    // trained boundary).
+    float f0_den = params->is_sdr ? fmaxf(features[0], SDR_FEATURE0_FLOOR)
+                                  : fmaxf(features[0], 1e-6f);
+    features[87] = 0.5444f / f0_den;
     return true;
 }
 

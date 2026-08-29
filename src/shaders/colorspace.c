@@ -918,6 +918,15 @@ enum {
 
     // Convert from histogram bin to (starting) PQ value
 #define HIST_PQ(bin) (((bin) + HIST_BIAS) << (PQ_BITS - HIST_BITS))
+
+    // ML feature extraction histogram: 512 bins, full PQ range [0, PQ_MAX].
+    // bin = y_pq >> (PQ_BITS - ML_HIST_BITS).  No bias — SDR and HDR both matter.
+    ML_HIST_BITS  = 9,
+    ML_HIST_BINS  = 1 << ML_HIST_BITS,   // 512
+
+    // Spatial zone grid sizes for ML features
+    ML_ZONES_3X3  = 9,   // 3×3
+    ML_ZONES_5X5  = 25,  // 5×5
 };
 
 
@@ -929,6 +938,17 @@ struct peak_buf_data {
     unsigned frame_sum_pq[SLICES];   // sum of PQ Y values over all WGs (PQ_BITS)
     unsigned frame_max_pq[SLICES];   // maximum PQ Y value among these WGs (PQ_BITS)
     unsigned frame_hist[SLICES][HIST_BINS]; // always allocated, conditionally used
+
+    // ML feature extraction — accumulated in the same pixel scan, no extra pass.
+    // No slice-sharding: 512 histogram bins + 34 zone buckets distribute atomics
+    // naturally across luma values and spatial positions.
+    unsigned ml_hist[ML_HIST_BINS];          // 512-bin full-range PQ histogram
+    unsigned zone_3x3_sum[ML_ZONES_3X3];     // per-zone PQ sum (fixed-pt, /PQ_MAX for mean)
+    unsigned zone_3x3_max[ML_ZONES_3X3];     // per-zone PQ max
+    unsigned zone_3x3_count[ML_ZONES_3X3];   // per-zone pixel count
+    unsigned zone_5x5_sum[ML_ZONES_5X5];     // per-zone PQ sum
+    unsigned zone_5x5_max[ML_ZONES_5X5];     // per-zone PQ max
+    unsigned zone_5x5_count[ML_ZONES_5X5];   // per-zone pixel count
 };
 
 static const struct pl_buffer_var peak_buf_vars[] = {
@@ -952,6 +972,13 @@ static const struct pl_buffer_var peak_buf_vars[] = {
     VAR(frame_sum_pq),
     VAR(frame_max_pq),
     VAR(frame_hist),
+    VAR(ml_hist),
+    VAR(zone_3x3_sum),
+    VAR(zone_3x3_max),
+    VAR(zone_3x3_count),
+    VAR(zone_5x5_sum),
+    VAR(zone_5x5_max),
+    VAR(zone_5x5_count),
 #undef VAR
 };
 
@@ -974,6 +1001,10 @@ struct sh_color_map_obj {
         pl_buf readback;                        // readback buffer (fallback)
         float avg_pq;                           // current (smoothed) values
         float max_pq;
+        // ML feature cache: populated in update_peak_buf before buf is destroyed.
+        // pl_get_detected_ml_features reads from here, never from the buf directly.
+        float ml_features[78];
+        bool  ml_features_valid;
     } peak;
 };
 
@@ -1058,6 +1089,68 @@ static float measure_peak(const struct peak_buf_data *data, float percentile)
     pl_unreachable();
 }
 
+static float ml_hist_percentile(const unsigned hist[ML_HIST_BINS],
+                                unsigned count, float target);
+
+// Assemble ML feature vector from raw peak_buf_data into obj->peak.ml_features.
+// Called inside update_peak_buf before the buf is destroyed so the cache is
+// always populated while data is available.
+static void cache_ml_features(struct sh_color_map_obj *obj,
+                              const struct peak_buf_data *data)
+{
+    unsigned total_pixels = 0;
+    for (int i = 0; i < ML_ZONES_3X3; i++)
+        total_pixels += data->zone_3x3_count[i];
+    if (!total_pixels) {
+        obj->peak.ml_features_valid = false;
+        return;
+    }
+
+    float *f = obj->peak.ml_features;
+
+    // feature[0]: maxscl
+    unsigned peak_pq = 0;
+    for (int i = 0; i < ML_ZONES_3X3; i++)
+        if (data->zone_3x3_max[i] > peak_pq) peak_pq = data->zone_3x3_max[i];
+    f[0] = (float) peak_pq / PQ_MAX;
+
+    // feature[1]: average_maxrgb
+    uint64_t sum_pq = 0;
+    for (int i = 0; i < ML_ZONES_3X3; i++)
+        sum_pq += data->zone_3x3_sum[i];
+    f[1] = (float)(sum_pq / total_pixels) / PQ_MAX;
+
+    // feature[2]: fraction_bright_pixels (> PQ_MAX/2)
+    unsigned bright = 0;
+    for (int i = ML_HIST_BINS / 2; i < ML_HIST_BINS; i++)
+        bright += data->ml_hist[i];
+    f[2] = (float) bright / (float) total_pixels;
+
+    // features[3–8]: percentiles p25/p50/p75/p90/p95/p99
+    static const float targets[6] = { 0.25f, 0.50f, 0.75f, 0.90f, 0.95f, 0.99f };
+    for (int i = 0; i < 6; i++)
+        f[3 + i] = ml_hist_percentile(data->ml_hist, total_pixels, targets[i]);
+
+    // features[9–17]: 3x3 zone means; features[18–26]: 3x3 zone maxes
+    for (int z = 0; z < ML_ZONES_3X3; z++) {
+        unsigned cnt = data->zone_3x3_count[z];
+        f[9  + z] = cnt ? (float)(data->zone_3x3_sum[z] / cnt) / PQ_MAX : 0.0f;
+        f[18 + z] = (float) data->zone_3x3_max[z] / PQ_MAX;
+    }
+
+    // features[27–51]: 5x5 zone means; features[52–76]: 5x5 zone maxes
+    for (int z = 0; z < ML_ZONES_5X5; z++) {
+        unsigned cnt = data->zone_5x5_count[z];
+        f[27 + z] = cnt ? (float)(data->zone_5x5_sum[z] / cnt) / PQ_MAX : 0.0f;
+        f[52 + z] = (float) data->zone_5x5_max[z] / PQ_MAX;
+    }
+
+    // features[77]: target_nits — filled by caller (pl_get_detected_ml_features)
+    f[77] = 0.0f;
+
+    obj->peak.ml_features_valid = true;
+}
+
 // if `force` is true, ensures the buffer is read, even if `allow_delayed`
 static void update_peak_buf(pl_gpu gpu, struct sh_color_map_obj *obj, bool force)
 {
@@ -1077,7 +1170,8 @@ static void update_peak_buf(pl_gpu gpu, struct sh_color_map_obj *obj, bool force
         ok = pl_buf_read(gpu, obj->peak.buf, 0, &data, sizeof(data));
     }
     if (ok && data.frame_wg_count[0] > 0) {
-        // Peak detection completed successfully
+        // Peak detection completed — cache ML features before destroying buf
+        cache_ml_features(obj, &data);
         pl_buf_destroy(gpu, &obj->peak.buf);
     } else {
         // No data read? Possibly this peak obj has not been executed yet
@@ -1159,7 +1253,10 @@ bool pl_shader_detect_peak(pl_shader sh, struct pl_color_space csp,
     }
 
     const bool use_histogram = params->percentile > 0 && params->percentile < 100;
-    size_t shmem_req = 3 * sizeof(uint32_t);
+    size_t shmem_req = 3 * sizeof(uint32_t);                    // wg_sum, wg_max, wg_black
+    shmem_req += sizeof(uint32_t[ML_HIST_BINS]);                // wg_ml_hist[512]
+    shmem_req += sizeof(uint32_t[ML_ZONES_3X3 * 3]);            // wg_z3: sum/max/cnt
+    shmem_req += sizeof(uint32_t[ML_ZONES_5X5 * 3]);            // wg_z5: sum/max/cnt
     if (use_histogram)
         shmem_req += sizeof(uint32_t[HIST_BINS]);
 
@@ -1243,6 +1340,20 @@ retry_ssbo:
         GLSLH("shared uint "$"[%u]; \n", wg_hist, HIST_BINS);
     }
 
+    // ML feature shared memory — always present, paid once per workgroup
+    ident_t wg_ml_hist = sh_fresh(sh, "wg_ml_hist");
+    ident_t wg_z3sum   = sh_fresh(sh, "wg_z3sum"),
+            wg_z3max   = sh_fresh(sh, "wg_z3max"),
+            wg_z3cnt   = sh_fresh(sh, "wg_z3cnt");
+    ident_t wg_z5sum   = sh_fresh(sh, "wg_z5sum"),
+            wg_z5max   = sh_fresh(sh, "wg_z5max"),
+            wg_z5cnt   = sh_fresh(sh, "wg_z5cnt");
+    GLSLH("shared uint "$"[%u]; \n", wg_ml_hist, ML_HIST_BINS);
+    GLSLH("shared uint "$"[%u], "$"[%u], "$"[%u]; \n",
+          wg_z3sum, ML_ZONES_3X3, wg_z3max, ML_ZONES_3X3, wg_z3cnt, ML_ZONES_3X3);
+    GLSLH("shared uint "$"[%u], "$"[%u], "$"[%u]; \n",
+          wg_z5sum, ML_ZONES_5X5, wg_z5max, ML_ZONES_5X5, wg_z5cnt, ML_ZONES_5X5);
+
     sh_describe(sh, "peak detection");
 #pragma GLSL /* pl_shader_detect_peak */                                        \
     {                                                                           \
@@ -1257,6 +1368,15 @@ retry_ssbo:
         for (uint i = local_idx; i < ${const uint: HIST_BINS}; i += wg_size)    \
             $wg_hist[i] = 0u;                                                   \
     @}                                                                          \
+    /* ML feature shared memory zero-init — cooperative loops over each array */\
+    for (uint i = local_idx; i < ${const uint: ML_HIST_BINS}; i += wg_size)    \
+        $wg_ml_hist[i] = 0u;                                                    \
+    for (uint i = local_idx; i < ${const uint: ML_ZONES_3X3}; i += wg_size) {  \
+        $wg_z3sum[i] = $wg_z3max[i] = $wg_z3cnt[i] = 0u;                       \
+    }                                                                           \
+    for (uint i = local_idx; i < ${const uint: ML_ZONES_5X5}; i += wg_size) {  \
+        $wg_z5sum[i] = $wg_z5max[i] = $wg_z5cnt[i] = 0u;                       \
+    }                                                                           \
     barrier();
 
     // Decode color into linear light representation
@@ -1265,8 +1385,61 @@ retry_ssbo:
 
     bool has_subgroups = sh_glsl(sh).subgroup_size > 0;
     const float cutoff = fmaxf(params->black_cutoff, 0.0f) * 1e-2f;
+
+    // SDR (gamma-family) signal values are NOT PQ luma — SDR white reads ~1.0
+    // although its luminance is ~0.508 PQ. Bake the flag so the ML luma path
+    // below converts to true PQ-of-nits, keeping base features in their
+    // trained semantics (see SDR input design, [[zion-core-design]]).
+    const int sdr = pl_color_transfer_is_hdr(csp.transfer) ? 0 : 1;
 #pragma GLSL /* Measure luminance as N-bit PQ */                                \
     float luma = dot(${sh_luma_coeffs(sh, &csp)}, color.rgb);                   \
+                                                                                \
+    /* ML features: signal-domain luma (pre-linearise dot product).             \
+     * Uses color_orig.rgb — the PQ-encoded signal BEFORE pl_shader_linearize. \
+     * dot(luma_coeffs, PQ_signal_RGB) = Y_pq (BT.2020) or I (ICtCp), which   \
+     * exactly matches the PL_CHANNEL_Y value the old ml_features.c stored     \
+     * in the 256×144 r16 texture — preserving feature/model compatibility.    \
+     * No PQ encode/decode needed: the signal value IS the PQ luma already.    \
+     */                                                                         \
+    {                                                                           \
+        float lm = clamp(dot(${sh_luma_coeffs(sh, &csp)}, color_orig.rgb),     \
+                         0.0, 1.0);                                             \
+        /* Default: HDR (PQ/HLG) — the signal value IS the PQ luma already.    \
+         */                                                                     \
+        uint y_ml = uint(${const float: PQ_MAX} * lm);                         \
+        @if (sdr) {                                                             \
+            /* SDR (gamma/bt.1886) signal is NOT PQ luma. color.rgb is already \
+             * linearised, so decode nits exactly then PQ-encode: SDR white → \
+             * ~0.508 PQ (not ~0.85 signal value). Keeps ML base features in  \
+             * the trained PQ-of-nits semantics.                               \
+             */                                                                 \
+            float sdr_nits = dot(${sh_luma_coeffs(sh, &csp)}, color.rgb)       \
+                           * ${const float: PL_COLOR_SDR_WHITE};               \
+            float sdr_np  = clamp(sdr_nits                                     \
+                             / ${const float: PL_COLOR_SDR_WHITE * 100.0},     \
+                             0.0, 1.0);                                         \
+            float sdr_m1 = pow(sdr_np, ${const float: PQ_M1});                 \
+            y_ml = uint(${const float: PQ_MAX}                                 \
+                     * pow((${const float: PQ_C1}                              \
+                          + ${const float: PQ_C2} * sdr_m1)                    \
+                          / (1.0 + ${const float: PQ_C3} * sdr_m1),            \
+                          ${const float: PQ_M2}));                              \
+        @}                                                                      \
+        atomicAdd($wg_ml_hist[y_ml >> ${const uint: PQ_BITS - ML_HIST_BITS}], 1u);\
+        ivec2 img_sz = ivec2(gl_NumWorkGroups.xy) * ivec2(gl_WorkGroupSize.xy); \
+        ivec2 pxy    = ivec2(gl_GlobalInvocationID.xy);                         \
+        int z3 = (pxy.y * ${const int: 3} / img_sz.y) * ${const int: 3}        \
+               + (pxy.x * ${const int: 3} / img_sz.x);                         \
+        int z5 = (pxy.y * ${const int: 5} / img_sz.y) * ${const int: 5}        \
+               + (pxy.x * ${const int: 5} / img_sz.x);                         \
+        atomicAdd($wg_z3sum[z3], y_ml);                                         \
+        atomicMax($wg_z3max[z3], y_ml);                                         \
+        atomicAdd($wg_z3cnt[z3], 1u);                                           \
+        atomicAdd($wg_z5sum[z5], y_ml);                                         \
+        atomicMax($wg_z5max[z5], y_ml);                                         \
+        atomicAdd($wg_z5cnt[z5], 1u);                                           \
+    }                                                                           \
+                                                                                \
     luma *= ${const float: PL_COLOR_SDR_WHITE / 10000.0};                       \
     luma = pow(clamp(luma, 0.0, 1.0), ${const float: PQ_M1});                   \
     luma = (${const float: PQ_C1} + ${const float: PQ_C2} * luma) /             \
@@ -1313,6 +1486,7 @@ retry_ssbo:
                 atomicAdd($wg_black, 1u);                                       \
         @}                                                                      \
     @}                                                                          \
+                                                                                \
     barrier();                                                                  \
                                                                                 \
     @if (use_histogram) {                                                       \
@@ -1334,6 +1508,22 @@ retry_ssbo:
             atomicAdd(frame_sum_pq[slice], $wg_sum / num);                      \
             atomicMax(frame_max_pq[slice], $wg_max);                            \
         }                                                                       \
+    }                                                                           \
+                                                                                \
+    /* ML: flush 512-bin histogram to global SSBO (cooperative loop) */        \
+    for (uint i = local_idx; i < ${const uint: ML_HIST_BINS}; i += wg_size)    \
+        atomicAdd(ml_hist[i], $wg_ml_hist[i]);                                  \
+                                                                                \
+    /* ML: flush zone stats to global SSBO (cooperative loops) */              \
+    for (uint i = local_idx; i < ${const uint: ML_ZONES_3X3}; i += wg_size) {  \
+        atomicAdd(zone_3x3_sum[i],   $wg_z3sum[i]);                             \
+        atomicMax(zone_3x3_max[i],   $wg_z3max[i]);                             \
+        atomicAdd(zone_3x3_count[i], $wg_z3cnt[i]);                             \
+    }                                                                           \
+    for (uint i = local_idx; i < ${const uint: ML_ZONES_5X5}; i += wg_size) {  \
+        atomicAdd(zone_5x5_sum[i],   $wg_z5sum[i]);                             \
+        atomicMax(zone_5x5_max[i],   $wg_z5max[i]);                             \
+        atomicAdd(zone_5x5_count[i], $wg_z5cnt[i]);                             \
     }                                                                           \
     color = color_orig;                                                         \
     }
@@ -1367,6 +1557,52 @@ void pl_reset_detected_peak(pl_shader_obj state)
     pl_buf_destroy(state->gpu, &obj->peak.buf);
     memset(&obj->peak, 0, sizeof(obj->peak));
     obj->peak.readback = readback;
+}
+
+// ── ML feature assembly helpers ──────────────────────────────────────────────
+
+static float ml_hist_percentile(const unsigned hist[ML_HIST_BINS],
+                                 unsigned total, float target)
+{
+    if (!total) return 0.0f;
+    unsigned want = (unsigned) ceilf(target * (float)(total - 1));
+    if (want >= total) want = total - 1;
+    unsigned seen = 0;
+    for (int i = 0; i < ML_HIST_BINS; i++) {
+        unsigned next = seen + hist[i];
+        if (want < next) {
+            // Linear interpolation within the bin
+            float bin_lo = (float)  i      / (float) ML_HIST_BINS;
+            float bin_hi = (float) (i + 1) / (float) ML_HIST_BINS;
+            float ratio  = (next > seen + 1)
+                ? (float)(want - seen) / (float)(next - seen)
+                : 0.0f;
+            return bin_lo + ratio * (bin_hi - bin_lo);
+        }
+        seen = next;
+    }
+    return 1.0f;
+}
+
+bool pl_get_detected_ml_features(const pl_shader_obj state,
+                                 float target_nits,
+                                 float features[78])
+{
+    if (!state || state->type != PL_SHADER_OBJ_COLOR_MAP)
+        return false;
+
+    struct sh_color_map_obj *obj = state->priv;
+
+    // Read from the ML feature cache populated in update_peak_buf.
+    // The buf itself may have been consumed by pl_get_detected_hdr_metadata
+    // (called inside pl_shader_color_map during rendering) before we get here.
+    if (!obj->peak.ml_features_valid)
+        return false;
+
+    memcpy(features, obj->peak.ml_features, 77 * sizeof(float));
+    features[77] = target_nits;
+
+    return true;
 }
 
 void pl_shader_extract_features(pl_shader sh, struct pl_color_space csp)

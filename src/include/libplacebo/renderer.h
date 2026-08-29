@@ -739,6 +739,13 @@ PL_API void pl_renderer_flush_cache(pl_renderer rr);
 PL_API bool pl_renderer_get_hdr_metadata(pl_renderer rr,
                                          struct pl_hdr_metadata *metadata);
 
+// Reads the 78-element ML feature vector from the renderer's internal peak
+// detection state (accumulated during the most recent frame render).
+// `target_nits` is written into features[77].
+// Returns false if no peak detection data is available.
+PL_API bool pl_renderer_get_ml_features(pl_renderer rr, float target_nits,
+                                        float features[78]);
+
 // Represents a mixture of input frames, distributed temporally.
 //
 // NOTE: Frames must be sorted by timestamp, i.e. `timestamps` must be

@@ -198,6 +198,25 @@ PL_API bool pl_get_detected_hdr_metadata(const pl_shader_obj state,
 // state used by `pl_shader_tone_map`.
 PL_API void pl_reset_detected_peak(pl_shader_obj state);
 
+// Retrieve ML feature vector from the last completed peak detection scan.
+// Features are assembled from the ml_hist and zone_3x3/5x5 fields accumulated
+// by pl_shader_detect_peak — no separate GPU pass is required.
+//
+// features[0]    maxscl (peak PQ luma, [0,1])
+// features[1]    average_maxrgb (mean PQ luma)
+// features[2]    fraction_bright_pixels (fraction > 0.5 PQ)
+// features[3–8]  percentiles p25/p50/p75/p90/p95/p99 from 512-bin histogram
+// features[9–17] 3×3 zone means (row-major)
+// features[18–26] 3×3 zone maxes
+// features[27–51] 5×5 zone means
+// features[52–76] 5×5 zone maxes
+// features[77]   target_nits (set by the caller via the out parameter)
+//
+// Returns false if no peak detection data is available yet.
+PL_API bool pl_get_detected_ml_features(const pl_shader_obj state,
+                                        float target_nits,
+                                        float features[78]);
+
 // Feature map extraction (for pl_color_map_args.feature_map). The result
 // of this shader should be downscaled / low-passed to the indicated kernel
 // size before use. (This does not happen automatically)

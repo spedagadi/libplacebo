@@ -24,6 +24,7 @@
 #include "dispatch.h"
 
 #include <libplacebo/renderer.h>
+#include <libplacebo/shaders/colorspace.h>
 
 struct cached_frame {
     uint64_t signature;
@@ -1183,11 +1184,65 @@ static void hdr_update_peak(struct pass_state *pass)
 {
     const struct pl_render_params *params = pass->params;
     pl_renderer rr = pass->rr;
-    if (!params->peak_detect_params || !pl_color_space_is_hdr(&pass->img.color))
+
+    bool is_hdr = pl_color_space_is_hdr(&pass->img.color);
+    if (!params->peak_detect_params)
         goto cleanup;
 
-    if (rr->errors & PL_RENDER_ERR_PEAK_DETECT)
-        goto cleanup;
+    // SDR sources: still run the accumulation pass when peak detection is
+    // configured, so pl_get_detected_ml_features() always has valid SDR
+    // features for the ML pipeline. This writes stats only — SDR grading is
+    // untouched because tone-map adaptation remains gated on is_hdr.
+    bool ml_only = !is_hdr;
+
+    // HDR-adaptation-only exits — they bail for SDR, but the feature
+    // accumulation must run regardless, or ML is a silent no-op on SDR input.
+    if (!ml_only) {
+        if (rr->errors & PL_RENDER_ERR_PEAK_DETECT)
+            goto cleanup;
+
+        float max_peak = pl_color_transfer_nominal_peak(pass->img.color.transfer) *
+                         PL_COLOR_SDR_WHITE;
+        if (pass->img.color.transfer == PL_COLOR_TRC_HLG)
+            max_peak = pass->img.color.hdr.max_luma;
+        if (max_peak <= pass->target.color.hdr.max_luma + 1e-6)
+            goto cleanup; // no adaptation needed
+
+        // DV content carries L1 metadata (avg_pq_y set by the RPU).  We still run
+        // peak detection so that the ML feature accumulation in pl_shader_detect_peak
+        // fires for every frame regardless of content type.  The IIR-smoothed values
+        // written by update_peak_buf are NOT consumed for DV tone mapping (the DV RPU
+        // curve handles that), so running detection here is a no-op for quality.
+        // Removing this early-exit fixes the Oracle for DV content.
+        // if (pass->img.color.hdr.avg_pq_y)
+        //     goto cleanup; // DV metadata already present
+
+        enum pl_hdr_metadata_type metadata = PL_HDR_METADATA_ANY;
+        if (params->color_map_params)
+            metadata = params->color_map_params->metadata;
+
+        if (metadata && metadata != PL_HDR_METADATA_CIE_Y)
+            goto cleanup; // metadata will be unused
+
+        const struct pl_color_map_params *cpars = params->color_map_params;
+        bool uses_ootf = cpars && cpars->tone_mapping_function == &pl_tone_map_st2094_40;
+        if (uses_ootf && pass->img.color.hdr.ootf.num_anchors)
+            goto cleanup; // HDR10+ OOTF is being used
+
+        if (params->lut && params->lut_type == PL_LUT_CONVERSION)
+            goto cleanup; // LUT handles tone mapping
+    }
+
+    // SDR feature-only accumulation never needs the storable-FBO synchronous
+    // readback path — the stats are used one frame later by the ML eval, so
+    // force the delayed (readback) path even if the app configured otherwise.
+    const struct pl_peak_detect_params *pd = params->peak_detect_params;
+    struct pl_peak_detect_params sdr_pd;
+    if (ml_only) {
+        sdr_pd = *params->peak_detect_params;
+        sdr_pd.allow_delayed = true;
+        pd = &sdr_pd;
+    }
 
     if (pass->fbofmt[4] && !(pass->fbofmt[4]->caps & PL_FMT_CAP_STORABLE))
         goto cleanup;
@@ -1195,32 +1250,7 @@ static void hdr_update_peak(struct pass_state *pass)
     if (!rr->gpu->limits.max_ssbo_size)
         goto cleanup;
 
-    float max_peak = pl_color_transfer_nominal_peak(pass->img.color.transfer) *
-                     PL_COLOR_SDR_WHITE;
-    if (pass->img.color.transfer == PL_COLOR_TRC_HLG)
-        max_peak = pass->img.color.hdr.max_luma;
-    if (max_peak <= pass->target.color.hdr.max_luma + 1e-6)
-        goto cleanup; // no adaptation needed
-
-    if (pass->img.color.hdr.avg_pq_y)
-        goto cleanup; // DV metadata already present
-
-    enum pl_hdr_metadata_type metadata = PL_HDR_METADATA_ANY;
-    if (params->color_map_params)
-        metadata = params->color_map_params->metadata;
-
-    if (metadata && metadata != PL_HDR_METADATA_CIE_Y)
-        goto cleanup; // metadata will be unused
-
-    const struct pl_color_map_params *cpars = params->color_map_params;
-    bool uses_ootf = cpars && cpars->tone_mapping_function == &pl_tone_map_st2094_40;
-    if (uses_ootf && pass->img.color.hdr.ootf.num_anchors)
-        goto cleanup; // HDR10+ OOTF is being used
-
-    if (params->lut && params->lut_type == PL_LUT_CONVERSION)
-        goto cleanup; // LUT handles tone mapping
-
-    if (!pass->fbofmt[4] && !params->peak_detect_params->allow_delayed) {
+    if (!pass->fbofmt[4] && !pd->allow_delayed) {
         PL_WARN(rr, "Disabling peak detection because "
                 "`pl_peak_detect_params.allow_delayed` is false, but lack of "
                 "FBOs forces the result to be delayed.");
@@ -1229,14 +1259,14 @@ static void hdr_update_peak(struct pass_state *pass)
     }
 
     bool ok = pl_shader_detect_peak(img_sh(pass, &pass->img), pass->img.color,
-                                    &rr->tone_map_state, params->peak_detect_params);
+                                    &rr->tone_map_state, pd);
     if (!ok) {
         PL_WARN(rr, "Failed creating HDR peak detection shader.. disabling");
         rr->errors |= PL_RENDER_ERR_PEAK_DETECT;
         goto cleanup;
     }
 
-    pass->need_peak_fbo = !params->peak_detect_params->allow_delayed;
+    pass->need_peak_fbo = !pd->allow_delayed;
     return;
 
 cleanup:
@@ -1249,6 +1279,12 @@ bool pl_renderer_get_hdr_metadata(pl_renderer rr,
                                   struct pl_hdr_metadata *metadata)
 {
     return pl_get_detected_hdr_metadata(rr->tone_map_state, metadata);
+}
+
+bool pl_renderer_get_ml_features(pl_renderer rr, float target_nits,
+                                 float features[78])
+{
+    return pl_get_detected_ml_features(rr->tone_map_state, target_nits, features);
 }
 
 struct plane_state {

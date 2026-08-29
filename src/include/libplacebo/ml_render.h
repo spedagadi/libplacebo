@@ -51,6 +51,10 @@ struct pl_ml_render_params {
     float l1_avg_pq;
     float top_bar_norm;
     float bottom_bar_norm;
+    // SDR source (transfer not PQ/HLG): ML features are computed in true
+    // PQ-of-nits (bt.1886 → nits → PQ), and the 77–84 spline knots are
+    // synthesized from a virtual DV-mastered L2 curve (1000-nit ceiling).
+    bool is_sdr;
     // The renderer whose peak detection buffer provides ML features.
     // Must be the same pl_renderer used to render the current frame.
     // Features are read via pl_renderer_get_ml_features() — no GPU pass issued.
