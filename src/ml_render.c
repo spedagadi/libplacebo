@@ -1,4 +1,5 @@
 #include <math.h>
+#include <stdio.h>
 
 #include <libplacebo/dispatch.h>
 #include <libplacebo/ml_render.h>
@@ -271,6 +272,98 @@ static struct pl_hook_res shadow_bilateral_hook(void *priv,
     };
 }
 
+// SDR→P5 virtual-master bridge — PL_HOOK_RGB_INPUT, runs BEFORE the shadow
+// filter so every downstream stage (shadow mask, peak/feature accumulation,
+// tone mapping, ML grade) sees a virtual DV-style HDR master instead of raw
+// SDR. Decodes the SDR (gamma/bt.1886) signal to relative linear, scales to
+// the virtual P5 ceiling (sdr_virtual_nits), re-encodes as PQ and re-labels
+// the frame PQ/sig_peak=virtual. (ml_render.h docs.)
+static struct pl_hook_res sdr_p5_hook(void *priv, const struct pl_hook_params *params)
+{
+    struct pl_ml_render_result *result = priv;
+    if (pl_color_space_is_hdr(params->orig_color))
+        return (struct pl_hook_res) { .output = PL_HOOK_SIG_NONE };
+
+    pl_tex src = params->tex;
+    int w = src->params.w, h = src->params.h;
+    pl_tex dst = params->get_tex(params->priv, w, h);
+    if (!dst)
+        return (struct pl_hook_res) { .failed = true };
+
+    float virtual_nits = result->sdr_virtual_nits > 0.0f
+                       ? result->sdr_virtual_nits : 1000.0f;
+    float strength = fmaxf(0.0f, fminf(1.0f, result->sdr_strength));
+
+    // Relative → linear decode (SDR white = 1.0) per the current source
+    // transfer. First-cut calibration: pure-gamma/bt.1886 + srgb handled,
+    // everything else falls back to a 2.4 gamma decode.
+    const char *decode;
+    switch (params->color.transfer) {
+    case PL_COLOR_TRC_LINEAR:  decode = "vec3 rel = rgb;"; break;
+    case PL_COLOR_TRC_SRGB:    decode = "vec3 rel = pow(max(rgb, vec3(0.0)), vec3(2.2));"; break;
+    case PL_COLOR_TRC_GAMMA22: decode = "vec3 rel = pow(max(rgb, vec3(0.0)), vec3(2.2));"; break;
+    default:                   decode = "vec3 rel = pow(max(rgb, vec3(0.0)), vec3(2.4));"; break;
+    }
+
+    char body[768];
+    snprintf(body, sizeof(body),
+        "vec2 psz = vec2(textureSize(sdr_ml_src, 0));\n"
+        "vec2 puv = gl_FragCoord.xy / psz;\n"
+        "vec4 pc  = textureLod(sdr_ml_src, puv, 0.0);\n"
+        "vec3 rgb = pc.rgb;\n"
+        "%s\n"
+        "vec3 plasm = (sdr_ml_str > 0.001)\n"
+        "    ? pow(max(rel, vec3(0.0)), vec3(1.0 / (1.0 + sdr_ml_str)))\n"
+        "    : rel;\n"
+        "vec3 pvn = plasm * sdr_ml_vps;\n"
+        "vec3 pn  = clamp(pvn / 10000.0, 0.0, 1.0);\n"
+        "vec3 pm  = pow(pn, vec3(0.1593017578125));\n"
+        "vec3 ppq = pow((vec3(0.8359375) + vec3(18.8515625) * pm)\n"
+        "             / (vec3(1.0) + vec3(18.6875) * pm), vec3(78.84375));\n"
+        "color = vec4(ppq, pc.a);\n",
+        decode);
+
+    struct pl_shader_var vars[] = {
+        { .var = pl_var_float("sdr_ml_vps"), .data = &virtual_nits, .dynamic = true },
+        { .var = pl_var_float("sdr_ml_str"), .data = &strength,     .dynamic = true },
+    };
+    struct pl_shader_desc desc = {
+        .desc = { .name = "sdr_ml_src", .type = PL_DESC_SAMPLED_TEX },
+        .binding = { .object = src, .address_mode = PL_TEX_ADDRESS_CLAMP,
+                     .sample_mode = PL_TEX_SAMPLE_NEAREST },
+    };
+
+    pl_shader sh = pl_dispatch_begin(params->dispatch);
+    if (!pl_shader_custom(sh, &(struct pl_custom_shader) {
+        .description = "SDR→P5 virtual master",
+        .body        = body,
+        .input       = PL_SHADER_SIG_NONE,
+        .output      = PL_SHADER_SIG_COLOR,
+        .variables   = vars, .num_variables   = 2,
+        .descriptors = &desc, .num_descriptors = 1,
+        .output_w    = w,     .output_h        = h,
+    })) {
+        pl_dispatch_abort(params->dispatch, &sh);
+        return (struct pl_hook_res) { .failed = true };
+    }
+    if (!pl_dispatch_finish(params->dispatch,
+            pl_dispatch_params(.shader = &sh, .target = dst)))
+        return (struct pl_hook_res) { .failed = true };
+
+    struct pl_color_space out_color = params->color;
+    out_color.transfer = PL_COLOR_TRC_PQ;
+    out_color.hdr.max_luma = virtual_nits;   // > SDR white → treated as HDR
+
+    return (struct pl_hook_res) {
+        .output = PL_HOOK_SIG_TEX,
+        .tex    = dst,
+        .repr   = params->repr,
+        .color  = out_color,
+        .components = params->components,
+        .rect   = params->rect,
+    };
+}
+
 // Highlight bilateral — PL_HOOK_OUTPUT (post-curve, display output space).
 // 5×5 bilateral active where y > highlight_knee. Tighter sigma_range than
 // shadow bilateral: smoothes near-clipped specular without touching midtones.
@@ -374,13 +467,15 @@ static bool build_model_features(const struct pl_ml_render_params *params,
         .lut_size = 256,
         .output_max = 0.5444f,
     };
-    if (params->is_sdr) {
-        // SDR: feed the spline a *virtual DV-mastered* input so the knots
-        // (77–84) encode the curve a Dolby L2 master would write for this
-        // frame, while staying in the trained LUT-sample (output-PQ) units.
-        // Base stats are already true PQ-of-nits from the shader fix.
+    if (params->is_sdr && !params->emulate_sdr) {
+        // SDR (NOT emulated): feed the spline a *virtual DV-mastered* input so
+        // the knots (77–84) encode the curve a Dolby L2 master would write for
+        // this frame, while staying in the trained LUT-sample (output-PQ)
+        // units. Base stats are already true PQ-of-nits from the shader fix.
         // APL sigmoid gain centered on ~18-nit SDR mid-gray; virtual ceiling
         // fixed at 1000 nits (0.7518 PQ) per the SDR design.
+        // Under the SDR→P5 emulation bridge the signal is already virtual-HDR,
+        // so this branch is bypassed and the natural spline takes over.
         float nits_max = sdr_pq_to_nits(features[0]);
         float nits_avg = sdr_pq_to_nits(features[1]);
         float sigma = 1.0f / (1.0f + expf(-0.15f * (nits_avg - 18.0f)));
@@ -406,8 +501,9 @@ static bool build_model_features(const struct pl_ml_render_params *params,
     // Feature 87 (compression_strength): on SDR, floor features[0] at 0.62 so
     // 0.5444/0.51 ≈ 1.07 never reaches the model (caps at 0.878, inside the
     // trained boundary).
-    float f0_den = params->is_sdr ? fmaxf(features[0], SDR_FEATURE0_FLOOR)
-                                  : fmaxf(features[0], 1e-6f);
+    float f0_den = (params->is_sdr && !params->emulate_sdr)
+                               ? fmaxf(features[0], SDR_FEATURE0_FLOOR)
+                               : fmaxf(features[0], 1e-6f);
     features[87] = 0.5444f / f0_den;
     return true;
 }
@@ -480,6 +576,25 @@ bool pl_ml_render_evaluate(const struct pl_ml_render_params *params,
         result->chroma_skin_protect  = 1.0f;
     }
 
+    // ── SDR→P5 virtual-master bridge ─────────────────────────────────────────
+    result->sdr_emulate = params->is_sdr && params->emulate_sdr;
+    result->sdr_virtual_nits = params->sdr_virtual_nits > 0.0f
+                             ? params->sdr_virtual_nits : 1000.0f;
+    // APL-adaptive emulation strength (Dolby-flavoured): bright SDR scenes sit
+    // near the virtual ceiling and need a gentle touch; dark scenes benefit
+    // from a stronger mid/high lift. σ centred on ~18-nit SDR mid-gray.
+    // features[1] is the true-PQ APL of the previous frame — 1-frame latency,
+    // consistent with the rest of the ML path.
+    float sdr_str = fmaxf(0.0f, fminf(1.0f, params->sdr_strength));
+    if (result->sdr_emulate) {
+        float avg_pq = features[1];
+        float nits_avg = sdr_pq_to_nits(avg_pq);
+        float sigma = 1.0f / (1.0f + expf(-0.15f * (nits_avg - 18.0f)));
+        float adaptive = 1.0f + 1.0f * (1.0f - sigma);   // dark=2.0, bright=1.0
+        sdr_str = fmaxf(0.0f, fminf(1.0f, sdr_str * adaptive));
+    }
+    result->sdr_strength = sdr_str;
+
     // ── Shadow bilateral & toe lift ───────────────────────────────────────────
     result->shadow_knee = 0.35f; // fixed 0.35 PQ ≈ 11.7 nits shadow boundary
     result->shadow_strength = 0.0f;
@@ -534,7 +649,19 @@ int pl_ml_render_get_hooks(struct pl_ml_render_result *result,
     if (!result || !hooks)
         return 0;
     int count = 0;
+    // SDR→P5 emulation runs before everything else at RGB_INPUT so the shadow
+    // mask and every downstream stage see the virtual-PQ (DV-mastered) signal.
+    if (result->sdr_emulate) {
+        hooks[count++] = (struct pl_hook) {
+            .stages = PL_HOOK_RGB_INPUT,
+            .input  = PL_HOOK_SIG_TEX,
+            .priv   = result,
+            .hook   = sdr_p5_hook,
+            .signature = 0x5344525035465348ull,  // "SDRP5SH"
+        };
+    }
     // Shadow bilateral runs FIRST — on the raw PQ input before linearization.
+    // (After the emulation bridge when SDR→P5 is active.)
     if (result->shadow_strength > 0.001f) {
         hooks[count++] = (struct pl_hook) {
             .stages = PL_HOOK_RGB_INPUT,

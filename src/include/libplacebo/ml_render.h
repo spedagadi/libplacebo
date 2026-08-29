@@ -55,6 +55,17 @@ struct pl_ml_render_params {
     // PQ-of-nits (bt.1886 → nits → PQ), and the 77–84 spline knots are
     // synthesized from a virtual DV-mastered L2 curve (1000-nit ceiling).
     bool is_sdr;
+    // SDR→P5 virtual-master bridge: when is_sdr AND emulate_sdr, a RGB_INPUT
+    // hook decodes SDR → linear nits → scales to the virtual P5 ceiling
+    // (sdr_virtual_nits, default 1000) → re-encodes as PQ and re-labels the
+    // frame PQ/sig_peak=virtual, so tone-mapping, feature detection and the
+    // ML grade all run on a virtual HDR master. When active, the raw-SDR
+    // feature branches (synthetic pivots, true-PQ shader path) are bypassed.
+    bool emulate_sdr;
+    float sdr_virtual_nits;   // [100, 4000] virtual P5 ceiling in nits
+    float sdr_strength;       // [0, 1] shaped mid-lift (0 = pure linear gain,
+                              // 1 = strong SDR→HDR "lift" curve that survives
+                              // tone-mapping)
     // The renderer whose peak detection buffer provides ML features.
     // Must be the same pl_renderer used to render the current frame.
     // Features are read via pl_renderer_get_ml_features() — no GPU pass issued.
@@ -83,6 +94,10 @@ struct pl_ml_render_result {
     float shadow_knee;        // PQ luma boundary for shadow mask (0.35 fixed)
     float highlight_strength; // bilateral blend in bright zones [0,0.4]
     float highlight_knee;     // output-space luma boundary, derived from gamma
+    // SDR→P5 emulation bridge (resolved): active when is_sdr && emulate_sdr.
+    bool sdr_emulate;
+    float sdr_virtual_nits;
+    float sdr_strength;
 };
 
 // Evaluates ML features from the renderer's peak detection state and resolves
@@ -92,10 +107,11 @@ PL_API bool pl_ml_render_evaluate(const struct pl_ml_render_params *params,
                                   struct pl_ml_render_result *result);
 
 // Initializes hooks for the resolved ML settings. `hooks` must contain room
-// for six entries and remain alive for the render using the result.
-// Slot order: [0] shadow bilateral (RGB_INPUT), [1] highlight bilateral
-// (OUTPUT), [2] fire-pop, [3] L2 gamma, [4] radiance, [5] chroma tuner.
-// Returns the actual number of hooks populated (0–6).
+// for seven entries and remain alive for the render using the result.
+// Slot order: [0] SDR→P5 emulation (RGB_INPUT, when sdr_emulate),
+// [1] shadow bilateral (RGB_INPUT), [2] highlight bilateral (OUTPUT),
+// [3] fire-pop, [4] L2 gamma, [5] radiance, [6] chroma tuner.
+// Returns the actual number of hooks populated (0–7).
 PL_API int pl_ml_render_get_hooks(struct pl_ml_render_result *result,
                                   struct pl_hook hooks[]);
 
