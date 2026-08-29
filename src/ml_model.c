@@ -115,6 +115,7 @@ bool pl_ml_model_predict(pl_ml_model model, const float *features, int feature_c
             if (node < 0 || node >= (int32_t)tree->node_count) return false;
         }
     }
+    prediction->value = (float)result;
     prediction->gamma = fmaxf(0.5f, fminf(1.5f, (float)result));
     return true;
 }

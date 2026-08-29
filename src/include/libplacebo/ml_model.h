@@ -17,6 +17,7 @@ struct pl_ml_model_params {
 
 struct pl_ml_prediction {
     float gamma;
+    float value; // raw unclipped prediction
 };
 
 struct pl_ml_context_params {
