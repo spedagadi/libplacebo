@@ -7,3 +7,17 @@
 *.o
 .cache
 __pycache__
+
+# Dev scratch — logs, test outputs, built artifacts
+scratch/
+*.log
+*.bin
+*.f32
+*.rgb
+*.mp4
+*.csv
+*.jsonl
+python3
+stderr.txt
+libplacebo-360.dll
+libplacebo.dll.a

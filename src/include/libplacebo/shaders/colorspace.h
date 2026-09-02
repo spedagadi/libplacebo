@@ -146,6 +146,13 @@ struct pl_peak_detect_params {
     // possibility of 1-frame flickers on transitions. Disabled by default.
     bool allow_delayed;
 
+    // Stats-only accumulation: run the frame-statistics accumulation pass
+    // (which also feeds pl_get_detected_ml_features) but do NOT feed the
+    // detected peak into tone-map adaptation. The tone map keeps using static
+    // metadata, exactly as if peak detection were disabled. This decouples ML
+    // feature availability from --hdr-compute-peak. Implies allow_delayed.
+    bool stats_only;
+
     // --- Deprecated / removed fields
     PL_DEPRECATED_IN(v6.313) float minimum_peak;
 };

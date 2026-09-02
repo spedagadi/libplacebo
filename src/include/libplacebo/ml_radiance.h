@@ -24,6 +24,7 @@ enum pl_ml_control_mode {
 struct pl_ml_radiance_params {
     enum pl_ml_control_mode mode;
     float average_luma;
+    float peak_luma;    // l1_max_pq — dampens auto strength for bright scenes
     float knee;
     float strength;
     float shoulder; // PQ level where boost starts to fade (default 0.82)

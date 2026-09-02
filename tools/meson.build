@@ -8,15 +8,10 @@ if cc.has_header('libavformat/avformat.h')
     ffmpeg_deps += dependency('libavutil', version: '>=56.0.0', required: false)
 
     if ffmpeg_deps[0].found() and ffmpeg_deps[1].found() and ffmpeg_deps[2].found()
-        pl_extract_features = executable('pl_extract_features',
-            'pl_extract_features.c',
-            dependencies: [ffmpeg_deps, libplacebo],
-            install: true,
-            install_dir: get_option('bindir'),
-        )
-        message('ML feature extraction tool will be built: pl_extract_features')
+        # pl_extract_features (single-shot) still uses old API — pending rewrite.
+        # message('Skipping pl_extract_features single-shot (pending API migration)')
 
-        # Daemon version - persistent GPU context for high-performance extraction
+        # Daemon: rewritten to use pl_render_image + pl_renderer_get_ml_features
         pl_extract_features_daemon = executable('pl_extract_features_daemon',
             'pl_extract_features_daemon.c',
             dependencies: [ffmpeg_deps, libplacebo],

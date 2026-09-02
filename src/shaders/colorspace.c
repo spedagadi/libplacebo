@@ -892,7 +892,8 @@ static bool peak_detect_params_eq(const struct pl_peak_detect_params *a,
     return a->smoothing_period     == b->smoothing_period     &&
            a->scene_threshold_low  == b->scene_threshold_low  &&
            a->scene_threshold_high == b->scene_threshold_high &&
-           a->percentile           == b->percentile;
+           a->percentile           == b->percentile          &&
+           a->stats_only           == b->stats_only;
     // don't compare `allow_delayed` because it doesn't change measurement
 }
 
@@ -1410,14 +1411,12 @@ retry_ssbo:
         @if (sdr) {                                                             \
             /* SDR (gamma/bt.1886) signal is NOT PQ luma. color.rgb is already \
              * linearised, so decode nits exactly then PQ-encode: SDR white → \
-             * ~0.508 PQ (not ~0.85 signal value). Keeps ML base features in  \
-             * the trained PQ-of-nits semantics.                               \
+             * ~0.58 PQ. Keeps ML base features in the trained PQ-of-nits     \
+             * semantics (Y = nits / 10000 per ST.2084).                       \
              */                                                                 \
             float sdr_nits = dot(${sh_luma_coeffs(sh, &csp)}, color.rgb)       \
                            * ${const float: PL_COLOR_SDR_WHITE};               \
-            float sdr_np  = clamp(sdr_nits                                     \
-                             / ${const float: PL_COLOR_SDR_WHITE * 100.0},     \
-                             0.0, 1.0);                                         \
+            float sdr_np  = clamp(sdr_nits / 10000.0, 0.0, 1.0);              \
             float sdr_m1 = pow(sdr_np, ${const float: PQ_M1});                 \
             y_ml = uint(${const float: PQ_MAX}                                 \
                      * pow((${const float: PQ_C1}                              \
@@ -1843,11 +1842,20 @@ void pl_shader_color_map_ex(pl_shader sh, const struct pl_color_map_params *para
     struct pl_color_space src = args->src, dst = args->dst;
     struct sh_color_map_obj *obj = NULL;
     if (args->state) {
-        pl_get_detected_hdr_metadata(*args->state, &src.hdr);
         obj = SH_OBJ(sh, args->state, PL_SHADER_OBJ_COLOR_MAP, struct sh_color_map_obj,
                      sh_color_map_uninit);
         if (!obj)
             return;
+        // Stats-only accumulation: populate the ML feature cache but leave the
+        // tone map on static metadata — the detected peak must NOT feed
+        // src.hdr (this is the "hdr-compute-peak=no + ML" contract). Keeping
+        // args->state non-NULL preserves tone/gamut LUT caching and avoids the
+        // linear-tone-map downgrade that a NULL state would force elsewhere.
+        if (obj->peak.params.stats_only) {
+            update_peak_buf(SH_GPU(sh), obj, false);
+        } else {
+            pl_get_detected_hdr_metadata(*args->state, &src.hdr);
+        }
     }
 
     pl_color_space_infer_map(&src, &dst);

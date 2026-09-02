@@ -1,12 +1,19 @@
 #include <math.h>
 
+#include <libplacebo/dispatch.h>
 #include <libplacebo/ml_radiance.h>
+#include <libplacebo/shaders/colorspace.h>
+
+// Shared by ml_render.c; not public API.
+extern void ml_grade_to_ref(pl_shader sh, const struct pl_color_space *csp);
+extern void ml_grade_from_ref(pl_shader sh, const struct pl_color_space *csp);
 
 static struct pl_hook_res radiance_hook(void *priv,
                                         const struct pl_hook_params *params)
 {
     struct pl_ml_radiance *radiance = priv;
     pl_shader sh = params->sh;
+    const struct pl_color_space target_csp = params->color;
     // Resonance: bell-shaped highlight lift.
     //
     // Rising side (knee → shoulder): smooth-step envelope lifts mid-highlights
@@ -40,6 +47,7 @@ static struct pl_hook_res radiance_hook(void *priv,
         { .var = pl_var_float("radiance_strength"), .data = &radiance->strength, .dynamic = true },
         { .var = pl_var_float("radiance_shoulder"), .data = &radiance->shoulder, .dynamic = true },
     };
+    ml_grade_to_ref(sh, &target_csp);
     if (!pl_shader_custom(sh, &(struct pl_custom_shader) {
         .description = "GPU adaptive radiance highlight lift",
         .body = body,
@@ -52,6 +60,7 @@ static struct pl_hook_res radiance_hook(void *priv,
     })) {
         return (struct pl_hook_res) { .failed = true };
     }
+    ml_grade_from_ref(sh, &target_csp);
     return (struct pl_hook_res) {
         .output = PL_HOOK_SIG_COLOR,
         .sh = sh,
@@ -77,6 +86,14 @@ void pl_ml_radiance_configure(struct pl_ml_radiance *radiance,
         radiance->strength = fmaxf(0.15f, 0.60f * (1.0f - 1.5f * avg));
         // Auto shoulder: set above the auto knee with some headroom
         radiance->shoulder = fminf(0.95f, radiance->knee + 0.25f);
+        // Dampen for scenes with high peak luminance — highlights are already
+        // near ceiling and radiance lift can blow them out. The L2 shader's
+        // adaptive highlight guard handles per-pixel protection; this is a
+        // gentler per-frame backstop. Taper: 0% at peak 0.5, 50% at peak 1.0.
+        if (params->peak_luma > 0.0f) {
+            float peak_damp = 1.0f - fmaxf(0.0f, (params->peak_luma - 0.5f) / 0.5f) * 0.5f;
+            radiance->strength *= fmaxf(0.0f, peak_damp);
+        }
     } else if (params->mode == PL_ML_CONTROL_MANUAL) {
         radiance->knee = fmaxf(0.40f, fminf(0.90f, params->knee));
         radiance->strength = fmaxf(0.0f, fminf(0.60f, params->strength));

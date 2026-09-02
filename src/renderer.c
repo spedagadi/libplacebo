@@ -1186,18 +1186,28 @@ static void hdr_update_peak(struct pass_state *pass)
     pl_renderer rr = pass->rr;
 
     bool is_hdr = pl_color_space_is_hdr(&pass->img.color);
-    if (!params->peak_detect_params)
+    const struct pl_peak_detect_params *pd = params->peak_detect_params;
+    if (!pd)
         goto cleanup;
 
-    // SDR sources: still run the accumulation pass when peak detection is
-    // configured, so pl_get_detected_ml_features() always has valid SDR
-    // features for the ML pipeline. This writes stats only — SDR grading is
-    // untouched because tone-map adaptation remains gated on is_hdr.
+    // Stats-only accumulation: feature sensing must never depend on target
+    // encoding or on adaptive tone mapping. Two cases run the accumulation pass
+    // while leaving the "use the detected peak" logic off:
+    //
+    //  - ml_only (SDR sources): still run the accumulation pass when peak
+    //    detection is configured, so pl_get_detected_ml_features() always has
+    //    valid SDR features for the ML pipeline. SDR grading is untouched
+    //    because tone-map adaptation remains gated on is_hdr.
+    //  - stats_only (HDR sources): explicit opt-out of adaptive tone mapping
+    //    (e.g. --hdr-compute-peak=no) while the ML pipeline still gets real
+    //    per-frame features. The tone map consumes static metadata below.
     bool ml_only = !is_hdr;
+    bool stats_only = pd->stats_only;
+    bool collect_only = ml_only || stats_only;
 
-    // HDR-adaptation-only exits — they bail for SDR, but the feature
-    // accumulation must run regardless, or ML is a silent no-op on SDR input.
-    if (!ml_only) {
+    // HDR-adaptation-only exits — they bail for collection-only input, but the
+    // feature accumulation must run regardless, or ML is a silent no-op.
+    if (!collect_only) {
         if (rr->errors & PL_RENDER_ERR_PEAK_DETECT)
             goto cleanup;
 
@@ -1233,13 +1243,12 @@ static void hdr_update_peak(struct pass_state *pass)
             goto cleanup; // LUT handles tone mapping
     }
 
-    // SDR feature-only accumulation never needs the storable-FBO synchronous
+    // Feature-only accumulation never needs the storable-FBO synchronous
     // readback path — the stats are used one frame later by the ML eval, so
     // force the delayed (readback) path even if the app configured otherwise.
-    const struct pl_peak_detect_params *pd = params->peak_detect_params;
     struct pl_peak_detect_params sdr_pd;
-    if (ml_only) {
-        sdr_pd = *params->peak_detect_params;
+    if (collect_only) {
+        sdr_pd = *pd;
         sdr_pd.allow_delayed = true;
         pd = &sdr_pd;
     }
@@ -2142,33 +2151,23 @@ static pl_tex get_feature_map(struct pass_state *pass)
     const float ratio = cparams->contrast_smoothness;
     const int cr_w = ceilf(abs(pl_rect_w(pass->dst_rect)) / ratio);
     const int cr_h = ceilf(abs(pl_rect_h(pass->dst_rect)) / ratio);
-    pl_tex inter_tex = get_fbo(pass, img->w, img->h, NULL, 1, PL_DEBUG_TAG);
-    pl_tex out_tex   = get_fbo(pass, cr_w, cr_h, NULL, 1, PL_DEBUG_TAG);
-    if (!inter_tex || !out_tex)
-        goto error;
-
-    pl_shader sh = pl_dispatch_begin(rr->dp);
-    pl_shader_sample_direct(sh, pl_sample_src( .tex = img->tex ));
-    pl_shader_extract_features(sh, img->color);
-    bool ok = pl_dispatch_finish(rr->dp, pl_dispatch_params(
-        .shader = &sh,
-        .target = inter_tex,
-    ));
-    if (!ok)
+    pl_tex out_tex = get_fbo(pass, cr_w, cr_h, NULL, 1, PL_DEBUG_TAG);
+    if (!out_tex)
         goto error;
 
     const struct pl_sample_src src = {
-        .tex          = inter_tex,
+        .tex          = img->tex,
         .rect         = img->rect,
         .address_mode = PL_TEX_ADDRESS_MIRROR,
-        .components   = 1,
+        .components   = 3,
         .new_w        = cr_w,
         .new_h        = cr_h,
     };
 
-    sh = pl_dispatch_begin(rr->dp);
-    dispatch_sampler(pass, sh, &rr->sampler_contrast, SAMPLER_LOWPASS, out_tex, &src);
-    ok = pl_dispatch_finish(rr->dp, pl_dispatch_params(
+    pl_shader sh = pl_dispatch_begin(rr->dp);
+    pl_shader_sample_direct(sh, &src);
+    pl_shader_extract_features(sh, img->color);
+    bool ok = pl_dispatch_finish(rr->dp, pl_dispatch_params(
         .shader = &sh,
         .target = out_tex,
     ));

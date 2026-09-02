@@ -6,6 +6,35 @@
 #include <libplacebo/tone_mapping.h>
 #include <libplacebo/shaders/colorspace.h>
 
+// Reference transfer used for all PL_HOOK_OUTPUT Zion Core grades.
+// The L2 gamma, radiance and chroma-tuner shaders were tuned assuming they
+// operate on a gamma-2.2 encoded 0..1 signal. Wrapping the hooks with a
+// target-transfer <-> gamma-2.2 round-trip makes the grade independent of
+// --target-trc and fixes the compounding that blows out highlights on SDR.
+#define ML_GRADE_REF_TRANSFER PL_COLOR_TRC_GAMMA22
+
+void ml_grade_to_ref(pl_shader sh,
+                     const struct pl_color_space *target_csp)
+{
+    if (target_csp->transfer == ML_GRADE_REF_TRANSFER)
+        return;
+    struct pl_color_space ref_csp = *target_csp;
+    ref_csp.transfer = ML_GRADE_REF_TRANSFER;
+    pl_shader_linearize(sh, target_csp);
+    pl_shader_delinearize(sh, &ref_csp);
+}
+
+void ml_grade_from_ref(pl_shader sh,
+                       const struct pl_color_space *target_csp)
+{
+    if (target_csp->transfer == ML_GRADE_REF_TRANSFER)
+        return;
+    struct pl_color_space ref_csp = *target_csp;
+    ref_csp.transfer = ML_GRADE_REF_TRANSFER;
+    pl_shader_linearize(sh, &ref_csp);
+    pl_shader_delinearize(sh, target_csp);
+}
+
 // ── SDR → true-PQ helpers (ST.2084 constants; not exported by public headers) ──
 #define SDR_VIRTUAL_PEAK_PQ 0.7518f   // 1000-nit virtual P5 ceiling
 #define SDR_FEATURE0_FLOOR  0.62f     // feature-87 compression-floor on SDR
@@ -32,14 +61,38 @@ static struct pl_hook_res l2_hook(void *priv, const struct pl_hook_params *param
 {
     struct pl_ml_render_result *result = priv;
     pl_shader sh = params->sh;
+    const struct pl_color_space target_csp = params->color;
     static const char body[] =
         "float y = dot(color.rgb, vec3(0.2126, 0.7152, 0.0722));\n"
         "float cb = (color.b - y) * (l2_saturation / 2048.0);\n"
         "float cr = (color.r - y) * (l2_saturation / 2048.0);\n"
         "float l2_gamma = 2048.0 / l2_power;\n"
         "if (l2_gamma != 1.0 && y > 0.001 && y < 0.999) {\n"
-        "    float t = 2.0 * y - 1.0;\n"
-        "    y = 0.5 * (sign(t) * pow(abs(t), l2_gamma) + 1.0);\n"
+        "    float hi = smoothstep(l2_guard, 0.98, y);\n"
+        "    float g = mix(l2_gamma, 1.0, hi);\n"
+        "    float lo = 0.5 * pow(2.0 * y, g);\n"
+        "    float hi_v = 1.0 - 0.5 * pow(2.0 * (1.0 - y), g);\n"
+        "    y = mix(lo, hi_v, step(0.5, y));\n"
+        "}\n"
+        "if (l2_midtone_boost > 0.001) {\n"
+        "    float hi_mb = smoothstep(l2_guard, 0.98, y);\n"
+        "    float eff_boost = mix(l2_midtone_boost, 0.0, hi_mb);\n"
+        "    float shadow_bias = max(0.0, 0.5 - y) * eff_boost * 0.4;\n"
+        "    y = clamp(0.5 + (y - 0.5) * (1.0 + eff_boost) - shadow_bias, 0.0, 1.0);\n"
+        "}\n"
+        "float desat = smoothstep(l2_guard, 0.95, y);\n"
+        "cr *= (1.0 - desat * 0.5);\n"
+        "cb *= (1.0 - desat * 0.5);\n"
+        "float r_out = y + cr;\n"
+        "float g_out = y - 0.2126 / 0.7152 * cr - 0.0722 / 0.7152 * cb;\n"
+        "float b_out = y + cb;\n"
+        "float mx = max(max(r_out, g_out), b_out);\n"
+        "float mn = min(min(r_out, g_out), b_out);\n"
+        "if (mx > 1.0 || mn < 0.0) {\n"
+        "    float s = 1.0;\n"
+        "    if (mx > 1.0 && mx > y + 0.001) s = min(s, (1.0 - y) / (mx - y));\n"
+        "    if (mn < 0.0 && mn < y - 0.001) s = min(s, y / (y - mn));\n"
+        "    cr *= max(s, 0.0); cb *= max(s, 0.0);\n"
         "}\n"
         "color.r = clamp(y + cr, 0.0, 1.0);\n"
         "color.g = clamp(y - 0.2126 / 0.7152 * cr - 0.0722 / 0.7152 * cb, 0.0, 1.0);\n"
@@ -47,13 +100,17 @@ static struct pl_hook_res l2_hook(void *priv, const struct pl_hook_params *param
     struct pl_shader_var vars[] = {
         { .var = pl_var_float("l2_power"), .data = &result->l2_power, .dynamic = true },
         { .var = pl_var_float("l2_saturation"), .data = &result->l2_saturation, .dynamic = true },
+        { .var = pl_var_float("l2_guard"), .data = &result->l2_highlight_guard, .dynamic = true },
+        { .var = pl_var_float("l2_midtone_boost"), .data = &result->l2_midtone_boost, .dynamic = true },
     };
+    ml_grade_to_ref(sh, &target_csp);
     if (!pl_shader_custom(sh, &(struct pl_custom_shader) {
         .description = "GPU L2 gamma and saturation trim", .body = body,
         .input = PL_SHADER_SIG_COLOR, .output = PL_SHADER_SIG_COLOR,
-        .variables = vars, .num_variables = 2,
+        .variables = vars, .num_variables = 4,
         .output_w = pl_rect_w(params->dst_rect), .output_h = pl_rect_h(params->dst_rect),
     })) return (struct pl_hook_res) { .failed = true };
+    ml_grade_from_ref(sh, &target_csp);
     return (struct pl_hook_res) { .output = PL_HOOK_SIG_COLOR, .sh = sh,
         .repr = params->repr, .color = params->color, .components = params->components,
         .rect = params->rect };
@@ -63,6 +120,7 @@ static struct pl_hook_res fire_hook(void *priv, const struct pl_hook_params *par
 {
     struct pl_ml_render_result *result = priv;
     pl_shader sh = params->sh;
+    const struct pl_color_space target_csp = params->color;
     static const char body[] =
         "float y = dot(color.rgb, vec3(0.2126, 0.7152, 0.0722));\n"
         "float t = clamp((y - 0.45) / 0.40, 0.0, 1.0);\n"
@@ -77,12 +135,14 @@ static struct pl_hook_res fire_hook(void *priv, const struct pl_hook_params *par
         "}\n";
     struct pl_shader_var var = { .var = pl_var_float("fire_strength"),
         .data = &result->fire_pop_strength, .dynamic = true };
+    ml_grade_to_ref(sh, &target_csp);
     if (!pl_shader_custom(sh, &(struct pl_custom_shader) {
         .description = "GPU fire-pop output hook", .body = body,
         .input = PL_SHADER_SIG_COLOR, .output = PL_SHADER_SIG_COLOR,
         .variables = &var, .num_variables = 1,
         .output_w = pl_rect_w(params->dst_rect), .output_h = pl_rect_h(params->dst_rect),
     })) return (struct pl_hook_res) { .failed = true };
+    ml_grade_from_ref(sh, &target_csp);
     return (struct pl_hook_res) { .output = PL_HOOK_SIG_COLOR, .sh = sh,
         .repr = params->repr, .color = params->color, .components = params->components,
         .rect = params->rect };
@@ -92,28 +152,22 @@ static struct pl_hook_res chroma_tuner_hook(void *priv, const struct pl_hook_par
 {
     struct pl_ml_render_result *result = priv;
     pl_shader sh = params->sh;
-    // Perceptual-space chroma tuner.
+    // Gamma-2.2 chroma tuner.
     //
-    // Root cause of facial blowout: PL_HOOK_OUTPUT runs in LINEAR light.
-    // YCbCr skin-ellipse parameters were calibrated for gamma-encoded space.
-    // In linear light, warm highlights cause r_channel to spike exponentially,
-    // inflating cr far outside the ellipse → skin pixels flagged as fire →
-    // full fire_boost applied → orange blowout on faces.
-    //
-    // Fix: convert to perceptual (gamma 2.2) space before skin detection,
-    // apply the vector boost there, then invert back to linear.
-    // This restores the cr/cb ratios to the range the ellipse expects.
-    static const char body[] =
-        // 1. Convert linear → perceptual for accurate skin math
-        "vec3 p = pow(clamp(color.rgb, 0.0, 1.0), vec3(1.0 / 2.2));\n"
-        "float y = dot(p, vec3(0.2126, 0.7152, 0.0722));\n"
-        "float r_res = p.r - y;\n"
-        "float b_res = p.b - y;\n"
+    // ml_grade_to_ref already converts the signal to gamma-2.2 encoded [0,1]
+    // before this body runs. The cr/cb decomposition and skin ellipse operate
+    // directly on these gamma-encoded values, matching the SDR training domain
+    // (WIDER FACE, sRGB ≈ gamma 2.2).  No extra pow() is needed.
+    static const char body_a[] =
+        // 1. Decompose gamma-2.2 signal into luma + chroma residuals
+        "float y = dot(color.rgb, vec3(0.2126, 0.7152, 0.0722));\n"
+        "float r_res = color.r - y;\n"
+        "float b_res = color.b - y;\n"
         "float cb = b_res / 1.8556;\n"
         "float cr = r_res / 1.5748;\n"
-        // 2. Adaptive ellipse expansion above knee (highlight coordinate drift fix)
-        "float dr = (cr - 0.15) / 0.08;\n"
-        "float db = (cb + 0.05) / 0.04;\n"
+        // 2. Skin ellipse (center/radii from WIDER FACE training stats in gamma-2.2)
+        "float dr = (cr - 0.08) / 0.07;\n"
+        "float db = (cb + 0.05) / 0.05;\n"
         "if (y > u_chroma_knee) {\n"
         "    float hd = clamp((y - u_chroma_knee) / (1.0 - u_chroma_knee), 0.0, 1.0);\n"
         "    float ex = 1.0 + hd * 0.50;\n"
@@ -121,16 +175,9 @@ static struct pl_hook_res chroma_tuner_hook(void *priv, const struct pl_hook_par
         "}\n"
         "float skin_ellipse = dr * dr + db * db;\n"
         "float skin_weight = 1.0 / (1.0 + skin_ellipse * 12.0);\n"
-        // 3. Adaptive highlight skin taper (perceptual space).
-        // Starts at y=0.60 perceptual — covers Boromir-style specular blind spot
-        // (0.60–0.74) while leaving normal skin midtones (y < 0.60) free to
-        // receive the full color boost.
-        // NOTE: taper_start must be a fixed perceptual value, NOT derived from
-        // u_chroma_knee. The knee (0.55) was calibrated in linear space; using
-        // knee-0.05=0.50 in perceptual maps to ~22% linear and over-protects
-        // 80%+ of the image, killing neutral_boost entirely.
+        // 3. Highlight skin taper (gamma-2.2 space, y=0.60 ≈ 33% linear)
         "if (y > 0.60) {\n"
-        "    float dt = clamp((y - 0.60) / 0.40, 0.0, 1.0);\n"  // ramp 0.60→1.0
+        "    float dt = clamp((y - 0.60) / 0.40, 0.0, 1.0);\n"
         "    float pe = dt * dt * (3.0 - 2.0 * dt);\n"
         "    skin_weight = mix(skin_weight, 1.0, pe);\n"
         "}\n"
@@ -149,24 +196,87 @@ static struct pl_hook_res chroma_tuner_hook(void *priv, const struct pl_hook_par
         "    float max_safe = y / g_denom;\n"
         "    if (max_safe < chroma_scalar) chroma_scalar = max(1.0, max_safe);\n"
         "}\n"
-        // 6. Apply scalar to perceptual residuals, reconstruct, invert to linear
+        // 6. Warm-excursion damp — same counter-weight as body_b
+        "float warm = clamp((r_res - b_res) * 3.3333, 0.0, 1.0);\n"
+        "chroma_scalar = mix(chroma_scalar, 1.0, warm * u_chroma_warm_damp);\n"
+        // 7. Apply scalar to residuals, reconstruct gamma-2.2 signal
         "r_res *= chroma_scalar; b_res *= chroma_scalar;\n"
-        "vec3 perc_out;\n"
-        "perc_out.r = y + r_res;\n"
-        "perc_out.g = y - (0.2126 / 0.7152) * r_res - (0.0722 / 0.7152) * b_res;\n"
-        "perc_out.b = y + b_res;\n"
-        "color.rgb = pow(clamp(perc_out, 0.0, 1.0), vec3(2.2));\n";
+        "color.r = clamp(y + r_res, 0.0, 1.0);\n"
+        "color.g = clamp(y - (0.2126 / 0.7152) * r_res - (0.0722 / 0.7152) * b_res, 0.0, 1.0);\n"
+        "color.b = clamp(y + b_res, 0.0, 1.0);\n";
+    // Body B — trained P(skin) LUT lookup instead of the hand-tuned ellipse.
+    // No adaptive ellipse and NO highlight taper: the trained distribution
+    // already spans bright scenes, so the mask survives them (the OLD taper
+    // disabled protection exactly where the fire boost is largest).
+    // ml_grade_to_ref already provides gamma-2.2 encoded values matching the
+    // WIDER FACE training domain — no extra pow() needed.
+    static const char body_b[] =
+        // 1. Decompose gamma-2.2 signal into luma + chroma residuals
+        "float y = dot(color.rgb, vec3(0.2126, 0.7152, 0.0722));\n"
+        "float r_res = color.r - y;\n"
+        "float b_res = color.b - y;\n"
+        "float cb = b_res / 1.8556;\n"
+        "float cr = r_res / 1.5748;\n"
+        // 2. Trained P(skin) LUT lookup (cr→u, cb→v), bilinear + clamp.
+        "vec2 uv = vec2((cr - u_skin_cr0) / (u_skin_cr1 - u_skin_cr0),\n"
+        "               (cb - u_skin_cb0) / (u_skin_cb1 - u_skin_cb0));\n"
+        "float skin_weight = textureLod(skin_lut, clamp(uv, 0.0, 1.0), 0.0).r;\n"
+        // 3. Compute adaptive chroma boost
+        "float luma_boost = u_chroma_neutral_boost;\n"
+        "float denom = 1.0 - u_chroma_knee;\n"
+        "if (y > u_chroma_knee && denom > 0.001) {\n"
+        "    float t = clamp((y - u_chroma_knee) / denom, 0.0, 1.0);\n"
+        "    luma_boost = mix(u_chroma_neutral_boost, u_chroma_fire_boost, pow(t, 1.5));\n"
+        "}\n"
+        "float chroma_scalar = mix(luma_boost, 1.0, clamp(skin_weight * u_chroma_skin_protect, 0.0, 1.0));\n"
+        "chroma_scalar = clamp(chroma_scalar, 1.0, 1.50);\n"
+        // 4. Safe taper: prevent green going negative on saturated fire/highlights
+        "float g_denom = (0.2126 / 0.7152) * r_res + (0.0722 / 0.7152) * b_res;\n"
+        "if (g_denom > 0.0) {\n"
+        "    float max_safe = y / g_denom;\n"
+        "    if (max_safe < chroma_scalar) chroma_scalar = max(1.0, max_safe);\n"
+        "}\n"
+        // 4b. Warm-excursion damp -- the red/pink counter-weight
+        "float warm = clamp((r_res - b_res) * 3.3333, 0.0, 1.0);\n"
+        "chroma_scalar = mix(chroma_scalar, 1.0, warm * u_chroma_warm_damp);\n"
+        // 5. Apply scalar to residuals, reconstruct gamma-2.2 signal
+        "r_res *= chroma_scalar; b_res *= chroma_scalar;\n"
+        "color.r = clamp(y + r_res, 0.0, 1.0);\n"
+        "color.g = clamp(y - (0.2126 / 0.7152) * r_res - (0.0722 / 0.7152) * b_res, 0.0, 1.0);\n"
+        "color.b = clamp(y + b_res, 0.0, 1.0);\n";
     struct pl_shader_var vars[] = {
         { .var = pl_var_float("u_chroma_neutral_boost"), .data = &result->chroma_neutral_boost, .dynamic = true },
         { .var = pl_var_float("u_chroma_fire_boost"),    .data = &result->chroma_fire_boost,    .dynamic = true },
         { .var = pl_var_float("u_chroma_knee"),          .data = &result->chroma_knee,          .dynamic = true },
         { .var = pl_var_float("u_chroma_skin_protect"),  .data = &result->chroma_skin_protect,  .dynamic = true },
+        // warm-excursion damp [0..1] — shared by both body-A and body-B
+        { .var = pl_var_float("u_chroma_warm_damp"), .data = &result->chroma_warm_damp, .dynamic = true },
+        // body-B LUT grid bounds (registered only when lut_ok)
+        { .var = pl_var_float("u_skin_cr0"), .data = &result->skin_lut_cr0, .dynamic = true },
+        { .var = pl_var_float("u_skin_cr1"), .data = &result->skin_lut_cr1, .dynamic = true },
+        { .var = pl_var_float("u_skin_cb0"), .data = &result->skin_lut_cb0, .dynamic = true },
+        { .var = pl_var_float("u_skin_cb1"), .data = &result->skin_lut_cb1, .dynamic = true },
     };
+    bool lut_ok = result->skin_lut != NULL && result->skin_lut_gpu == params->gpu;
+    const char *body = lut_ok ? body_b : body_a;
+    struct pl_shader_desc desc = lut_ok ? (struct pl_shader_desc) {
+        .desc = { .name = "skin_lut", .type = PL_DESC_SAMPLED_TEX },
+        .binding = {
+            .object = result->skin_lut,
+            .sample_mode  = PL_TEX_SAMPLE_LINEAR,   // bilinear P(skin)
+            .address_mode = PL_TEX_ADDRESS_CLAMP,
+        },
+    } : (struct pl_shader_desc) {0};
+    const struct pl_color_space target_csp = params->color;
+    ml_grade_to_ref(sh, &target_csp);
     if (!pl_shader_custom(sh, &(struct pl_custom_shader) {
         .description = "Adaptive Chroma Vector Tuner", .body = body,
         .input = PL_SHADER_SIG_COLOR, .output = PL_SHADER_SIG_COLOR,
-        .variables = vars, .num_variables = 4,
+        .variables = vars, .num_variables = lut_ok ? 9 : 5,
+        .descriptors = lut_ok ? &desc : NULL,
+        .num_descriptors = lut_ok ? 1 : 0,
     })) return (struct pl_hook_res) { .failed = true };
+    ml_grade_from_ref(sh, &target_csp);
     return (struct pl_hook_res) { .output = PL_HOOK_SIG_COLOR, .sh = sh,
         .repr = params->repr, .color = params->color, .components = params->components,
         .rect = params->rect };
@@ -200,9 +310,16 @@ static struct pl_hook_res shadow_bilateral_hook(void *priv,
 
     pl_shader sh = pl_dispatch_begin(params->dispatch);
 
+    // BT.2020 for HDR sources, BT.709 for SDR (after SDR→P5 bridge)
+    float luma[3] = { 0.2627f, 0.6780f, 0.0593f };
+    if (result->sdr_emulate) {
+        luma[0] = 0.2126f; luma[1] = 0.7152f; luma[2] = 0.0722f;
+    }
+
     struct pl_shader_var vars[] = {
         { .var = pl_var_float("shadow_str"),  .data = &result->shadow_strength, .dynamic = true },
         { .var = pl_var_float("shadow_knee"), .data = &result->shadow_knee,     .dynamic = true },
+        { .var = pl_var_vec3("luma_w"),       .data = luma },
     };
     struct pl_shader_desc desc = {
         .desc = { .name = "shadow_src", .type = PL_DESC_SAMPLED_TEX },
@@ -217,17 +334,16 @@ static struct pl_hook_res shadow_bilateral_hook(void *priv,
         "vec2 pt = 1.0 / sz;\n"
         "vec4 csrc = textureLod(shadow_src, uv, 0.0);\n"
         "vec3 center = csrc.rgb;\n"
-        "float y_c = dot(center, vec3(0.2126, 0.7152, 0.0722));\n"
+        "float y_c = dot(center, luma_w);\n"
         "float smask = 1.0 - smoothstep(shadow_knee * 0.5, shadow_knee, y_c);\n"
         "vec3 out_rgb = center;\n"
         "if (smask > 0.001 && shadow_str > 0.001) {\n"
-        "    // 1. 5x5 Bilateral edge-preserving spatial denoiser\n"
         "    vec3 acc = vec3(0.0); float tw = 0.0;\n"
         "    float sr = clamp(shadow_str, 0.02, 0.30);\n"
         "    for (int dy = -2; dy <= 2; dy++) {\n"
         "        for (int dx = -2; dx <= 2; dx++) {\n"
         "            vec3 s = textureLod(shadow_src, uv + vec2(dx, dy) * pt, 0.0).rgb;\n"
-        "            float sy = dot(s, vec3(0.2126, 0.7152, 0.0722));\n"
+        "            float sy = dot(s, luma_w);\n"
         "            float d2 = float(dx*dx + dy*dy);\n"
         "            float yd = y_c - sy;\n"
         "            float w = exp(-d2 * 0.222) * exp(-yd*yd / (2.0*sr*sr));\n"
@@ -236,10 +352,6 @@ static struct pl_hook_res shadow_bilateral_hook(void *priv,
         "    }\n"
         "    vec3 denoised = acc / max(tw, 0.001);\n"
         "    out_rgb = mix(center, denoised, smask * clamp(shadow_str * 2.0, 0.0, 1.0));\n"
-        "    // 2. Machine-learned shadow toe (un-crush dark gradients)\n"
-        "    // Multiplicative gain anchored at black: out = rgb*(1+str*(1-u)^2)\n"
-        "    // u = y_c/knee. At u=0 the gain is 1+str (max detail expansion, no\n"
-        "    // lift of black); at u=1 the gain is 1 and the curve merges C1.\n"
         "    float u = clamp(y_c / max(shadow_knee, 0.001), 0.0, 1.0);\n"
         "    float gain = 1.0 + shadow_str * (1.0 - u) * (1.0 - u);\n"
         "    out_rgb = clamp(mix(out_rgb, out_rgb * vec3(gain), smask), 0.0, 1.0);\n"
@@ -251,7 +363,7 @@ static struct pl_hook_res shadow_bilateral_hook(void *priv,
         .body        = shadow_body,
         .input       = PL_SHADER_SIG_NONE,
         .output      = PL_SHADER_SIG_COLOR,
-        .variables   = vars, .num_variables   = 2,
+        .variables   = vars, .num_variables   = 3,
         .descriptors = &desc, .num_descriptors = 1,
         .output_w    = w,     .output_h        = h,
     })) {
@@ -294,18 +406,44 @@ static struct pl_hook_res sdr_p5_hook(void *priv, const struct pl_hook_params *p
                        ? result->sdr_virtual_nits : 1000.0f;
     float strength = fmaxf(0.0f, fminf(1.0f, result->sdr_strength));
 
-    // Relative → linear decode (SDR white = 1.0) per the current source
-    // transfer. First-cut calibration: pure-gamma/bt.1886 + srgb handled,
-    // everything else falls back to a 2.4 gamma decode.
     const char *decode;
     switch (params->color.transfer) {
-    case PL_COLOR_TRC_LINEAR:  decode = "vec3 rel = rgb;"; break;
-    case PL_COLOR_TRC_SRGB:    decode = "vec3 rel = pow(max(rgb, vec3(0.0)), vec3(2.2));"; break;
-    case PL_COLOR_TRC_GAMMA22: decode = "vec3 rel = pow(max(rgb, vec3(0.0)), vec3(2.2));"; break;
-    default:                   decode = "vec3 rel = pow(max(rgb, vec3(0.0)), vec3(2.4));"; break;
+    case PL_COLOR_TRC_LINEAR:
+        decode = "vec3 rel = rgb;";
+        break;
+    case PL_COLOR_TRC_SRGB:
+        decode = "vec3 sc = max(rgb, vec3(0.0));\n"
+                 "vec3 lo = sc / 12.92;\n"
+                 "vec3 hi = pow((sc + 0.055) / 1.055, vec3(2.4));\n"
+                 "vec3 rel = mix(lo, hi, step(vec3(0.04045), sc));";
+        break;
+    case PL_COLOR_TRC_BT_1886:
+    case PL_COLOR_TRC_GAMMA24:
+        decode = "vec3 rel = pow(max(rgb, vec3(0.0)), vec3(2.4));";
+        break;
+    case PL_COLOR_TRC_GAMMA18:
+    case PL_COLOR_TRC_PRO_PHOTO:
+        decode = "vec3 rel = pow(max(rgb, vec3(0.0)), vec3(1.8));";
+        break;
+    case PL_COLOR_TRC_GAMMA20:
+        decode = "vec3 rel = pow(max(rgb, vec3(0.0)), vec3(2.0));";
+        break;
+    case PL_COLOR_TRC_GAMMA22:
+        decode = "vec3 rel = pow(max(rgb, vec3(0.0)), vec3(2.2));";
+        break;
+    case PL_COLOR_TRC_GAMMA26:
+    case PL_COLOR_TRC_ST428:
+        decode = "vec3 rel = pow(max(rgb, vec3(0.0)), vec3(2.6));";
+        break;
+    case PL_COLOR_TRC_GAMMA28:
+        decode = "vec3 rel = pow(max(rgb, vec3(0.0)), vec3(2.8));";
+        break;
+    default:
+        decode = "vec3 rel = pow(max(rgb, vec3(0.0)), vec3(2.2));";
+        break;
     }
 
-    char body[768];
+    char body[1024];
     snprintf(body, sizeof(body),
         "vec2 psz = vec2(textureSize(sdr_ml_src, 0));\n"
         "vec2 puv = gl_FragCoord.xy / psz;\n"
@@ -447,6 +585,88 @@ static struct pl_hook_res highlight_bilateral_hook(void *priv,
     };
 }
 
+// Construct CR — PL_HOOK_OUTPUT 9×9 bilateral for local contrast enhancement.
+// Extracts the detail layer (original − bilateral) and boosts it by cr_strength.
+// Replaces the native libplacebo contrast_recovery path to avoid the expensive
+// get_feature_map downsample+extract pipeline.
+static struct pl_hook_res cr_bilateral_hook(void *priv,
+                                            const struct pl_hook_params *params)
+{
+    struct pl_ml_render_result *result = priv;
+    if (result->cr_strength <= 0.001f)
+        return (struct pl_hook_res) { .output = PL_HOOK_SIG_NONE };
+
+    pl_tex src = params->tex;
+    int w = src->params.w, h = src->params.h;
+    pl_tex dst = params->get_tex(params->priv, w, h);
+    if (!dst)
+        return (struct pl_hook_res) { .failed = true };
+
+    pl_shader sh = pl_dispatch_begin(params->dispatch);
+
+    struct pl_shader_var vars[] = {
+        { .var = pl_var_float("cr_str"), .data = &result->cr_strength, .dynamic = true },
+    };
+    struct pl_shader_desc desc = {
+        .desc = { .name = "cr_src", .type = PL_DESC_SAMPLED_TEX },
+        .binding = { .object = src,
+                     .address_mode = PL_TEX_ADDRESS_CLAMP,
+                     .sample_mode  = PL_TEX_SAMPLE_NEAREST },
+    };
+    // 9×9 bilateral: spatial sigma=3.0 px (1/(2*9)≈0.0556), range sigma=0.10.
+    // Luma-only detail boost — bilateral extracts the lowpass luma, difference
+    // is the local contrast detail layer.  Chroma is preserved from the
+    // original pixel (same principle as unsharp-mask in L*a*b*).
+    static const char cr_body[] =
+        "vec2 sz = vec2(textureSize(cr_src, 0));\n"
+        "vec2 uv = gl_FragCoord.xy / sz;\n"
+        "vec2 pt = 1.0 / sz;\n"
+        "vec4 csrc = textureLod(cr_src, uv, 0.0);\n"
+        "vec3 center = csrc.rgb;\n"
+        "float y_c = dot(center, vec3(0.2126, 0.7152, 0.0722));\n"
+        "float y_acc = 0.0; float tw = 0.0;\n"
+        "float sr = 0.10;\n"
+        "for (int dy = -4; dy <= 4; dy++) {\n"
+        "    for (int dx = -4; dx <= 4; dx++) {\n"
+        "        vec3 s = textureLod(cr_src, uv + vec2(dx, dy) * pt, 0.0).rgb;\n"
+        "        float sy = dot(s, vec3(0.2126, 0.7152, 0.0722));\n"
+        "        float d2 = float(dx*dx + dy*dy);\n"
+        "        float yd = y_c - sy;\n"
+        "        float w = exp(-d2 * 0.0556) * exp(-yd*yd / (2.0*sr*sr));\n"
+        "        y_acc += w * sy; tw += w;\n"
+        "    }\n"
+        "}\n"
+        "float y_bil = y_acc / max(tw, 0.001);\n"
+        "float y_new = y_c + cr_str * (y_c - y_bil);\n"
+        "y_new = clamp(y_new, 0.0, 1.0);\n"
+        "color = vec4(clamp(center + (y_new - y_c), 0.0, 1.0), csrc.a);\n";
+
+    if (!pl_shader_custom(sh, &(struct pl_custom_shader) {
+        .description = "Construct CR bilateral",
+        .body        = cr_body,
+        .input       = PL_SHADER_SIG_NONE,
+        .output      = PL_SHADER_SIG_COLOR,
+        .variables   = vars, .num_variables   = 1,
+        .descriptors = &desc, .num_descriptors = 1,
+        .output_w    = w,     .output_h        = h,
+    })) {
+        pl_dispatch_abort(params->dispatch, &sh);
+        return (struct pl_hook_res) { .failed = true };
+    }
+    if (!pl_dispatch_finish(params->dispatch,
+            pl_dispatch_params(.shader = &sh, .target = dst)))
+        return (struct pl_hook_res) { .failed = true };
+
+    return (struct pl_hook_res) {
+        .output     = PL_HOOK_SIG_TEX,
+        .tex        = dst,
+        .repr       = params->repr,
+        .color      = params->color,
+        .components = params->components,
+        .rect       = params->rect,
+    };
+}
+
 static bool build_model_features(const struct pl_ml_render_params *params,
                                  float features[88])
 {
@@ -498,12 +718,16 @@ static bool build_model_features(const struct pl_ml_render_params *params,
         features[77 + index] = spline_lut[knot_indices[index]];
     features[85] = params->top_bar_norm;
     features[86] = params->bottom_bar_norm;
-    // Feature 87 (compression_strength): on SDR, floor features[0] at 0.62 so
-    // 0.5444/0.51 ≈ 1.07 never reaches the model (caps at 0.878, inside the
-    // trained boundary).
-    float f0_den = (params->is_sdr && !params->emulate_sdr)
-                               ? fmaxf(features[0], SDR_FEATURE0_FLOOR)
-                               : fmaxf(features[0], 1e-6f);
+    // Feature 87 (compression_strength): ratio of output target to scene peak.
+    // SDR: floor features[0] at 0.62 so 0.5444/0.51 never reaches the model.
+    // HDR: soft cap at 0.90 PQ (~4000 nits) catches extreme container peaks
+    // without restricting the model's view of normal high-nit content.
+    float f0_den;
+    if (params->is_sdr && !params->emulate_sdr) {
+        f0_den = fmaxf(features[0], SDR_FEATURE0_FLOOR);
+    } else {
+        f0_den = fminf(fmaxf(features[0], 1e-6f), 0.90f);
+    }
     features[87] = 0.5444f / f0_den;
     return true;
 }
@@ -525,6 +749,18 @@ bool pl_ml_render_evaluate(const struct pl_ml_render_params *params,
             params->fire_pop_strength : 0.0f,
     };
 
+    // Forward the skin LUT to the result (wiped by the assignment above).
+    // Unconditional: the chroma hook may run whenever chroma boost > 1.0, in
+    // any control mode. When NULL (no LUT configured), the hook falls back to
+    // the legacy ellipse body.
+    result->skin_lut     = params->skin_lut;
+    result->skin_lut_gpu = params->skin_lut_gpu;
+    result->skin_lut_cr0 = params->skin_lut_cr0;
+    result->skin_lut_cr1 = params->skin_lut_cr1;
+    result->skin_lut_cb0 = params->skin_lut_cb0;
+    result->skin_lut_cb1 = params->skin_lut_cb1;
+    result->chroma_warm_damp = params->chroma_warm_damp;
+
     struct pl_ml_prediction prediction;
     float gamma = 1.0f;
     if (params->gamma_mode == PL_ML_CONTROL_AUTO && params->model) {
@@ -540,23 +776,43 @@ bool pl_ml_render_evaluate(const struct pl_ml_render_params *params,
     result->gamma = fmaxf(0.5f, fminf(1.5f, gamma));
     result->l2_power = 2048.0f / result->gamma;
     result->l2_saturation = 2048.0f;
+    // Adaptive highlight guard: lower the L2 shader's highlight protection
+    // threshold for bright scenes so sky/specular pixels are protected while
+    // dark/mid areas still get full contrast expansion from the gamma curve.
+    {
+        float l1max = params->l1_max_pq > 0.0f ? params->l1_max_pq : features[0];
+        result->l2_highlight_guard = 0.85f;
+        if (l1max > 0.6f)
+            result->l2_highlight_guard = fmaxf(0.50f,
+                0.85f - (l1max - 0.6f) * 0.75f);
+        // Compression-adaptive midtone contrast: the spline tone mapper
+        // flattens midtone contrast proportional to how much it compresses.
+        // Restore it with a midpoint stretch that scales with compression
+        // ratio (peak / target). Uses the highlight guard so bright pixels
+        // are excluded from the boost.
+        float compression = l1max / 0.5444f;
+        result->l2_midtone_boost = fmaxf(0.0f,
+            fminf(0.80f, (compression - 1.0f) * 0.60f));
+    }
 
     if (params->cr_mode == PL_ML_CONTROL_MANUAL) {
         result->cr_strength = params->cr_strength;
     } else if (params->cr_mode == PL_ML_CONTROL_AUTO) {
         float base_cr = fmaxf(0.1f, fminf(0.5f,
             0.25f + (1.2f - result->gamma) * 0.15f));
-        // Taper CR for very bright/high-contrast scenes (fires, explosions).
-        // At l1_max > 0.7 the bilateral filter has extreme gradients that crush
-        // bright edges. Scale back up to 50% reduction at l1_max=1.0.
+        // Taper CR for very bright/high-contrast scenes (fires, explosions,
+        // bright sky). At l1_max > 0.7 the bilateral filter has extreme
+        // gradients that crush bright edges. Scale back up to 80% reduction
+        // at l1_max=1.0 to prevent compounding with gamma and radiance boosts.
         float l1max = result->l1_max_pq > 0.0f ? result->l1_max_pq :
                       (params->l1_max_pq > 0.0f ? params->l1_max_pq : 0.5f);
-        float brightness_taper = 1.0f - fmaxf(0.0f, (l1max - 0.7f) / 0.3f) * 0.5f;
+        float brightness_taper = 1.0f - fmaxf(0.0f, (l1max - 0.7f) / 0.3f) * 0.8f;
         result->cr_strength = base_cr * brightness_taper;
     }
 
     struct pl_ml_radiance_params radiance = params->radiance;
     radiance.average_luma = features[1];
+    radiance.peak_luma = result->l1_max_pq > 0.0f ? result->l1_max_pq : features[0];
     pl_ml_radiance_configure(&result->radiance, &radiance);
 
     if (params->chroma_mode == PL_ML_CONTROL_MANUAL) {
@@ -631,7 +887,7 @@ bool pl_ml_render_evaluate(const struct pl_ml_render_params *params,
         if (params->highlight_model) {
             struct pl_ml_prediction hi_pred;
             if (pl_ml_context_predict(params->highlight_model, features, 88, &hi_pred))
-                result->highlight_strength = fmaxf(0.0f, fminf(0.4f, hi_pred.gamma));
+                result->highlight_strength = fmaxf(0.0f, fminf(0.4f, hi_pred.value));
         } else {
             // Heuristic: higher peak → more specular clipping risk → more smoothing.
             // features[0] ≈ maxscl/l1max_pq.
@@ -680,6 +936,15 @@ int pl_ml_render_get_hooks(struct pl_ml_render_result *result,
         hooks[count++] = (struct pl_hook) { .stages = PL_HOOK_OUTPUT,
             .input = PL_HOOK_SIG_COLOR, .priv = result, .hook = l2_hook,
             .signature = 0x44564C325452494Dull };
+    }
+    if (result->cr_strength > 0.001f) {
+        hooks[count++] = (struct pl_hook) {
+            .stages = PL_HOOK_OUTPUT,
+            .input  = PL_HOOK_SIG_TEX,
+            .priv   = result,
+            .hook   = cr_bilateral_hook,
+            .signature = 0x434F4E5354524352ull,  // "CONSTRCR"
+        };
     }
     if (result->radiance.strength > 0.0f)
         pl_ml_radiance_get_hook(&result->radiance, &hooks[count++]);

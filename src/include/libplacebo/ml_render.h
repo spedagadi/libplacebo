@@ -32,6 +32,23 @@ struct pl_ml_render_params {
     float chroma_fire_boost;
     float chroma_knee;
     float chroma_skin_protect;
+    // Trained P(skin) chroma LUT (r8, bilinear + clamp). When non-NULL and
+    // skin_lut_gpu matches the rendering GPU, chroma_tuner_hook samples the LUT
+    // instead of the hand-tuned ellipse and skips the highlight taper. Caller
+    // owns the texture lifecycle; pl_ml_render_evaluate forwards to the result
+    // on every frame (all controls modes). Bounds are the LUT grid edges in
+    // the canonical encoded (cr, cb) space.
+    pl_tex skin_lut;
+    pl_gpu skin_lut_gpu;
+    float skin_lut_cr0, skin_lut_cr1;   // cr grid bounds
+    float skin_lut_cb0, skin_lut_cb1;   // cb grid bounds
+    // Warm-excursion damp [0..1]: fractional chroma-gain pullback applied to
+    // the warm sector. The boost scales residuals proportionally, which is
+    // hue-neutral by construction -- the "red push / pink skin" the eye sees
+    // is SATURATION growth on warm hues, so the counter-weight caps magnitude
+    // there (0 = current behaviour; 1 = warm hues get no boost). The skin LUT
+    // protection stacks on top; cool hues are untouched.
+    float chroma_warm_damp;
 
     // Shadow bilateral — pre-curve 5×5 bilateral, masks low-PQ zones (y < 0.35).
     // Model predicts sigma_range strength from the shared 88-dim feature vector.
@@ -81,6 +98,8 @@ struct pl_ml_render_result {
     float cr_strength;
     float l2_power;
     float l2_saturation;
+    float l2_highlight_guard; // luma where highlight protection starts (adaptive)
+    float l2_midtone_boost;   // compression-adaptive midtone contrast multiplier
     float fire_pop_strength;
     float l1_max_pq;
     float l1_avg_pq;
@@ -89,6 +108,14 @@ struct pl_ml_render_result {
     float chroma_fire_boost;
     float chroma_knee;
     float chroma_skin_protect;
+    // Forwarded from params by pl_ml_render_evaluate (unconditional, all modes),
+    // so chroma_tuner_hook can bind the LUT texture. Zero when no LUT is set,
+    // in which case the hook uses the legacy hand-tuned ellipse path.
+    pl_tex skin_lut;
+    pl_gpu skin_lut_gpu;
+    float skin_lut_cr0, skin_lut_cr1;
+    float skin_lut_cb0, skin_lut_cb1;
+    float chroma_warm_damp;   // [0..1] warm-sector gain pullback (forwarded)
     // Shadow/highlight bilateral strengths resolved by pl_ml_render_evaluate.
     float shadow_strength;    // bilateral blend in dark zones [0,0.5]
     float shadow_knee;        // PQ luma boundary for shadow mask (0.35 fixed)
@@ -107,11 +134,11 @@ PL_API bool pl_ml_render_evaluate(const struct pl_ml_render_params *params,
                                   struct pl_ml_render_result *result);
 
 // Initializes hooks for the resolved ML settings. `hooks` must contain room
-// for seven entries and remain alive for the render using the result.
+// for eight entries and remain alive for the render using the result.
 // Slot order: [0] SDR→P5 emulation (RGB_INPUT, when sdr_emulate),
-// [1] shadow bilateral (RGB_INPUT), [2] highlight bilateral (OUTPUT),
-// [3] fire-pop, [4] L2 gamma, [5] radiance, [6] chroma tuner.
-// Returns the actual number of hooks populated (0–7).
+// [1] shadow bilateral (RGB_INPUT), [2] fire-pop, [3] L2 gamma,
+// [4] CR bilateral, [5] radiance, [6] chroma tuner, [7] highlight bilateral.
+// Returns the actual number of hooks populated (0–8).
 PL_API int pl_ml_render_get_hooks(struct pl_ml_render_result *result,
                                   struct pl_hook hooks[]);
 

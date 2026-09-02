@@ -8,7 +8,14 @@
  *   {"mkv_path": "path/to/video.mkv", "pts": 123.45, "target_nits": 100.0}
  *
  * Output format (binary):
- *   78 floats (77 features + target_nits) in native float32 format
+ *   78 floats (features[0..77]) in native float32 format
+ *
+ * Implementation note:
+ *   Features are extracted via pl_shader_detect_peak, which runs inside
+ *   pl_render_image as part of the normal rendering pipeline. This matches
+ *   the exact execution path used by mpv/vo_gpu_next. After rendering,
+ *   pl_renderer_get_ml_features reads the accumulated stats from the GPU
+ *   peak detection buffer — no separate downscale pass.
  *
  * Usage:
  *   pl_extract_features_daemon  (reads from stdin, writes to stdout)
@@ -17,11 +24,6 @@
  *   extractor = SustainedFeatureExtractor("pl_extract_features_daemon.exe")
  *   extractor.start()
  *   features = extractor.extract_frame("video.mkv", 123.45, target_nits=100.0)
- *
- * Performance:
- *   - Single GPU context initialization (persistent)
- *   - No process spawning overhead
- *   - ~0.05-0.15s per frame (vs ~3.9s with single-shot binary)
  *
  * License: CC0 / Public Domain
  */
@@ -42,24 +44,14 @@
 #include <libplacebo/log.h>
 #include <libplacebo/gpu.h>
 #include <libplacebo/d3d11.h>
+#include <libplacebo/renderer.h>
 #include <libplacebo/utils/libav.h>
-#include <libplacebo/ml_features.h>
 
 #define PL_LIBAV_IMPLEMENTATION 1
 #include <libplacebo/utils/libav.h>
 
 #define MAX_INPUT_LINE 4096
-
-static const char *g_debug_luma_path = NULL;
-
-static void usage(const char *argv0)
-{
-    fprintf(stderr,
-            "Usage: %s [--no-dovi] [--debug-luma <file>]\n"
-            "  --no-dovi                 Skip Dolby Vision RPU processing\n"
-            "  --debug-luma <file>      Write the latest 256x144 float32 luma frame\n",
-            argv0);
-}
+#define ML_FEATURE_DIM 78
 
 /* -------------------------------------------------------------------------
  * Request structure (parsed from JSON stdin)
@@ -76,10 +68,7 @@ typedef struct {
 static bool parse_json_request(const char *line, FrameRequest *req)
 {
     memset(req, 0, sizeof(*req));
-    req->target_nits = 100.0f;  // Default
-
-    // Very simple JSON parser - looks for our known fields
-    // Format: {"mkv_path": "...", "pts": 123.45, "target_nits": 100.0}
+    req->target_nits = 100.0f;
 
     const char *mkv_start = strstr(line, "\"mkv_path\"");
     const char *pts_start = strstr(line, "\"pts\"");
@@ -90,12 +79,11 @@ static bool parse_json_request(const char *line, FrameRequest *req)
         return false;
     }
 
-    // Extract mkv_path string
     const char *path_value = strchr(mkv_start, ':');
     if (path_value) {
         path_value = strchr(path_value, '"');
         if (path_value) {
-            path_value++; // Skip opening quote
+            path_value++;
             const char *path_end = strchr(path_value, '"');
             if (path_end) {
                 size_t len = path_end - path_value;
@@ -106,18 +94,14 @@ static bool parse_json_request(const char *line, FrameRequest *req)
         }
     }
 
-    // Extract pts float
     const char *pts_value = strchr(pts_start, ':');
-    if (pts_value) {
+    if (pts_value)
         req->pts = atof(pts_value + 1);
-    }
 
-    // Extract target_nits (optional)
     if (nits_start) {
         const char *nits_value = strchr(nits_start, ':');
-        if (nits_value) {
+        if (nits_value)
             req->target_nits = atof(nits_value + 1);
-        }
     }
 
     if (req->mkv_path[0] == '\0') {
@@ -137,7 +121,7 @@ typedef struct {
     AVCodecContext *dec;
     AVStream *st;
     int vstream;
-    double last_decoded_pts;  // Track last position for sequential seek optimization
+    double last_decoded_pts;
 } VideoState;
 
 static VideoState *open_video(const char *path)
@@ -149,14 +133,13 @@ static VideoState *open_video(const char *path)
     char native_path[sizeof(vs->path)];
     const char *open_path = path;
     if (path[0] == '/' && path[1] && path[2] == '/') {
-        snprintf(native_path, sizeof(native_path), "%c:%s",
-                 path[1], path + 2);
+        snprintf(native_path, sizeof(native_path), "%c:%s", path[1], path + 2);
         open_path = native_path;
     }
 #endif
 
     strncpy(vs->path, path, sizeof(vs->path) - 1);
-    vs->last_decoded_pts = -1.0;  // Initialize seek tracker
+    vs->last_decoded_pts = -1.0;
 
     if (avformat_open_input(&vs->fmt,
 #ifdef _WIN32
@@ -209,51 +192,41 @@ static void close_video(VideoState *vs)
 static AVFrame *decode_frame_at(VideoState *vs, double target_pts)
 {
     AVFormatContext *fmt = vs->fmt;
-    AVCodecContext *dec = vs->dec;
-    AVStream *st = vs->st;
+    AVCodecContext  *dec = vs->dec;
+    AVStream        *st  = vs->st;
     int vstream = vs->vstream;
 
-    // Sequential seek optimization: skip seeking if target is close to last position
     bool sequential = (vs->last_decoded_pts >= 0.0 &&
                        target_pts >= vs->last_decoded_pts &&
                        (target_pts - vs->last_decoded_pts) < 1.0);
 
     if (!sequential) {
-        // Seek to just before target PTS, using stream-specific index (not -1)
         int64_t seek_ts = (int64_t)(target_pts / av_q2d(st->time_base));
         av_seek_frame(fmt, vstream, seek_ts, AVSEEK_FLAG_BACKWARD);
         avcodec_flush_buffers(dec);
     }
 
-    AVPacket *pkt = av_packet_alloc();
-    AVFrame *frame = av_frame_alloc();
-    AVFrame *best = NULL;
-    double best_diff = 1e9;
+    AVPacket *pkt   = av_packet_alloc();
+    AVFrame  *frame = av_frame_alloc();
+    AVFrame  *best  = NULL;
+    double    best_diff = 1e9;
 
     for (int attempts = 0; attempts < 512; attempts++) {
         int ret = av_read_frame(fmt, pkt);
         if (ret < 0) break;
-        if (pkt->stream_index != vstream) {
-            av_packet_unref(pkt);
-            continue;
-        }
+        if (pkt->stream_index != vstream) { av_packet_unref(pkt); continue; }
 
         avcodec_send_packet(dec, pkt);
         av_packet_unref(pkt);
 
         while (avcodec_receive_frame(dec, frame) == 0) {
-            double pts = frame->pts * av_q2d(st->time_base);
+            double pts  = frame->pts * av_q2d(st->time_base);
             double diff = fabs(pts - target_pts);
-
             if (diff < best_diff) {
                 best_diff = diff;
-                if (best) av_frame_free(&best);  // CRITICAL: Free old frame before overwriting
+                if (best) av_frame_free(&best);
                 best = av_frame_clone(frame);
-
-                // Accept if within 1ms (frame-exact at any reasonable FPS)
-                // At 120fps, 1 frame = 8.3ms, so 1ms ensures exact frame match
-                if (diff < 0.001)
-                    goto found;
+                if (diff < 0.001) goto found;
             }
             av_frame_unref(frame);
         }
@@ -262,181 +235,251 @@ static AVFrame *decode_frame_at(VideoState *vs, double target_pts)
 found:
     av_packet_free(&pkt);
     av_frame_free(&frame);
-
-    // Update position tracker for sequential optimization
-    if (best) {
+    if (best)
         vs->last_decoded_pts = best->pts * av_q2d(st->time_base);
-    }
-
     return best;
 }
 
 /* -------------------------------------------------------------------------
- * Process single frame request
+ * Persistent render target — recreated when resolution changes
  * ---------------------------------------------------------------------- */
-static bool process_request(pl_gpu gpu, VideoState *vs, const FrameRequest *req, float *features_out)
+typedef struct {
+    pl_tex  tex;
+    int     w, h;
+} RenderTarget;
+
+static bool ensure_render_target(pl_gpu gpu, RenderTarget *rt, int w, int h)
 {
-    // Decode frame
-    AVFrame *frame = decode_frame_at(vs, req->pts);
-    if (!frame) {
+    if (rt->tex && rt->w == w && rt->h == h)
+        return true;
+
+    pl_tex_destroy(gpu, &rt->tex);
+    rt->w = rt->h = 0;
+
+    // RGBA16F — suitable for HDR content, write-only from renderer
+    pl_fmt fmt = pl_find_fmt(gpu, PL_FMT_FLOAT, 4, 16, 16,
+                             PL_FMT_CAP_RENDERABLE);
+    if (!fmt) {
+        fprintf(stderr, "ERROR: No RGBA16F renderable format\n");
         return false;
     }
 
-    // Map AVFrame to GPU textures WITH Dolby Vision metadata
-    struct pl_frame pl_frame;
+    rt->tex = pl_tex_create(gpu, pl_tex_params(
+        .w = w, .h = h, .format = fmt,
+        .renderable = true, .blit_dst = true));
+    if (!rt->tex) {
+        fprintf(stderr, "ERROR: Failed to create render target %dx%d\n", w, h);
+        return false;
+    }
+
+    rt->w = w;
+    rt->h = h;
+    return true;
+}
+
+/* -------------------------------------------------------------------------
+ * Process single frame request
+ *
+ * Renders via pl_render_image (which fires pl_shader_detect_peak), then
+ * reads the accumulated ML features via pl_renderer_get_ml_features.
+ * This mirrors the exact path used by mpv/vo_gpu_next on every frame.
+ * ---------------------------------------------------------------------- */
+bool g_no_dovi = false;
+
+static bool process_request(pl_gpu gpu, pl_renderer renderer,
+                            RenderTarget *rt, VideoState *vs,
+                            const FrameRequest *req, float *features_out)
+{
+    AVFrame *frame = decode_frame_at(vs, req->pts);
+    if (!frame) {
+        fprintf(stderr, "ERROR: Failed to decode frame at PTS %.3f\n", req->pts);
+        return false;
+    }
+
+    // Map AVFrame → GPU textures.
+    // Always strip DV RPU metadata (map_dovi = false) so that hdr_update_peak
+    // runs GPU histogram peak detection.  When map_dovi=true, the renderer sees
+    // L1 avg_pq_y from the RPU and skips GPU peak detection entirely, which
+    // would leave the peak buffer empty and pl_renderer_get_ml_features failing.
+    struct pl_frame src = {0};
     pl_tex tex[4] = {0};
-
-    // Use pl_map_avframe_ex to properly handle Dolby Vision RPU metadata
-    // map_dovi=false when --no-dovi flag is set (HDR10 calibration extraction mode)
-    extern bool g_no_dovi;
-    struct pl_avframe_params avparams = {
-        .frame = frame,
-        .tex = tex,
-        .map_dovi = !g_no_dovi,
+    struct pl_avframe_params avp = {
+        .frame    = frame,
+        .tex      = tex,
+        .map_dovi = false,
     };
-
-    if (!pl_map_avframe_ex(gpu, &pl_frame, &avparams)) {
-        fprintf(stderr, "ERROR: Failed to map frame to GPU\n");
+    if (!pl_map_avframe_ex(gpu, &src, &avp)) {
+        fprintf(stderr, "ERROR: Failed to map AVFrame to GPU\n");
         av_frame_free(&frame);
         return false;
     }
 
-    // Extract features with persistent GPU context (use GPU, not CPU fallback)
-    struct pl_ml_feature_params params = {
-        .target_nits = req->target_nits,
-        .downsample_width = 256,
-        .downsample_height = 144,
-        .force_cpu_fallback = false,  // Use native GPU paths for DV-corrected values
-        .debug_luma_path = g_debug_luma_path,
+    // Ensure off-screen render target matches source resolution.
+    // Rendering at source resolution means pl_shader_detect_peak sees the
+    // upscaling path → runs at SOURCE resolution (no downscale yet), which
+    // matches mpv's behaviour for 4K HDR content on a 4K display.
+    int w = frame->width, h = frame->height;
+    if (!ensure_render_target(gpu, rt, w, h)) {
+        pl_unmap_avframe(gpu, &src);
+        for (int i = 0; i < 4; i++) pl_tex_destroy(gpu, &tex[i]);
+        av_frame_free(&frame);
+        return false;
+    }
+
+    // Build target pl_frame pointing at the off-screen texture
+    struct pl_frame dst = {0};
+    dst.num_planes = 1;
+    dst.planes[0].texture = rt->tex;
+    dst.planes[0].components = 4;
+    dst.planes[0].component_mapping[0] = PL_CHANNEL_R;
+    dst.planes[0].component_mapping[1] = PL_CHANNEL_G;
+    dst.planes[0].component_mapping[2] = PL_CHANNEL_B;
+    dst.planes[0].component_mapping[3] = PL_CHANNEL_A;
+    dst.repr  = pl_color_repr_hdtv;
+    dst.color = pl_color_space_srgb;
+    dst.crop  = (struct pl_rect2df){ 0, 0, w, h };
+
+    // Peak detect params.
+    // allow_delayed = true: avoids requiring pass->fbofmt[4] (fp16 FBO) which
+    // may not be available in a minimal off-screen render setup.  Instead we
+    // call pl_gpu_finish() after rendering to ensure GPU writes are complete.
+    static const struct pl_peak_detect_params pd = {
+        .smoothing_period     = 1.0f,
+        .scene_threshold_low  = 0.0f,
+        .scene_threshold_high = 0.0f,
+        .percentile           = 99.995f,
+        .allow_delayed        = true,
     };
 
-    bool ok = pl_extract_ml_features(gpu, &pl_frame, &params, features_out);
+    struct pl_render_params rp = pl_render_default_params;
+    rp.peak_detect_params = &pd;
 
-    // Clean up - Note: pl_unmap_avframe does NOT destroy textures (by design for reuse)
-    pl_unmap_avframe(gpu, &pl_frame);
-    for (int i = 0; i < 4; i++) {
-        if (tex[i]) pl_tex_destroy(gpu, &tex[i]);
+    bool rendered = pl_render_image(renderer, &src, &dst, &rp);
+
+    bool ok = false;
+    if (rendered) {
+        // Wait for all queued GPU commands to complete so the peak detection
+        // SSBO writes are visible before we read them back.
+        pl_gpu_finish(gpu);
+        ok = pl_renderer_get_ml_features(renderer, req->target_nits, features_out);
+        if (!ok)
+            fprintf(stderr, "WARN: Peak detection buffer not ready after gpu_finish\n");
+    } else {
+        fprintf(stderr, "ERROR: pl_render_image failed\n");
     }
-    av_frame_free(&frame);
 
+    pl_unmap_avframe(gpu, &src);
+    for (int i = 0; i < 4; i++) pl_tex_destroy(gpu, &tex[i]);
+    av_frame_free(&frame);
     return ok;
 }
 
 /* -------------------------------------------------------------------------
  * Main daemon loop
  * ---------------------------------------------------------------------- */
-/* Global flag: when true, DV RPU polynomial is NOT applied (HDR10 calibration mode) */
-bool g_no_dovi = false;
+static void usage(const char *argv0)
+{
+    fprintf(stderr,
+            "Usage: %s [--no-dovi]\n"
+            "  --no-dovi   Skip Dolby Vision RPU processing\n"
+            "Reads JSON requests from stdin, writes 78 float32 feature vectors to stdout.\n",
+            argv0);
+}
 
 int main(int argc, char **argv)
 {
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "--no-dovi") == 0)
             g_no_dovi = true;
-        else if (strcmp(argv[i], "--debug-luma") == 0 && i + 1 < argc)
-            g_debug_luma_path = argv[++i];
         else if (strcmp(argv[i], "--help") == 0 || strcmp(argv[i], "-h") == 0) {
-            usage(argv[0]);
-            return 0;
+            usage(argv[0]); return 0;
         } else {
             fprintf(stderr, "ERROR: Unknown argument: %s\n", argv[i]);
-            usage(argv[0]);
-            return 1;
+            usage(argv[0]); return 1;
         }
     }
 
-    // Binary mode on stdout only (stdin stays in text mode for fgets JSON parsing)
 #ifdef _WIN32
     _setmode(_fileno(stdout), _O_BINARY);
 #endif
+    av_log_set_level(AV_LOG_ERROR);
 
-    av_log_set_level(AV_LOG_ERROR);  // Suppress ffmpeg noise
-
-    // Initialize libplacebo ONCE (persistent GPU context)
+    // Persistent GPU context + renderer (created once, reused for all requests)
     pl_log log = pl_log_create(PL_API_VER, pl_log_params(
-        .log_cb = pl_log_simple,
-        .log_priv = stderr,
+        .log_cb    = pl_log_simple,
+        .log_priv  = stderr,
         .log_level = PL_LOG_WARN,
     ));
 
-    pl_d3d11 d3d11 = pl_d3d11_create(log, pl_d3d11_params(
-        .allow_software = true,
-    ));
-
+    pl_d3d11 d3d11 = pl_d3d11_create(log, pl_d3d11_params(.allow_software = true));
     if (!d3d11) {
-        fprintf(stderr, "FATAL: Failed to create persistent D3D11 context\n");
+        fprintf(stderr, "FATAL: Failed to create D3D11 context\n");
+        pl_log_destroy(&log);
         return 1;
     }
     pl_gpu gpu = d3d11->gpu;
 
-    fprintf(stderr, "Daemon ready: GPU context initialized\n");
+    pl_renderer renderer = pl_renderer_create(log, gpu);
+    if (!renderer) {
+        fprintf(stderr, "FATAL: Failed to create renderer\n");
+        pl_d3d11_destroy(&d3d11);
+        pl_log_destroy(&log);
+        return 1;
+    }
 
-    // Main event loop: read JSON commands from stdin
+    RenderTarget rt = {0};
+
+    fprintf(stderr, "Daemon ready: GPU context + renderer initialized\n");
+
     char line[MAX_INPUT_LINE];
     int request_count = 0;
-    VideoState *video_state = NULL;  // Persistent video file handle
+    VideoState *video_state = NULL;
 
     while (fgets(line, sizeof(line), stdin) != NULL) {
         request_count++;
 
-        // Parse JSON request
         FrameRequest req;
         if (!parse_json_request(line, &req)) {
             fprintf(stderr, "ERROR: Failed to parse request #%d\n", request_count);
-            // Write error marker (all zeros)
-            float zeros[PL_ML_FEATURE_DIM] = {0};
-            fwrite(zeros, sizeof(float), PL_ML_FEATURE_DIM, stdout);
+            float zeros[ML_FEATURE_DIM] = {0};
+            fwrite(zeros, sizeof(float), ML_FEATURE_DIM, stdout);
             fflush(stdout);
             continue;
         }
 
-        // Check if video file changed - reopen if needed
         if (!video_state || strcmp(video_state->path, req.mkv_path) != 0) {
-            if (video_state) {
-                close_video(video_state);
-            }
+            if (video_state) close_video(video_state);
             video_state = open_video(req.mkv_path);
             if (!video_state) {
                 fprintf(stderr, "ERROR: Failed to open video: %s\n", req.mkv_path);
-                // Write error marker (all zeros)
-                float zeros[PL_ML_FEATURE_DIM] = {0};
-                fwrite(zeros, sizeof(float), PL_ML_FEATURE_DIM, stdout);
+                float zeros[ML_FEATURE_DIM] = {0};
+                fwrite(zeros, sizeof(float), ML_FEATURE_DIM, stdout);
                 fflush(stdout);
                 continue;
             }
             fprintf(stderr, "Opened video: %s\n", req.mkv_path);
         }
 
-        // Process frame with persistent GPU context AND persistent video handle
-        float features[PL_ML_FEATURE_DIM];
-        bool ok = process_request(gpu, video_state, &req, features);
-
+        float features[ML_FEATURE_DIM];
+        bool ok = process_request(gpu, renderer, &rt, video_state, &req, features);
         if (!ok) {
-            fprintf(stderr, "ERROR: Failed to extract features for %s @ %.3f\n",
+            fprintf(stderr, "ERROR: Feature extraction failed for %s @ %.3f\n",
                     req.mkv_path, req.pts);
-            // Write error marker (all zeros)
             memset(features, 0, sizeof(features));
         }
 
-        // Write binary output to stdout
-        size_t written = fwrite(features, sizeof(float), PL_ML_FEATURE_DIM, stdout);
-        fflush(stdout);  // Critical: force immediate write
-
-        if (written != PL_ML_FEATURE_DIM) {
-            fprintf(stderr, "ERROR: Failed to write features (wrote %zu/%d)\n",
-                    written, PL_ML_FEATURE_DIM);
-        }
+        size_t written = fwrite(features, sizeof(float), ML_FEATURE_DIM, stdout);
+        fflush(stdout);
+        if (written != ML_FEATURE_DIM)
+            fprintf(stderr, "ERROR: Short write (%zu/%d floats)\n", written, ML_FEATURE_DIM);
     }
 
-    // Clean up when stdin closes
-    fprintf(stderr, "Daemon shutting down: processed %d requests\n", request_count);
+    fprintf(stderr, "Daemon shutting down after %d requests\n", request_count);
 
-    if (video_state) {
-        close_video(video_state);
-    }
-
+    if (video_state) close_video(video_state);
+    pl_tex_destroy(gpu, &rt.tex);
+    pl_renderer_destroy(&renderer);
     pl_d3d11_destroy(&d3d11);
     pl_log_destroy(&log);
-
     return 0;
 }

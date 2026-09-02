@@ -1236,7 +1236,8 @@ static int render_frame_with_decoder(Args a, pl_gpu gpu, pl_renderer renderer,
         /* Predict gamma from the complete canonical feature vector. */
         float content_ratio = a.l1_max_pq / (a.out_nits > 0.01f ? a.out_nits / 10000.0f : 0.02f);
         float predicted_gamma = predict_gamma_from_brightness(content_ratio, a.l1_avg_pq);
-        have_ml_result = pl_ml_render_evaluate(gpu, &image, pl_ml_render_params(
+        have_ml_result = pl_ml_render_evaluate(pl_ml_render_params(
+            .renderer = NULL, // standalone tool — no pl_renderer; falls through to heuristic
             .model = ml_context,
             .gamma_mode = (enum pl_ml_control_mode)a.gamma_mode,
             .gamma = a.contrast_gamma,
@@ -1272,12 +1273,13 @@ static int render_frame_with_decoder(Args a, pl_gpu gpu, pl_renderer renderer,
             } else {
                 float base_cr = fmaxf(0.1f, fminf(0.5f,
                     0.25f + (1.2f - ml_result.gamma) * 0.15f));
-                float brightness_taper = 1.0f - fmaxf(0.0f, (a.l1_max_pq - 0.7f) / 0.3f) * 0.5f;
+                float brightness_taper = 1.0f - fmaxf(0.0f, (a.l1_max_pq - 0.7f) / 0.3f) * 0.8f;
                 ml_result.cr_strength = base_cr * brightness_taper;
             }
             pl_ml_radiance_configure(&ml_result.radiance, pl_ml_radiance_params(
                 .mode = (enum pl_ml_control_mode)a.radiance_mode,
                 .average_luma = a.l1_avg_pq,
+                .peak_luma = a.l1_max_pq,
                 .knee = a.radiance_knee,
                 .strength = a.radiance_strength));
         }
